@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+job_applications.sqlite3
+*.sqlite3-journal
