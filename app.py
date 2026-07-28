@@ -41,6 +41,17 @@ THEMES = {
 }
 
 
+STATUS_COLORS = {
+    "Pending": "#eab308",
+    "OA Received": "#a855f7",
+    "Interview": "#f97316",
+    "Offer": "#22c55e",
+    "Rejected": "#ef4444",
+    "Withdrawn": "#9ca3af",
+}
+
+TIME_RANGES = [("7d", 7), ("14d", 14), ("30d", 30), ("90d", 90), ("All time", None)]
+
 JOB_TYPES = ["Internship", "Full time", "Part time", "Contract", "Unpaid"]
 STATUSES = ["Pending", "Applied", "OA Received", "Interview", "Offer", "Rejected", "Withdrawn"]
 PAY_PERIODS = ["Per hour", "Monthly", "Annual", "Unspecified"]
@@ -188,7 +199,14 @@ class JobStore:
         return {"total": total, "heard_back": heard_back, "offers": offers, "pending": pending}
 
     def daily_counts(self, days=14):
-        start = date.today() - timedelta(days=days - 1)
+        if days is None:
+            earliest = self.conn.execute(
+                "SELECT MIN(application_date) AS earliest FROM jobs"
+            ).fetchone()["earliest"]
+            start = date.fromisoformat(earliest) if earliest else date.today()
+            days = (date.today() - start).days + 1
+        else:
+            start = date.today() - timedelta(days=days - 1)
         labels = [(start + timedelta(days=i)).isoformat() for i in range(days)]
         counts = dict.fromkeys(labels, 0)
         rows = self.conn.execute(
@@ -203,6 +221,24 @@ class JobStore:
         for row in rows:
             counts[row["application_date"]] = row["count"]
         return list(counts.items())
+
+    def status_counts(self):
+        rows = self.list_jobs()
+        buckets = {
+            "Pending": 0,
+            "OA Received": 0,
+            "Interview": 0,
+            "Offer": 0,
+            "Rejected": 0,
+            "Withdrawn": 0,
+        }
+        for row in rows:
+            status = row["status"]
+            if status in {"Pending", "Applied"}:
+                buckets["Pending"] += 1
+            elif status in buckets:
+                buckets[status] += 1
+        return buckets
 
     def save_profile_value(self, key, value):
         self.conn.execute(
@@ -230,6 +266,7 @@ class JobTrackerApp(tk.Tk):
         self.theme_name = self.store.get_profile_value("theme", "light")
         self.theme = THEMES[self.theme_name]
         self.active_page = "add"
+        self.dashboard_range_days = 14
         self.drawer_visible = False
         self.form_vars = {}
         self.configure(bg=self.theme["bg"])
@@ -335,6 +372,32 @@ class JobTrackerApp(tk.Tk):
         style.map(
             "ActiveTab.TButton",
             background=[("active", self.theme["surface_2"])],
+        )
+        style.configure(
+            "Range.TButton",
+            background=self.theme["surface_2"],
+            foreground=self.theme["muted"],
+            bordercolor=self.theme["border"],
+            relief="flat",
+            padding=(10, 4),
+            font=("Segoe UI", 8),
+        )
+        style.map(
+            "Range.TButton",
+            background=[("active", self.theme["surface"])],
+        )
+        style.configure(
+            "RangeActive.TButton",
+            background=self.theme["primary"],
+            foreground="#ffffff" if self.theme_name == "light" else "#08111f",
+            bordercolor=self.theme["primary"],
+            relief="flat",
+            padding=(10, 4),
+            font=("Segoe UI", 8),
+        )
+        style.map(
+            "RangeActive.TButton",
+            background=[("active", self.theme["primary_hover"])],
         )
         style.configure(
             "TEntry",
@@ -756,9 +819,24 @@ class JobTrackerApp(tk.Tk):
             ttk.Label(box, text=str(stats[key]), style="CardTitle.TLabel").pack(anchor="w")
             ttk.Label(box, text=label, style="MutedSurface.TLabel").pack(anchor="w", pady=(4, 0))
 
-        chart_card = self.card(self.content)
-        chart_card.pack(fill="both", expand=True)
-        ttk.Label(chart_card, text="Daily applications", style="CardTitle.TLabel").pack(anchor="w")
+        charts_row = ttk.Frame(self.content, style="TFrame")
+        charts_row.pack(fill="both", expand=True)
+
+        chart_card = self.card(charts_row)
+        chart_card.pack(side="left", fill="both", expand=True, padx=(0, 12))
+        chart_header = ttk.Frame(chart_card, style="Surface.TFrame")
+        chart_header.pack(fill="x")
+        ttk.Label(chart_header, text="Applications over time", style="CardTitle.TLabel").pack(side="left")
+        range_frame = ttk.Frame(chart_header, style="Surface.TFrame")
+        range_frame.pack(side="right")
+        for label, days in TIME_RANGES:
+            style = "RangeActive.TButton" if days == self.dashboard_range_days else "Range.TButton"
+            ttk.Button(
+                range_frame,
+                text=label,
+                style=style,
+                command=lambda d=days: self.set_dashboard_range(d),
+            ).pack(side="left", padx=(6, 0))
         canvas = tk.Canvas(
             chart_card,
             height=300,
@@ -766,12 +844,35 @@ class JobTrackerApp(tk.Tk):
             highlightthickness=0,
         )
         canvas.pack(fill="both", expand=True, pady=(14, 0))
-        canvas.bind("<Configure>", lambda event: self.draw_daily_chart(canvas))
-        self.draw_daily_chart(canvas)
+        canvas.bind("<Configure>", lambda event: self.draw_line_chart(canvas))
+        self.draw_line_chart(canvas)
 
-    def draw_daily_chart(self, canvas):
+        pie_card = self.card(charts_row)
+        pie_card.pack(side="left", fill="both", expand=True)
+        ttk.Label(pie_card, text="Applications by status", style="CardTitle.TLabel").pack(anchor="w")
+        pie_body = ttk.Frame(pie_card, style="Surface.TFrame")
+        pie_body.pack(fill="both", expand=True, pady=(14, 0))
+        pie_canvas = tk.Canvas(
+            pie_body,
+            width=220,
+            height=220,
+            bg=self.theme["surface"],
+            highlightthickness=0,
+        )
+        pie_canvas.pack(side="left", fill="y")
+        legend = ttk.Frame(pie_body, style="Surface.TFrame")
+        legend.pack(side="left", fill="both", expand=True, padx=(18, 0))
+        pie_canvas.bind("<Configure>", lambda event: self.draw_status_pie(pie_canvas))
+        self.draw_status_pie(pie_canvas)
+        self.render_status_legend(legend)
+
+    def set_dashboard_range(self, days):
+        self.dashboard_range_days = days
+        self.show_page("dashboard")
+
+    def draw_line_chart(self, canvas):
         canvas.delete("all")
-        data = self.store.daily_counts()
+        data = self.store.daily_counts(self.dashboard_range_days)
         width = max(canvas.winfo_width(), 640)
         height = max(canvas.winfo_height(), 280)
         pad_x, pad_y = 46, 36
@@ -782,18 +883,66 @@ class JobTrackerApp(tk.Tk):
         text_color = self.theme["muted"]
         canvas.create_line(pad_x, height - pad_y, width - pad_x, height - pad_y, fill=axis_color)
         canvas.create_line(pad_x, pad_y, pad_x, height - pad_y, fill=axis_color)
-        bar_gap = 8
-        bar_w = max(10, (chart_w / len(data)) - bar_gap)
+        step = chart_w / max(len(data) - 1, 1)
+        label_stride = max(1, len(data) // 12)
+        points = []
         for index, (day, count) in enumerate(data):
-            x0 = pad_x + index * (chart_w / len(data)) + bar_gap / 2
-            y0 = height - pad_y - (count / max_count * chart_h)
-            x1 = x0 + bar_w
-            y1 = height - pad_y
-            canvas.create_rectangle(x0, y0, x1, y1, fill=self.theme["chart"], outline="")
-            label = datetime.fromisoformat(day).strftime("%m/%d")
-            canvas.create_text(x0 + bar_w / 2, height - 15, text=label, fill=text_color, font=("Segoe UI", 8))
+            x = pad_x + index * step
+            y = height - pad_y - (count / max_count * chart_h)
+            points.append((x, y))
+            if index % label_stride == 0 or index == len(data) - 1:
+                label = datetime.fromisoformat(day).strftime("%m/%d")
+                canvas.create_text(x, height - 15, text=label, fill=text_color, font=("Segoe UI", 8))
+        if len(points) > 1:
+            canvas.create_line(*[coord for point in points for coord in point], fill=self.theme["chart"], width=2, smooth=True)
+        for (x, y), (_, count) in zip(points, data):
+            radius = 3
+            canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=self.theme["chart"], outline="")
             if count:
-                canvas.create_text(x0 + bar_w / 2, y0 - 10, text=str(count), fill=self.theme["text"], font=("Segoe UI", 9))
+                canvas.create_text(x, y - 12, text=str(count), fill=self.theme["text"], font=("Segoe UI", 9))
+
+    def draw_status_pie(self, canvas):
+        canvas.delete("all")
+        buckets = self.store.status_counts()
+        total = sum(buckets.values())
+        size = min(max(canvas.winfo_width(), 180), max(canvas.winfo_height(), 180))
+        pad = 10
+        x0, y0, x1, y1 = pad, pad, size - pad, size - pad
+        if total == 0:
+            canvas.create_oval(x0, y0, x1, y1, outline=self.theme["border"], width=1)
+            canvas.create_text(
+                size / 2, size / 2, text="No data", fill=self.theme["muted"], font=("Segoe UI", 9)
+            )
+            return
+        start_angle = 90.0
+        for status, count in buckets.items():
+            if not count:
+                continue
+            extent = -360.0 * (count / total)
+            canvas.create_arc(
+                x0, y0, x1, y1,
+                start=start_angle,
+                extent=extent,
+                fill=STATUS_COLORS[status],
+                outline=self.theme["surface"],
+                width=2,
+                style="pieslice",
+            )
+            start_angle += extent
+
+    def render_status_legend(self, legend):
+        buckets = self.store.status_counts()
+        total = sum(buckets.values())
+        for status, count in buckets.items():
+            row = ttk.Frame(legend, style="Surface.TFrame")
+            row.pack(fill="x", pady=3)
+            swatch = tk.Canvas(row, width=12, height=12, highlightthickness=0, bg=self.theme["surface"])
+            swatch.pack(side="left")
+            swatch.create_rectangle(0, 0, 12, 12, fill=STATUS_COLORS[status], outline="")
+            pct = f"{(count / total * 100):.0f}%" if total else "0%"
+            ttk.Label(
+                row, text=f"{status} — {count} ({pct})", style="MutedSurface.TLabel"
+            ).pack(side="left", padx=(8, 0))
 
     def render_settings_page(self):
         ttk.Label(self.content, text="Settings", style="Title.TLabel").pack(anchor="w")
