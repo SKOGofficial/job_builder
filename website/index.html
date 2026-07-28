@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      name="description"
+      content="A static product report for Job Builder, a local job application tracker with roadmap plans for response metrics, Gmail and Grok analysis, and offer comparison workflows."
+    >
+    <title>Job Builder Product Report</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="Job Builder product report home">
+        <span class="brand-mark" aria-hidden="true">JB</span>
+        <span>Job Builder</span>
+      </a>
+      <nav class="nav" aria-label="Report sections">
+        <a href="#today">Today</a>
+        <a href="#metrics">Metrics</a>
+        <a href="#email">Email</a>
+        <a href="#offers">Offers</a>
+        <a href="#roadmap">Roadmap</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="kicker">Static product report</p>
+          <h1 id="hero-title">A local job-search control room, from application log to offer decision.</h1>
+          <p class="hero-text">
+            Job Builder already records applications, prevents duplicate postings, and shows basic outcomes.
+            This report frames the next product direction: response metrics, auditable email review, and offer comparisons.
+          </p>
+          <div class="hero-actions" aria-label="Primary report links">
+            <a class="button primary" href="#today">What exists now</a>
+            <a class="button secondary" href="#roadmap">Future build</a>
+          </div>
+        </div>
+
+        <figure class="hero-board" aria-label="Dashboard concept preview">
+          <div class="board-strip">
+            <span>Local SQLite</span>
+            <span>URL hash ID</span>
+            <span>Manual status</span>
+          </div>
+          <div class="board-main">
+            <div class="packet active">
+              <span class="packet-label">Applied</span>
+              <strong>128</strong>
+              <small>Tracked records</small>
+            </div>
+            <div class="packet">
+              <span class="packet-label">Hit rate</span>
+              <strong>31%</strong>
+              <small>Replies / applications</small>
+            </div>
+            <div class="packet">
+              <span class="packet-label">OAs</span>
+              <strong>18</strong>
+              <small>Required or completed</small>
+            </div>
+            <div class="packet verdict">
+              <span class="packet-label">Offers</span>
+              <strong>3</strong>
+              <small>Ready to compare</small>
+            </div>
+          </div>
+          <div class="signal-chart" aria-hidden="true">
+            <span style="height: 32%"></span>
+            <span style="height: 58%"></span>
+            <span style="height: 44%"></span>
+            <span style="height: 74%"></span>
+            <span style="height: 52%"></span>
+            <span style="height: 86%"></span>
+            <span style="height: 68%"></span>
+            <span style="height: 40%"></span>
+          </div>
+          <figcaption>
+            Concept only. The website does not read email, call external APIs, change app data, or calculate offers.
+          </figcaption>
+        </figure>
+      </section>
+
+      <section id="today" class="section inventory" aria-labelledby="today-title">
+        <div class="section-head">
+          <p class="kicker">What you have today</p>
+          <h2 id="today-title">The current product is already a dependable local tracker.</h2>
+          <p>
+            The Python desktop app gives the job search one place to store applications and revisit status without
+            relying on a web service or exposing private data.
+          </p>
+        </div>
+        <div class="inventory-grid">
+          <article>
+            <span class="card-code">LOG</span>
+            <h3>Application capture</h3>
+            <p>Posting URL, job ID, title, company, role type, pay notes, OA state, references, dates, status, and notes.</p>
+          </article>
+          <article>
+            <span class="card-code">DEDUP</span>
+            <h3>Duplicate prevention</h3>
+            <p>Normalized URLs create stable IDs so repeated postings can be flagged before another application is saved.</p>
+          </article>
+          <article>
+            <span class="card-code">LOCAL</span>
+            <h3>Private storage</h3>
+            <p>SQLite keeps application history on the machine and supports the local desktop workflow launched with Python.</p>
+          </article>
+          <article>
+            <span class="card-code">VIEW</span>
+            <h3>Basic review views</h3>
+            <p>All-jobs table, row details, profile notes, resume notes, status updates, and a first dashboard are in place.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="metrics" class="section dashboard-model" aria-labelledby="metrics-title">
+        <div class="section-head compact">
+          <p class="kicker">Dashboard model</p>
+          <h2 id="metrics-title">Metrics should separate effort, response quality, and pipeline progress.</h2>
+        </div>
+        <div class="dashboard-layout">
+          <aside class="question-rail" aria-label="Metric questions">
+            <a href="#volume">Am I applying consistently?</a>
+            <a href="#hit-rate">Which applications get replies?</a>
+            <a href="#pipeline">Where am I stuck?</a>
+            <a href="#follow-up">What needs action next?</a>
+          </aside>
+          <div class="metric-panels">
+            <article id="volume">
+              <span class="metric-tag">Volume</span>
+              <h3>Application pace</h3>
+              <p>Show applications by day and week so bursts, gaps, and momentum are visible without mixing in outcomes.</p>
+            </article>
+            <article id="hit-rate">
+              <span class="metric-tag">Quality</span>
+              <h3>Hit-rate breakdown</h3>
+              <p>Calculate replies divided by applications by source, role type, company, week, and location preference.</p>
+            </article>
+            <article id="pipeline">
+              <span class="metric-tag">Progress</span>
+              <h3>Status funnel</h3>
+              <p>Track applied, OA, interview, rejection, offer, pending, and withdrawn states as one readable funnel.</p>
+            </article>
+            <article id="follow-up">
+              <span class="metric-tag">Action</span>
+              <h3>Follow-up queue</h3>
+              <p>Surface portal checks, recruiter follow-ups, OA deadlines, and applications waiting too long for a reply.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="email" class="section email-plan" aria-labelledby="email-title">
+        <div class="email-diagram" aria-label="Future Gmail and Grok workflow concept">
+          <div class="inbox-card">
+            <strong>Gmail</strong>
+            <span>read-only inbox scope</span>
+          </div>
+          <div class="connector" aria-hidden="true"></div>
+          <div class="inbox-card">
+            <strong>Matcher</strong>
+            <span>company, sender, job ID, title</span>
+          </div>
+          <div class="connector" aria-hidden="true"></div>
+          <div class="inbox-card">
+            <strong>Grok</strong>
+            <span>reply, OA, rejection, offer</span>
+          </div>
+          <div class="connector" aria-hidden="true"></div>
+          <div class="inbox-card final">
+            <strong>Review</strong>
+            <span>confirm before status change</span>
+          </div>
+        </div>
+        <div class="section-head">
+          <p class="kicker">Future email intelligence</p>
+          <h2 id="email-title">Email reading should be narrow, explicit, and reviewable.</h2>
+          <p>
+            The future Gmail and Grok integration should only run after the user connects an account. It should match
+            messages to tracked jobs, summarize relevant emails, classify outcomes, and ask for confirmation before
+            updating important records.
+          </p>
+          <ul class="plain-list">
+            <li>Use read-only Gmail access until write actions are intentionally designed.</li>
+            <li>Keep token storage, mailbox scope, and audit logs visible to the user.</li>
+            <li>Separate email classification from final application status changes.</li>
+          </ul>
+        </div>
+      </section>
+
+      <section id="offers" class="section offer-lab" aria-labelledby="offers-title">
+        <div class="section-head compact">
+          <p class="kicker">Offer comparison</p>
+          <h2 id="offers-title">Acceptance decisions need more than a salary number.</h2>
+        </div>
+        <div class="offer-grid">
+          <article class="offer-card">
+            <h3>Total compensation</h3>
+            <p>Base salary, bonus, signing bonus, equity, vesting schedule, benefits, relocation, and negotiation state.</p>
+          </article>
+          <article class="offer-card">
+            <h3>Area reality</h3>
+            <p>Cost of living, taxes, commute cost, housing pressure, local salary bands, and purchasing power.</p>
+          </article>
+          <article class="offer-card">
+            <h3>Work model</h3>
+            <p>Local, hybrid, remote, travel expectations, office cadence, schedule flexibility, and commute risk.</p>
+          </article>
+          <article class="offer-card decision">
+            <h3>Decision frame</h3>
+            <p>Compare upside, stability, timeline, growth, personal constraints, and acceptance deadlines in one view.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="roadmap" class="section roadmap-section" aria-labelledby="roadmap-title">
+        <div class="section-head">
+          <p class="kicker">Build sequence</p>
+          <h2 id="roadmap-title">A staged roadmap keeps the tracker reliable before adding automation.</h2>
+        </div>
+        <div class="timeline">
+          <article>
+            <span>Now</span>
+            <h3>Polish the tracker</h3>
+            <p>Add edit flows, filters, follow-up dates, source fields, empty states, and clearer dashboard charts.</p>
+          </article>
+          <article>
+            <span>Next</span>
+            <h3>Strengthen the data model</h3>
+            <p>Add tests, schema migrations, backup and restore, event history, and import or export workflows.</p>
+          </article>
+          <article>
+            <span>Later</span>
+            <h3>Add email response review</h3>
+            <p>Design Gmail OAuth, token storage, message matching, Grok classification, and user-confirmed updates.</p>
+          </article>
+          <article>
+            <span>Future</span>
+            <h3>Build offer acceptance tools</h3>
+            <p>Model TC, benefits, location tradeoffs, work model, deadlines, negotiation notes, and final decision criteria.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section closing" aria-labelledby="closing-title">
+        <p class="kicker">Scope boundary</p>
+        <h2 id="closing-title">This page is a product report, not a feature implementation.</h2>
+        <p>
+          It documents what the app can do today and what it can become. It does not connect to Gmail, read messages,
+          call Grok, calculate compensation, change the SQLite database, or alter the desktop app workflow.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>

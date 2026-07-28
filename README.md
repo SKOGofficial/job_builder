@@ -44,6 +44,12 @@ python app.py
 
 The SQLite database is created automatically as `job_applications.sqlite3` in the project folder.
 
+## Product report website
+
+A static product report website is available at `website/index.html`. It describes the current tracker,
+dashboard direction, future Gmail and Grok API integration concept, and offer comparison roadmap without
+implementing those integrations.
+
 ## Data model
 
 The `jobs` table stores every application. Each posting URL is normalized and hashed with SHA-256 to create a stable URL-derived Job ID. If the same URL is used again, the app warns the user and can create a correlated Job ID with a numeric suffix.
