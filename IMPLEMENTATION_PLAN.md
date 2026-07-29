@@ -49,8 +49,61 @@ This file tracks the remaining work for the Job Board Tracker. Keep it current a
 - Add a structured intake queue for copied job URLs that still need review.
 - Add optional page scraping for title, company, pay, and location when a posting URL is provided.
 - Add duplicate detection that considers normalized URL, company, title, and external job IDs when available.
-- Add Gmail or email integration only after OAuth, token storage, and privacy boundaries are designed.
 - Add a browser popup or lightweight companion entry point that writes to the same local API or database safely.
+
+### P1 - Gmail integration (design approved)
+
+Replaces the earlier "design OAuth and privacy boundaries first" placeholder. User approved
+networked email access on 2026-07-29, satisfying the AGENTS.md constraint.
+
+Goal: detect when a company replies about an application so the user knows to revisit the portal.
+
+Dependencies and configuration:
+
+- Add `requirements.txt` with `google-api-python-client`, `google-auth`, `google-auth-oauthlib`,
+  `python-dotenv`, and `keyring`. The app is no longer standard library only; README must say so.
+- OAuth scope is `gmail.readonly`. The app never sends, deletes, or modifies mail.
+- Client ID and client secret live in a gitignored `.env`. For a Desktop OAuth client these are
+  public per RFC 8252 and are treated as configuration, not secrets. PKCE plus the redirect URI
+  restriction is what actually protects the flow.
+- The refresh token is the only real credential. Store it in Windows Credential Manager through
+  `keyring` under service `job_builder_gmail`, never in the project folder.
+- Add `.env` and `client_secret.json` to `.gitignore`. Ship a `.env.example`.
+
+New module `gmail_client.py`, kept out of `app.py`:
+
+- `load_credentials()` reads client config from `.env` and the refresh token from keyring.
+- `run_auth_flow()` runs `InstalledAppFlow` on localhost and stores the refresh token in keyring.
+- `disconnect()` calls Google's revoke endpoint first, then deletes the local token, so a failed
+  revoke never leaves a live token the user can no longer see.
+- `search_messages()` and `get_message_headers()` fetch with `format="metadata"` only.
+
+Matching behavior:
+
+- `JobStore.jobs_awaiting_response()` returns jobs in Pending, Applied, or OA Received with no
+  response date.
+- Build a Gmail query per job from company and application date.
+- Match conservatively on sender domain and company name in subject. Company names are short and
+  collide with unrelated mail, so body matching would produce false positives.
+- Matches are suggestions only. The app never writes a status automatically; the user confirms or
+  dismisses each one. An incorrect silent status write is hard to notice and hard to undo.
+
+Storage and UI:
+
+- New `email_matches` table: `id`, `job_id`, `gmail_message_id`, `sender`, `subject`,
+  `received_date`, `reviewed`, `dismissed`. Message IDs and headers only, no bodies at rest.
+- Created with `CREATE TABLE IF NOT EXISTS`, which is additive and preserves the existing database.
+- New "Email matches" drawer page listing suggestions with Confirm and Dismiss actions.
+- Settings gains Connect Gmail, connection status, and Disconnect.
+- Replies are checked on demand through a "Check for replies" button. No background polling in v1.
+
+Testing:
+
+- Unit test the query builder and matcher against fake headers with no network access.
+- Use a temporary SQLite database for `email_matches` tests.
+
+User prerequisite: create a Google Cloud project, enable the Gmail API, configure the OAuth consent
+screen, and download Desktop app credentials. Consent happens in the user's browser.
 
 ### P2 - Resume and profile workflow
 

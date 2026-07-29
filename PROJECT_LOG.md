@@ -2,6 +2,44 @@
 
 Use this file to record meaningful project changes, implementation decisions, and verification notes.
 
+## 2026-07-29 - Gmail reply detection
+
+- User explicitly approved networked email access, satisfying the AGENTS.md constraint against
+  adding email integration without approval.
+- Added `gmail_client.py` holding all OAuth and Gmail API mechanics, kept out of `app.py`.
+- Added `email_matches` table through `CREATE TABLE IF NOT EXISTS`, which is additive and leaves
+  existing rows in `job_applications.sqlite3` untouched.
+- Added an Email matches page plus Gmail connect, disconnect, and Check for replies in Settings.
+- Added `requirements.txt`, `.env.example`, and a Python 3.14 `.venv`. `.env`, `client_secret.json`,
+  and `.venv/` are gitignored.
+- Added `test_gmail_matching.py` with 22 tests covering slug handling, query building, sender
+  parsing, match rules, and the email_matches store.
+
+Key decisions:
+
+- Matches are suggestions only. The app never writes a job status automatically. A heuristic
+  email match applied silently would be hard to notice and hard to undo, so every match needs
+  an explicit confirm or dismiss.
+- Only `gmail.readonly` is requested, and messages are fetched with `format="metadata"` and a
+  header allowlist, so message bodies are never downloaded or stored.
+- The refresh token goes to Windows Credential Manager through `keyring`. The client ID and
+  secret stay in `.env` because a Desktop OAuth client is a public client per RFC 8252; those
+  values identify the app rather than granting mailbox access.
+- Disconnect revokes with Google before deleting locally, so a failed revoke cannot strand a
+  live token that the app can no longer see.
+- Matching rejects free mail domains such as gmail.com as a domain signal, since short company
+  slugs would otherwise match unrelated mail.
+- The Gmail import is guarded so the tracker still launches as a local-only tool when the
+  packages are absent.
+
+Verification:
+
+- `.venv\Scripts\python.exe -m unittest test_gmail_matching` passes, 22 tests, on Python 3.14.5.
+- Rendered all seven pages programmatically against a temporary database with no errors, and
+  confirmed the drawer lists Email matches.
+- Not yet exercised against a live Google account; that needs the user's own OAuth client and
+  browser consent.
+
 ## 2026-06-23 - Product report website redesign
 
 - Reworked `website/index.html` and `website/styles.css` into a static product report for the Job Builder roadmap.

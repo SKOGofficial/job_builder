@@ -5,6 +5,19 @@ from datetime import date, datetime, timedelta
 from tkinter import messagebox, ttk
 from urllib.parse import urlparse, urlunparse
 
+# Gmail support is optional. The tracker is usable as a purely local tool without
+# the Google libraries installed, so an import failure disables the feature
+# instead of stopping the app from launching.
+try:
+    import gmail_client
+
+    GMAIL_AVAILABLE = True
+    GMAIL_IMPORT_ERROR = ""
+except ImportError as exc:
+    gmail_client = None
+    GMAIL_AVAILABLE = False
+    GMAIL_IMPORT_ERROR = str(exc)
+
 
 DB_PATH = "job_applications.sqlite3"
 
@@ -112,9 +125,23 @@ class JobStore:
                 value TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS email_matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                gmail_message_id TEXT NOT NULL,
+                sender TEXT,
+                subject TEXT,
+                received_date TEXT,
+                reviewed INTEGER NOT NULL DEFAULT 0,
+                dismissed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(job_id, gmail_message_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_jobs_url_hash ON jobs(url_hash);
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
             CREATE INDEX IF NOT EXISTS idx_jobs_application_date ON jobs(application_date);
+            CREATE INDEX IF NOT EXISTS idx_email_matches_job_id ON email_matches(job_id);
             """
         )
         self.conn.commit()
@@ -253,6 +280,82 @@ class JobStore:
             elif status in buckets:
                 buckets[status] += 1
         return buckets
+
+    def jobs_awaiting_response(self):
+        return self.conn.execute(
+            """
+            SELECT * FROM jobs
+            WHERE status IN ('Pending', 'Applied', 'OA Received')
+              AND (response_date IS NULL OR response_date = '')
+            ORDER BY application_date DESC
+            """
+        ).fetchall()
+
+    def record_email_match(self, job_id, message):
+        """Store a suggested match. Ignores duplicates so re-scanning is safe."""
+        now = datetime.now().isoformat(timespec="seconds")
+        cursor = self.conn.execute(
+            """
+            INSERT OR IGNORE INTO email_matches (
+                job_id, gmail_message_id, sender, subject, received_date, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                message["id"],
+                message["sender"],
+                message["subject"],
+                message["date"],
+                now,
+            ),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def pending_email_matches(self):
+        return self.conn.execute(
+            """
+            SELECT m.*, j.position_title, j.company, j.status AS job_status
+            FROM email_matches m
+            JOIN jobs j ON j.job_id = m.job_id
+            WHERE m.reviewed = 0 AND m.dismissed = 0
+            ORDER BY m.created_at DESC
+            """
+        ).fetchall()
+
+    def known_message_ids(self, job_id):
+        rows = self.conn.execute(
+            "SELECT gmail_message_id FROM email_matches WHERE job_id = ?", (job_id,)
+        ).fetchall()
+        return {row["gmail_message_id"] for row in rows}
+
+    def confirm_email_match(self, match_id, status):
+        """Apply a user-confirmed match to the job, then mark the match reviewed.
+
+        The status write happens here rather than during scanning so nothing
+        changes without the user explicitly choosing it.
+        """
+        match = self.conn.execute(
+            "SELECT * FROM email_matches WHERE id = ?", (match_id,)
+        ).fetchone()
+        if match is None:
+            return
+        job = self.conn.execute(
+            "SELECT id FROM jobs WHERE job_id = ?", (match["job_id"],)
+        ).fetchone()
+        if job is not None:
+            self.update_status(job["id"], status)
+        self.conn.execute(
+            "UPDATE email_matches SET reviewed = 1 WHERE id = ?", (match_id,)
+        )
+        self.conn.commit()
+
+    def dismiss_email_match(self, match_id):
+        self.conn.execute(
+            "UPDATE email_matches SET dismissed = 1 WHERE id = ?", (match_id,)
+        )
+        self.conn.commit()
 
     def save_profile_value(self, key, value):
         self.conn.execute(
@@ -496,6 +599,7 @@ class JobTrackerApp(tk.Tk):
         ttk.Label(self.drawer, text="Menu", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 14))
         entries = [
             ("Settings", "settings"),
+            ("Email matches", "email_matches"),
             ("Profile", "profile"),
             ("Resume & Experiences", "resume"),
         ]
@@ -544,6 +648,8 @@ class JobTrackerApp(tk.Tk):
             self.render_dashboard_page()
         elif page == "settings":
             self.render_settings_page()
+        elif page == "email_matches":
+            self.render_email_matches_page()
         elif page == "profile":
             self.render_profile_page()
         elif page == "resume":
@@ -990,6 +1096,221 @@ class JobTrackerApp(tk.Tk):
             anchor="w", pady=(5, 12)
         )
         ttk.Button(card, text="Toggle Dark / Light", style="Primary.TButton", command=self.toggle_theme).pack(anchor="w")
+
+        gmail_card = self.card(self.content)
+        gmail_card.pack(fill="x", pady=(16, 0))
+        ttk.Label(gmail_card, text="Gmail", style="CardTitle.TLabel").pack(anchor="w")
+
+        if not GMAIL_AVAILABLE:
+            ttk.Label(
+                gmail_card,
+                text="Gmail support needs extra packages. Run: pip install -r requirements.txt",
+                style="MutedSurface.TLabel",
+                wraplength=620,
+            ).pack(anchor="w", pady=(5, 0))
+            return
+
+        connected = gmail_client.is_connected()
+        state = "Connected" if connected else "Not connected"
+        ttk.Label(gmail_card, text=f"Status: {state}", style="MutedSurface.TLabel").pack(
+            anchor="w", pady=(5, 4)
+        )
+        ttk.Label(
+            gmail_card,
+            text=(
+                "Read-only access is used to spot replies about your applications. "
+                "The app never sends, deletes, or changes mail, and only reads message "
+                "headers. Sign-in happens in your browser."
+            ),
+            style="MutedSurface.TLabel",
+            wraplength=620,
+        ).pack(anchor="w", pady=(0, 12))
+
+        buttons = ttk.Frame(gmail_card, style="Surface.TFrame")
+        buttons.pack(anchor="w")
+        if connected:
+            ttk.Button(
+                buttons, text="Check for replies", style="Primary.TButton", command=self.scan_gmail
+            ).pack(side="left", padx=(0, 8))
+            ttk.Button(buttons, text="Disconnect", command=self.disconnect_gmail).pack(side="left")
+        else:
+            ttk.Button(
+                buttons, text="Connect Gmail", style="Primary.TButton", command=self.connect_gmail
+            ).pack(side="left")
+
+    def connect_gmail(self):
+        try:
+            gmail_client.run_auth_flow()
+        except gmail_client.GmailNotConfigured as exc:
+            messagebox.showerror("Gmail not configured", str(exc))
+            return
+        except Exception as exc:
+            messagebox.showerror("Could not connect", str(exc))
+            return
+        messagebox.showinfo("Gmail connected", "Gmail is connected with read-only access.")
+        self.show_page("settings")
+
+    def disconnect_gmail(self):
+        if not messagebox.askyesno(
+            "Disconnect Gmail",
+            "Revoke this app's access to your Gmail account and remove the stored token?",
+        ):
+            return
+        try:
+            gmail_client.disconnect()
+        except Exception as exc:
+            messagebox.showerror("Could not disconnect", str(exc))
+            return
+        messagebox.showinfo("Gmail disconnected", "Access was revoked and the token removed.")
+        self.show_page("settings")
+
+    def scan_gmail(self):
+        """Look for replies to open applications and record them as suggestions.
+
+        Nothing is applied to a job here. Every hit becomes a pending suggestion
+        the user confirms or dismisses on the Email matches page.
+        """
+        try:
+            creds = gmail_client.load_credentials()
+        except Exception as exc:
+            messagebox.showerror("Gmail unavailable", str(exc))
+            return
+
+        jobs = self.store.jobs_awaiting_response()
+        if not jobs:
+            messagebox.showinfo("Nothing to check", "No applications are waiting on a response.")
+            return
+
+        found = 0
+        skipped = []
+        for job in jobs:
+            query = gmail_client.build_query(job["company"], job["application_date"])
+            if not query:
+                skipped.append(job["position_title"])
+                continue
+            try:
+                messages = gmail_client.search_messages(query, creds=creds)
+            except Exception as exc:
+                messagebox.showerror(
+                    "Gmail search failed",
+                    f"Stopped after checking {found} match(es).\n\n{exc}",
+                )
+                break
+            seen = self.store.known_message_ids(job["job_id"])
+            for stub in messages:
+                if stub["id"] in seen:
+                    continue
+                headers = gmail_client.get_message_headers(stub["id"], creds=creds)
+                if not gmail_client.message_matches_company(headers, job["company"]):
+                    continue
+                if self.store.record_email_match(job["job_id"], headers):
+                    found += 1
+
+        summary = f"Found {found} new possible repl{'y' if found == 1 else 'ies'}."
+        if skipped:
+            summary += f"\n\nSkipped {len(skipped)} job(s) with no company name recorded."
+        if found:
+            summary += "\n\nReview them on the Email matches page."
+        messagebox.showinfo("Gmail check complete", summary)
+        self.show_page("email_matches")
+
+    def render_email_matches_page(self):
+        ttk.Label(self.content, text="Email matches", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            self.content,
+            text=(
+                "Suggested replies matched to open applications. Nothing is applied until "
+                "you confirm it."
+            ),
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(4, 16))
+
+        if not GMAIL_AVAILABLE:
+            card = self.card(self.content)
+            card.pack(fill="x")
+            ttk.Label(
+                card,
+                text="Gmail support needs extra packages. Run: pip install -r requirements.txt",
+                style="MutedSurface.TLabel",
+                wraplength=620,
+            ).pack(anchor="w")
+            return
+
+        toolbar = ttk.Frame(self.content, style="TFrame")
+        toolbar.pack(fill="x", pady=(0, 12))
+        if gmail_client.is_connected():
+            ttk.Button(
+                toolbar, text="Check for replies", style="Primary.TButton", command=self.scan_gmail
+            ).pack(side="left")
+        else:
+            ttk.Button(
+                toolbar, text="Connect Gmail in Settings", command=lambda: self.show_page("settings")
+            ).pack(side="left")
+
+        matches = self.store.pending_email_matches()
+        if not matches:
+            card = self.card(self.content)
+            card.pack(fill="x")
+            ttk.Label(
+                card,
+                text="No pending matches. Use Check for replies to scan your inbox.",
+                style="MutedSurface.TLabel",
+            ).pack(anchor="w")
+            return
+
+        for match in matches:
+            self.render_email_match_card(match)
+
+    def render_email_match_card(self, match):
+        card = self.card(self.content)
+        card.pack(fill="x", pady=(0, 10))
+        ttk.Label(
+            card,
+            text=f"{match['position_title']} at {match['company'] or 'Unknown company'}",
+            style="CardTitle.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            card,
+            text=f"From: {match['sender']}",
+            style="MutedSurface.TLabel",
+            wraplength=760,
+        ).pack(anchor="w", pady=(6, 0))
+        ttk.Label(
+            card,
+            text=f"Subject: {match['subject']}",
+            style="Surface.TLabel",
+            wraplength=760,
+        ).pack(anchor="w", pady=(2, 0))
+        ttk.Label(
+            card,
+            text=f"Received: {match['received_date']}  |  Current status: {match['job_status']}",
+            style="MutedSurface.TLabel",
+        ).pack(anchor="w", pady=(2, 10))
+
+        actions = ttk.Frame(card, style="Surface.TFrame")
+        actions.pack(fill="x")
+        ttk.Label(actions, text="Set status to", style="Surface.TLabel").pack(side="left")
+        status_var = tk.StringVar(value="Interview")
+        ttk.Combobox(
+            actions, textvariable=status_var, values=STATUSES, state="readonly", width=16
+        ).pack(side="left", padx=8)
+        ttk.Button(
+            actions,
+            text="Confirm",
+            style="Primary.TButton",
+            command=lambda: self.confirm_match(match["id"], status_var.get()),
+        ).pack(side="left", padx=(4, 8))
+        ttk.Button(
+            actions, text="Dismiss", command=lambda: self.dismiss_match(match["id"])
+        ).pack(side="left")
+
+    def confirm_match(self, match_id, status):
+        self.store.confirm_email_match(match_id, status)
+        self.show_page("email_matches")
+
+    def dismiss_match(self, match_id):
+        self.store.dismiss_email_match(match_id)
+        self.show_page("email_matches")
 
     def render_profile_page(self):
         self.render_text_storage_page(
