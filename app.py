@@ -222,6 +222,20 @@ class JobStore:
             counts[row["application_date"]] = row["count"]
         return list(counts.items())
 
+    def cumulative_counts(self, days=14):
+        daily = self.daily_counts(days)
+        if not daily:
+            return daily
+        base = self.conn.execute(
+            "SELECT COUNT(*) AS count FROM jobs WHERE application_date < ?", (daily[0][0],)
+        ).fetchone()["count"]
+        result = []
+        running = base
+        for day, count in daily:
+            running += count
+            result.append((day, running))
+        return result
+
     def status_counts(self):
         rows = self.list_jobs()
         buckets = {
@@ -572,28 +586,42 @@ class JobTrackerApp(tk.Tk):
             "response_date": tk.StringVar(),
         }
 
-        self.field(card, "Job posting URL", "posting_url", 0, width=72)
-        ttk.Button(card, text="Check URL", command=self.check_url).grid(row=0, column=2, padx=(12, 0), sticky="ew")
+        row = 0
+        self.field(card, "Job posting URL", "posting_url", row, width=72)
+        ttk.Button(card, text="Check URL", command=self.check_url).grid(
+            row=row * 2 + 1, column=2, padx=(12, 0), sticky="ew"
+        )
+        row += 1
 
-        self.field(card, "Position title", "position_title", 1)
-        self.field(card, "Company", "company", 1, column=2)
-        self.combo(card, "Type", "job_type", JOB_TYPES, 2)
-        self.combo(card, "Status", "status", STATUSES, 2, column=2)
-        self.field(card, "Payment amount", "payment_amount", 3)
-        self.combo(card, "Payment period", "payment_period", PAY_PERIODS, 3, column=2)
-        self.field(card, "Application date", "application_date", 4)
-        self.field(card, "Response date", "response_date", 4, column=2)
+        self.field(card, "Position title", "position_title", row)
+        self.field(card, "Company", "company", row, column=2)
+        row += 1
+
+        self.combo(card, "Type", "job_type", JOB_TYPES, row)
+        self.combo(card, "Status", "status", STATUSES, row, column=2)
+        row += 1
+
+        self.field(card, "Payment amount", "payment_amount", row)
+        self.combo(card, "Payment period", "payment_period", PAY_PERIODS, row, column=2)
+        row += 1
+
+        self.field(card, "Application date", "application_date", row)
+        self.field(card, "Response date", "response_date", row, column=2)
+        row += 1
 
         checks = ttk.Frame(card, style="Surface.TFrame")
-        checks.grid(row=5, column=0, columnspan=3, sticky="w", pady=(16, 4))
+        checks.grid(row=row * 2, rowspan=2, column=0, columnspan=3, sticky="w", pady=(16, 4))
         for label, key in [
             ("Requires OA", "requires_oa"),
             ("Completed OA", "completed_oa"),
             ("Received references", "received_references"),
         ]:
             ttk.Checkbutton(checks, text=label, variable=self.form_vars[key]).pack(side="left", padx=(0, 20))
+        row += 1
 
-        ttk.Label(card, text="Notes", style="Surface.TLabel").grid(row=6, column=0, sticky="w", pady=(14, 5))
+        ttk.Label(card, text="Notes", style="Surface.TLabel").grid(
+            row=row * 2, column=0, sticky="w", pady=(14, 5)
+        )
         self.notes = tk.Text(
             card,
             height=5,
@@ -606,10 +634,11 @@ class JobTrackerApp(tk.Tk):
             highlightthickness=1,
             highlightbackground=self.theme["border"],
         )
-        self.notes.grid(row=7, column=0, columnspan=3, sticky="ew")
+        self.notes.grid(row=row * 2 + 1, column=0, columnspan=3, sticky="ew")
+        row += 1
 
         actions = ttk.Frame(card, style="Surface.TFrame")
-        actions.grid(row=8, column=0, columnspan=3, sticky="e", pady=(18, 0))
+        actions.grid(row=row * 2, column=0, columnspan=3, sticky="e", pady=(18, 0))
         ttk.Button(actions, text="Clear", command=self.render_add_page).pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="Save Application", style="Primary.TButton", command=self.save_job).pack(side="left")
 
@@ -624,12 +653,20 @@ class JobTrackerApp(tk.Tk):
         entry.grid(row=row * 2 + 1, column=column, columnspan=2 if column == 0 else 1, sticky="ew", padx=(0, 12))
         return entry
 
-    def combo(self, parent, label, key, options, row, column=0):
+    def combo(self, parent, label, key, options, row, column=0, width=None):
         ttk.Label(parent, text=label, style="Surface.TLabel").grid(
             row=row * 2, column=column, sticky="w", pady=(8, 4), padx=(0, 12)
         )
-        combo = ttk.Combobox(parent, textvariable=self.form_vars[key], values=options, state="readonly")
-        combo.grid(row=row * 2 + 1, column=column, sticky="ew", padx=(0, 12))
+        combo = ttk.Combobox(
+            parent, textvariable=self.form_vars[key], values=options, state="readonly", width=width
+        )
+        combo.grid(
+            row=row * 2 + 1,
+            column=column,
+            columnspan=2 if column == 0 else 1,
+            sticky="ew",
+            padx=(0, 12),
+        )
         return combo
 
     def check_url(self):
@@ -826,7 +863,7 @@ class JobTrackerApp(tk.Tk):
         chart_card.pack(side="left", fill="both", expand=True, padx=(0, 12))
         chart_header = ttk.Frame(chart_card, style="Surface.TFrame")
         chart_header.pack(fill="x")
-        ttk.Label(chart_header, text="Applications over time", style="CardTitle.TLabel").pack(side="left")
+        ttk.Label(chart_header, text="Total applications over time", style="CardTitle.TLabel").pack(side="left")
         range_frame = ttk.Frame(chart_header, style="Surface.TFrame")
         range_frame.pack(side="right")
         for label, days in TIME_RANGES:
@@ -872,7 +909,7 @@ class JobTrackerApp(tk.Tk):
 
     def draw_line_chart(self, canvas):
         canvas.delete("all")
-        data = self.store.daily_counts(self.dashboard_range_days)
+        data = self.store.cumulative_counts(self.dashboard_range_days)
         width = max(canvas.winfo_width(), 640)
         height = max(canvas.winfo_height(), 280)
         pad_x, pad_y = 46, 36
@@ -895,10 +932,10 @@ class JobTrackerApp(tk.Tk):
                 canvas.create_text(x, height - 15, text=label, fill=text_color, font=("Segoe UI", 8))
         if len(points) > 1:
             canvas.create_line(*[coord for point in points for coord in point], fill=self.theme["chart"], width=2, smooth=True)
-        for (x, y), (_, count) in zip(points, data):
+        for index, ((x, y), (_, count)) in enumerate(zip(points, data)):
             radius = 3
             canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=self.theme["chart"], outline="")
-            if count:
+            if index == len(points) - 1:
                 canvas.create_text(x, y - 12, text=str(count), fill=self.theme["text"], font=("Segoe UI", 9))
 
     def draw_status_pie(self, canvas):
