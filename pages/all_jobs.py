@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from pages.base import BasePage
-from theme import STATUSES
+from utilities.theme import STATUSES
 
 COLUMNS = ("job_id", "title", "company", "type", "status", "oa", "refs", "payment", "date")
 

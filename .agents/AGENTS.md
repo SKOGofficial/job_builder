@@ -1,6 +1,6 @@
 # Agent Handoff Notes
 
-This repository is a local job application tracker. Future agents should start here, then read `README.md`, `IMPLEMENTATION_PLAN.md`, and `CODEX.md`.
+This repository is a local job application tracker. Future agents should start here, then read `README.md`, `.agents/IMPLEMENTATION_PLAN.md`, and `.agents/CODEX.md`.
 
 ## Mission
 
@@ -35,21 +35,12 @@ modules back into one file.
 
 ## Known State
 
-- `app.py` is the shell and entry point: window, theme, navigation, drawer, and the `card`
-  and `clear` helpers pages draw with.
-- `store.py` holds `JobStore` plus `normalize_url`, `url_hash`, and `today_iso`. It has no
-  Tkinter import so it can be tested headlessly. `JobStore` resolves `DB_PATH` at call time,
-  not as a default argument, so tests can redirect it.
-- `theme.py` holds the palettes, `STATUS_COLORS`, `TIME_RANGES`, the option lists, and
-  `apply_styles`.
-- `pages/` holds one module per page, all subclassing `BasePage` in `pages/base.py`. Profile
-  and Resume share `pages/text_storage.py`. Page instances are created once and reused, so
-  per-page state such as the dashboard range survives navigation.
-- `gmail_client.py` owns OAuth and the Gmail API. `gmail_workflow.py` sits between it and the
-  UI, deciding which jobs to scan and reporting results.
-- `llm_client.py` is an intentionally empty placeholder for LLM orchestration.
+- `app.py` is the shell and entry point: window, theme, navigation, drawer, and shared widget helpers.
+- `utilities/` holds utility modules: `store.py` (`JobStore`, `normalize_url`, `url_hash`, `today_iso`) and `theme.py` (palettes, `STATUS_COLORS`, `TIME_RANGES`, option lists, `apply_styles`). `utilties/` aliases `utilities/`.
+- `pages/` holds one module per page, all subclassing `BasePage` in `pages/base.py`. Profile and Resume share `pages/text_storage.py`. Page instances are created once and reused.
+- `clients/` holds external client integrations: `gmail_client.py` combines OAuth mechanics, Gmail API calls, and `GmailWorkflow` UI orchestration. `llm_client.py` is the placeholder for LLM orchestration.
 - The SQLite schema is created in `JobStore.init_db`, including the `email_matches` table.
-- Tests are `test_gmail_matching.py` and `test_app_pages.py`. The latter needs a display.
+- `tests/` holds test suites: `tests/test_gmail_matching.py` and `tests/test_app_pages.py`.
 
 ## Priority Work
 
@@ -74,4 +65,4 @@ modules back into one file.
 - The requested workflow works from the UI.
 - Dashboard charts are distinct and readable.
 - Documentation reflects the new state.
-- `PROJECT_LOG.md` has a concise entry for the work completed.
+- `.agents/PROJECT_LOG.md` has a concise entry for the work completed.

@@ -7,9 +7,9 @@ so an incorrect heuristic match can never change a record on its own.
 import tkinter as tk
 from tkinter import ttk
 
-from gmail_workflow import MISSING_PACKAGES_HINT
+from clients.gmail_client import MISSING_PACKAGES_HINT
 from pages.base import BasePage
-from theme import STATUSES
+from utilities.theme import STATUSES
 
 
 class EmailMatchesPage(BasePage):

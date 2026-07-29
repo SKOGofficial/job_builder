@@ -5,8 +5,8 @@ from datetime import datetime
 from tkinter import messagebox, ttk
 
 from pages.base import BasePage
-from store import today_iso, url_hash
-from theme import JOB_TYPES, PAY_PERIODS, STATUSES
+from utilities.store import today_iso, url_hash
+from utilities.theme import JOB_TYPES, PAY_PERIODS, STATUSES
 
 
 class AddApplicationPage(BasePage):

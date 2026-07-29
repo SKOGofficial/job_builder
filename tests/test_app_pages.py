@@ -12,9 +12,9 @@ import tempfile
 import unittest
 
 import app
-import store
+import utilities.store as store
 from pages import DRAWER_ENTRIES, NAV_TABS, PAGE_CLASSES
-from theme import TIME_RANGES
+from utilities.theme import TIME_RANGES
 
 
 def display_available():

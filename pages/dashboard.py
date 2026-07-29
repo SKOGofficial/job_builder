@@ -9,7 +9,7 @@ from datetime import datetime
 from tkinter import ttk
 
 from pages.base import BasePage
-from theme import STATUS_COLORS, TIME_RANGES
+from utilities.theme import STATUS_COLORS, TIME_RANGES
 
 STAT_TILES = [
     ("Jobs applied", "total"),

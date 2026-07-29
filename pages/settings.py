@@ -2,7 +2,7 @@
 
 from tkinter import ttk
 
-from gmail_workflow import MISSING_PACKAGES_HINT
+from clients.gmail_client import MISSING_PACKAGES_HINT
 from pages.base import BasePage
 
 

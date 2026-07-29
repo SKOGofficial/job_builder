@@ -128,4 +128,4 @@ screen, and download Desktop app credentials. Consent happens in the user's brow
 - Dashboard graphs answer different questions and do not repeat the same metric in different shapes.
 - The UI is readable in dark and light mode with no broken characters.
 - Existing `job_applications.sqlite3` data is preserved through migrations.
-- README, `CODEX.md`, `AGENTS.md`, and this file stay aligned with the actual app.
+- README, `.agents/CODEX.md`, `.agents/AGENTS.md`, and this file stay aligned with the actual app.

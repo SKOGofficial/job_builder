@@ -13,8 +13,9 @@ Primary goal: make it easy to record every job application, detect duplicate pos
 - `app.py`: Tkinter application, SQLite store, dashboard drawing, profile storage, and all UI logic.
 - `README.md`: user-facing project overview and run instructions.
 - `job_applications.sqlite3`: local user data, ignored by git. Do not delete, reset, overwrite, or commit it.
-- `IMPLEMENTATION_PLAN.md`: feature backlog and acceptance checklist.
-- `PROJECT_LOG.md`: project activity log.
+- `.agents/IMPLEMENTATION_PLAN.md`: feature backlog and acceptance checklist.
+- `.agents/PROJECT_LOG.md`: project activity log.
+- `.agents/AGENTS.md`: agent handoff notes and constraints.
 
 ## Current Behavior
 
@@ -32,7 +33,7 @@ Primary goal: make it easy to record every job application, detect duplicate pos
 - Prefer small, verifiable changes over broad rewrites.
 - Keep UI dense, readable, and task-oriented.
 - Before changing UI text, check for broken encoding characters around the menu icon and detail separators.
-- Update `IMPLEMENTATION_PLAN.md` and `PROJECT_LOG.md` when completing meaningful work.
+- Update `.agents/IMPLEMENTATION_PLAN.md` and `.agents/PROJECT_LOG.md` when completing meaningful work.
 
 ## Verification
 

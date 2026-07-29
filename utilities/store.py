@@ -4,11 +4,13 @@ This module holds no Tkinter code so it can be imported and tested headlessly.
 """
 
 import hashlib
+import os
 import sqlite3
 from datetime import date, datetime, timedelta
 from urllib.parse import urlparse, urlunparse
 
-DB_PATH = "job_applications.sqlite3"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, "job_applications.sqlite3")
 
 
 def normalize_url(url):

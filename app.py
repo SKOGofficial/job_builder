@@ -13,10 +13,13 @@ Run it with:
 import tkinter as tk
 from tkinter import ttk
 
-from gmail_workflow import GMAIL_AVAILABLE, GMAIL_IMPORT_ERROR, GmailWorkflow, gmail_client
+import clients.gmail_client as _gmail_client_mod
+from clients.gmail_client import GMAIL_AVAILABLE, GMAIL_IMPORT_ERROR, GmailWorkflow
+
+gmail_client = _gmail_client_mod if GMAIL_AVAILABLE else None
 from pages import DRAWER_ENTRIES, NAV_TABS, PAGE_CLASSES
-from store import DB_PATH, JobStore, normalize_url, today_iso, url_hash
-from theme import (
+from utilities.store import DB_PATH, JobStore, normalize_url, today_iso, url_hash
+from utilities.theme import (
     JOB_TYPES,
     PAY_PERIODS,
     STATUS_COLORS,

@@ -13,13 +13,8 @@ import unittest
 from datetime import date, timedelta
 
 import app
-
-try:
-    import gmail_client
-
-    HAVE_GMAIL = True
-except ImportError:
-    HAVE_GMAIL = False
+import clients.gmail_client as gmail_client
+from clients.gmail_client import GMAIL_AVAILABLE as HAVE_GMAIL
 
 
 @unittest.skipUnless(HAVE_GMAIL, "google/keyring packages not installed")

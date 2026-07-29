@@ -2,6 +2,24 @@
 
 Use this file to record meaningful project changes, implementation decisions, and verification notes.
 
+## 2026-07-29 - Codebase reorganization: clients, utilities, and tests
+
+- Organized client integrations into `clients/` directory (`clients/gmail_client.py` and `clients/llm_client.py`).
+- Combined `gmail_client.py` and `gmail_workflow.py` into a single module `clients/gmail_client.py` containing OAuth mechanics, Gmail API calls, and `GmailWorkflow` UI orchestration.
+- Organized utility files into `utilities/` (`utilities/store.py` and `utilities/theme.py`) and provided a `utilties/` alias package for compatibility.
+- Updated `JobStore.DB_PATH` in `utilities/store.py` to calculate absolute path relative to project root (`BASE_DIR`) so database resolution is robust across working directories.
+- Organized unit and UI integration tests into `tests/` directory (`tests/test_gmail_matching.py` and `tests/test_app_pages.py`).
+- Updated relative imports across `app.py`, `pages/`, `clients/`, `utilities/`, `tests/`, and `.github/workflows/tests.yml`.
+- Removed redundant root-level files (`gmail_client.py`, `gmail_workflow.py`, `llm_client.py`, `store.py`, `theme.py`, `test_app_pages.py`, `test_gmail_matching.py`).
+
+Verification:
+- `python -m compileall -q app.py clients utilities utilties pages tests` passed with 0 errors.
+- `python -m unittest discover -s tests -p "test_*.py"` passed (34 tests run, 0 failures, 0 errors).
+
+- Moved `AGENTS.md`, `CODEX.md`, `IMPLEMENTATION_PLAN.md`, and `PROJECT_LOG.md` into `.agents/` directory.
+- Configured configuration pointers in `.claude/` and `.codex/` so all agents (Claude, Codex, Antigravity) automatically discover their instruction files.
+- Updated `README.md` and document internal links to reference `.agents/` paths.
+
 ## 2026-07-29 - Gmail reply detection
 
 - User explicitly approved networked email access, satisfying the AGENTS.md constraint against

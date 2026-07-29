@@ -1,6 +1,7 @@
-"""Gmail read-only access for the Job Board Tracker.
+"""Gmail read-only access and workflow integration for the Job Board Tracker.
 
-Kept separate from app.py so the UI never touches OAuth mechanics directly.
+Combines OAuth mechanics, Gmail API calls, and UI workflow orchestration into a
+single module so external service details stay out of the UI.
 
 Credential model:
 
@@ -17,14 +18,29 @@ modifies mail.
 import os
 import re
 from datetime import date, timedelta
+from tkinter import messagebox
 
-import keyring
-import requests
-from dotenv import load_dotenv
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
+try:
+    import keyring
+    import requests
+    from dotenv import load_dotenv
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+
+    GMAIL_AVAILABLE = True
+    GMAIL_IMPORT_ERROR = ""
+except ImportError as exc:
+    keyring = None
+    requests = None
+    load_dotenv = None
+    Request = None
+    Credentials = None
+    InstalledAppFlow = None
+    build = None
+    GMAIL_AVAILABLE = False
+    GMAIL_IMPORT_ERROR = str(exc)
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
@@ -33,6 +49,10 @@ KEYRING_USERNAME = "refresh_token"
 
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 REVOKE_URI = "https://oauth2.googleapis.com/revoke"
+
+MISSING_PACKAGES_HINT = (
+    "Gmail support needs extra packages. Run: pip install -r requirements.txt"
+)
 
 
 class GmailNotConfigured(Exception):
@@ -44,9 +64,13 @@ class GmailNotConnected(Exception):
 
 
 def client_config():
-    load_dotenv()
-    client_id = os.environ.get("GMAIL_CLIENT_ID", "").strip()
-    client_secret = os.environ.get("GMAIL_CLIENT_SECRET", "").strip()
+    if load_dotenv:
+        env_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
+        )
+        load_dotenv(dotenv_path=env_path)
+    client_id = os.environ.get("GMAIL_CLIENT_ID", "").strip() if os.environ else ""
+    client_secret = os.environ.get("GMAIL_CLIENT_SECRET", "").strip() if os.environ else ""
     if not client_id or not client_secret:
         raise GmailNotConfigured(
             "GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET must be set in .env. "
@@ -56,6 +80,8 @@ def client_config():
 
 
 def stored_refresh_token():
+    if not keyring:
+        return None
     return keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
 
 
@@ -130,8 +156,6 @@ def disconnect():
         headers={"content-type": "application/x-www-form-urlencoded"},
         timeout=15,
     )
-    # 200 means revoked. 400 usually means it was already invalid, which is
-    # equally fine to clear locally. Anything else is a real failure.
     if response.status_code not in (200, 400):
         raise RuntimeError(
             f"Could not revoke the token with Google (HTTP {response.status_code}). "
@@ -195,16 +219,12 @@ def sender_domain(sender):
     return match.group(1).lower() if match else ""
 
 
-# Suffixes stripped before turning a company name into a domain guess or a
-# subject keyword, so "Acme Corp." and "Acme" behave the same.
 COMPANY_SUFFIXES = {
     "inc", "inc.", "llc", "l.l.c.", "ltd", "ltd.", "limited", "corp", "corp.",
     "corporation", "co", "co.", "company", "plc", "gmbh", "ag", "sa", "nv", "bv",
     "group", "holdings", "technologies", "technology", "labs", "systems",
 }
 
-# Free and shared mail domains never count as a domain match. A recruiter mailing
-# from gmail.com would otherwise match every job whose company slug is short.
 GENERIC_DOMAINS = {
     "gmail.com", "googlemail.com", "yahoo.com", "outlook.com", "hotmail.com",
     "live.com", "icloud.com", "aol.com", "proton.me", "protonmail.com",
@@ -250,3 +270,92 @@ def message_matches_company(message, company):
             return True
     subject_slug = company_slug(message.get("subject", ""))
     return bool(subject_slug) and slug in subject_slug
+
+
+class GmailWorkflow:
+    def __init__(self, app):
+        self.app = app
+
+    @property
+    def available(self):
+        return GMAIL_AVAILABLE
+
+    def is_connected(self):
+        return GMAIL_AVAILABLE and is_connected()
+
+    def connect(self):
+        try:
+            run_auth_flow()
+        except GmailNotConfigured as exc:
+            messagebox.showerror("Gmail not configured", str(exc))
+            return
+        except Exception as exc:
+            messagebox.showerror("Could not connect", str(exc))
+            return
+        messagebox.showinfo("Gmail connected", "Gmail is connected with read-only access.")
+        self.app.show_page("settings")
+
+    def disconnect(self):
+        if not messagebox.askyesno(
+            "Disconnect Gmail",
+            "Revoke this app's access to your Gmail account and remove the stored token?",
+        ):
+            return
+        try:
+            disconnect()
+        except Exception as exc:
+            messagebox.showerror("Could not disconnect", str(exc))
+            return
+        messagebox.showinfo("Gmail disconnected", "Access was revoked and the token removed.")
+        self.app.show_page("settings")
+
+    def scan(self):
+        """Look for replies to open applications and record them as suggestions.
+
+        Nothing is applied to a job here. Every hit becomes a pending suggestion
+        the user confirms or dismisses on the Email matches page.
+        """
+        store = self.app.store
+        try:
+            creds = load_credentials()
+        except Exception as exc:
+            messagebox.showerror("Gmail unavailable", str(exc))
+            return
+
+        jobs = store.jobs_awaiting_response()
+        if not jobs:
+            messagebox.showinfo("Nothing to check", "No applications are waiting on a response.")
+            return
+
+        found = 0
+        skipped = []
+        for job in jobs:
+            query = build_query(job["company"], job["application_date"])
+            if not query:
+                skipped.append(job["position_title"])
+                continue
+            try:
+                messages = search_messages(query, creds=creds)
+            except Exception as exc:
+                messagebox.showerror(
+                    "Gmail search failed",
+                    f"Stopped after checking {found} match(es).\n\n{exc}",
+                )
+                break
+            seen = store.known_message_ids(job["job_id"])
+            for stub in messages:
+                if stub["id"] in seen:
+                    continue
+                headers = get_message_headers(stub["id"], creds=creds)
+                if not message_matches_company(headers, job["company"]):
+                    continue
+                if store.record_email_match(job["job_id"], headers):
+                    found += 1
+
+        summary = f"Found {found} new possible repl{'y' if found == 1 else 'ies'}."
+        if skipped:
+            summary += f"\n\nSkipped {len(skipped)} job(s) with no company name recorded."
+        if found:
+            summary += "\n\nReview them on the Email matches page."
+        messagebox.showinfo("Gmail check complete", summary)
+        self.app.show_page("email_matches")
