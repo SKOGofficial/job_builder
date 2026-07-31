@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 job_applications.sqlite3
+job_applications.backup-*.sqlite3
 *.sqlite3-journal
 .env
 client_secret.json

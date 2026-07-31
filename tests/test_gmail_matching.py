@@ -5,6 +5,7 @@ pure functions, and the store tests run against a temporary SQLite database so
 the real job_applications.sqlite3 is never touched.
 """
 
+import base64
 import os
 import sqlite3
 import sys
@@ -88,11 +89,91 @@ class MessageMatchesCompanyTests(unittest.TestCase):
         self.assertFalse(gmail_client.message_matches_company(msg, ""))
 
     def test_body_text_is_not_consulted(self):
-        # Only headers are ever fetched, so a company name appearing elsewhere
-        # must not produce a match.
+        # Matches store body text, but the decision stays on headers alone: a
+        # company name appearing in the body must not produce a match.
         msg = self.message(sender="news@unrelated.com", subject="Newsletter")
         msg["body"] = "Acme Acme Acme"
         self.assertFalse(gmail_client.message_matches_company(msg, "Acme"))
+
+
+def encode_part(text):
+    """Base64url without padding, the way the Gmail API returns part data."""
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+@unittest.skipUnless(HAVE_GMAIL, "google/keyring packages not installed")
+class ExtractBodyTests(unittest.TestCase):
+    def test_single_plain_text_part(self):
+        payload = {"mimeType": "text/plain", "body": {"data": encode_part("Hello there")}}
+        self.assertEqual(gmail_client.extract_body(payload), "Hello there")
+
+    def test_prefers_plain_text_over_html(self):
+        payload = {
+            "mimeType": "multipart/alternative",
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": encode_part("plain version")}},
+                {"mimeType": "text/html", "body": {"data": encode_part("<p>html version</p>")}},
+            ],
+        }
+        self.assertEqual(gmail_client.extract_body(payload), "plain version")
+
+    def test_falls_back_to_html_with_tags_stripped(self):
+        markup = "<html><body><p>Thanks for applying &amp; good luck</p></body></html>"
+        payload = {
+            "mimeType": "multipart/alternative",
+            "parts": [{"mimeType": "text/html", "body": {"data": encode_part(markup)}}],
+        }
+        body = gmail_client.extract_body(payload)
+        self.assertIn("Thanks for applying & good luck", body)
+        self.assertNotIn("<p>", body)
+
+    def test_html_script_and_style_are_dropped(self):
+        markup = "<style>p{color:red}</style><script>alert(1)</script><p>Real text</p>"
+        payload = {"mimeType": "text/html", "body": {"data": encode_part(markup)}}
+        body = gmail_client.extract_body(payload)
+        self.assertEqual(body, "Real text")
+
+    def test_walks_nested_multipart(self):
+        payload = {
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {
+                    "mimeType": "multipart/alternative",
+                    "parts": [
+                        {"mimeType": "text/plain", "body": {"data": encode_part("buried text")}}
+                    ],
+                }
+            ],
+        }
+        self.assertEqual(gmail_client.extract_body(payload), "buried text")
+
+    def test_attachments_contribute_nothing(self):
+        # An attachment part carries an attachmentId instead of inline data, so
+        # nothing is fetched or decoded for it.
+        payload = {
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": encode_part("see attached")}},
+                {"mimeType": "application/pdf", "body": {"attachmentId": "abc", "size": 9001}},
+            ],
+        }
+        self.assertEqual(gmail_client.extract_body(payload), "see attached")
+
+    def test_missing_or_unreadable_data_yields_empty_string(self):
+        self.assertEqual(gmail_client.extract_body({}), "")
+        self.assertEqual(gmail_client.extract_body({"mimeType": "text/plain", "body": {}}), "")
+        self.assertEqual(
+            gmail_client.extract_body(
+                {"mimeType": "text/plain", "body": {"data": "!!!not base64!!!"}}
+            ),
+            "",
+        )
+
+    def test_long_body_is_truncated(self):
+        payload = {"mimeType": "text/plain", "body": {"data": encode_part("x" * 500)}}
+        body = gmail_client.extract_body(payload, max_chars=100)
+        self.assertTrue(body.startswith("x" * 100))
+        self.assertIn("truncated", body)
 
 
 class EmailMatchStoreTests(unittest.TestCase):
@@ -185,6 +266,24 @@ class EmailMatchStoreTests(unittest.TestCase):
         self.assertEqual(job["status"], "Applied")
         self.assertEqual(self.store.pending_email_matches(), [])
 
+    def test_body_and_snippet_round_trip(self):
+        job_id = self.add_job()
+        message = self.sample_message()
+        message["body"] = "Hi, we would like to schedule a call.\n\nBest,\nRecruiting"
+        message["snippet"] = "Hi, we would like to schedule a call."
+        self.store.record_email_match(job_id, message)
+        match = self.store.pending_email_matches()[0]
+        self.assertEqual(match["body_text"], message["body"])
+        self.assertEqual(match["snippet"], message["snippet"])
+
+    def test_match_without_body_still_records(self):
+        # A failed body fetch must not cost us the match.
+        job_id = self.add_job()
+        self.assertTrue(self.store.record_email_match(job_id, self.sample_message()))
+        match = self.store.pending_email_matches()[0]
+        self.assertEqual(match["body_text"], "")
+        self.assertEqual(match["snippet"], "")
+
     def test_email_matches_table_is_additive(self):
         # Opening an existing database must not disturb the jobs table.
         job_id = self.add_job()
@@ -192,6 +291,71 @@ class EmailMatchStoreTests(unittest.TestCase):
         self.assertEqual(len(reopened.list_jobs()), 1)
         self.assertEqual(reopened.list_jobs()[0]["job_id"], job_id)
         reopened.conn.close()
+
+
+class SchemaMigrationTests(unittest.TestCase):
+    """Opening a pre-body database must widen it without losing rows."""
+
+    OLD_SCHEMA = """
+        CREATE TABLE email_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            gmail_message_id TEXT NOT NULL,
+            sender TEXT,
+            subject TEXT,
+            received_date TEXT,
+            reviewed INTEGER NOT NULL DEFAULT 0,
+            dismissed INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(job_id, gmail_message_id)
+        );
+    """
+
+    def setUp(self):
+        handle, self.db_path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(handle)
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript(self.OLD_SCHEMA)
+        conn.execute(
+            """
+            INSERT INTO email_matches (
+                job_id, gmail_message_id, sender, subject, received_date, created_at
+            )
+            VALUES ('JOB1', 'msg-old', 'careers@acme.com', 'Old match', '', '2026-07-01')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def test_missing_columns_are_added(self):
+        store = app.JobStore(self.db_path)
+        columns = {
+            row["name"] for row in store.conn.execute("PRAGMA table_info(email_matches)")
+        }
+        self.assertIn("body_text", columns)
+        self.assertIn("snippet", columns)
+        store.conn.close()
+
+    def test_existing_rows_survive_with_empty_body(self):
+        store = app.JobStore(self.db_path)
+        row = store.conn.execute(
+            "SELECT subject, body_text FROM email_matches WHERE gmail_message_id = 'msg-old'"
+        ).fetchone()
+        self.assertEqual(row["subject"], "Old match")
+        self.assertIsNone(row["body_text"])
+        store.conn.close()
+
+    def test_migration_is_idempotent(self):
+        app.JobStore(self.db_path).conn.close()
+        # A second open must not fail on already-present columns.
+        store = app.JobStore(self.db_path)
+        self.assertEqual(
+            store.conn.execute("SELECT COUNT(*) AS n FROM email_matches").fetchone()["n"], 1
+        )
+        store.conn.close()
 
 
 if __name__ == "__main__":

@@ -50,8 +50,9 @@ class SettingsPage(BasePage):
             card,
             text=(
                 "Read-only access is used to spot replies about your applications. "
-                "The app never sends, deletes, or changes mail, and only reads message "
-                "headers. Sign-in happens in your browser."
+                "The app never sends, deletes, or changes mail. Headers decide what "
+                "matches; the message text is then saved for matched mail only, so you "
+                "can read it on the Email matches page. Sign-in happens in your browser."
             ),
             style="MutedSurface.TLabel",
             wraplength=620,
