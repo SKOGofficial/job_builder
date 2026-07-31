@@ -95,7 +95,7 @@ Labels:
 - Rejected: the application was turned down.
 - Offer: a job offer is being extended.
 - Interview: an interview, call, or meeting is being invited or scheduled.
-- OA Received: an online assessment, coding test, or take-home task is requested.
+- OA Received: an online assessment or coding test.
 - Acknowledgement: the email only confirms the application was received, or is \
 otherwise routine with no decision in it.
 - Unclear: anything else, including marketing, newsletters, and mail that is not \
