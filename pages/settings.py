@@ -5,6 +5,7 @@ from tkinter import messagebox, ttk
 from clients import llm_client
 from clients.gmail_client import MISSING_PACKAGES_HINT
 from pages.base import BasePage
+from utilities import credentials
 
 
 class SettingsPage(BasePage):
@@ -99,6 +100,8 @@ class SettingsPage(BasePage):
             source = "read from .env"
         else:
             source = "not set"
+        if not credentials.backend_available():
+            source += " (no credential store on this machine)"
         ttk.Label(
             card, text=f"API key: {source}", style="MutedSurface.TLabel"
         ).pack(anchor="w", pady=(5, 2))
@@ -137,7 +140,9 @@ class SettingsPage(BasePage):
                 style="Primary.TButton",
                 command=self.test_groq,
             ).pack(side="left", padx=(0, 8))
-        if configured and not in_keyring:
+        # Offering to move the key somewhere that cannot store it would only
+        # produce an error, so the button appears once a backend answers.
+        if configured and not in_keyring and credentials.backend_available():
             ttk.Button(
                 buttons, text="Move key to Credential Manager", command=self.move_groq_key
             ).pack(side="left", padx=(0, 8))

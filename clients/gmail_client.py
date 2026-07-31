@@ -27,6 +27,8 @@ import re
 from datetime import date, timedelta
 from tkinter import messagebox
 
+from utilities import credentials
+
 try:
     import keyring
     import requests
@@ -91,9 +93,13 @@ def client_config():
 
 
 def stored_refresh_token():
-    if not keyring:
-        return None
-    return keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+    """Return the stored refresh token, or None when none is available.
+
+    A machine with no usable credential store reports no token rather than
+    raising, which reads as "not connected" — the same as never having
+    connected, and the state the Settings page already handles.
+    """
+    return credentials.read_secret(KEYRING_SERVICE, KEYRING_USERNAME)
 
 
 def is_connected():
@@ -147,7 +153,7 @@ def run_auth_flow():
             "Google did not return a refresh token. Revoke the app's access in your "
             "Google account settings and connect again."
         )
-    keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, creds.refresh_token)
+    credentials.write_secret(KEYRING_SERVICE, KEYRING_USERNAME, creds.refresh_token)
     return creds
 
 
@@ -172,7 +178,7 @@ def disconnect():
             f"Could not revoke the token with Google (HTTP {response.status_code}). "
             "The local token was kept so you can retry."
         )
-    keyring.delete_password(KEYRING_SERVICE, KEYRING_USERNAME)
+    credentials.delete_secret(KEYRING_SERVICE, KEYRING_USERNAME)
     return True
 
 

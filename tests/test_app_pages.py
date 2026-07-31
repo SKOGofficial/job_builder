@@ -14,6 +14,7 @@ import unittest
 import app
 import clients.llm_client as llm
 import utilities.store as store
+from utilities import credentials
 from pages import DRAWER_ENTRIES, NAV_TABS, PAGE_CLASSES
 from pages.email_matches import NO_BODY_HINT
 from utilities.theme import TIME_RANGES
@@ -38,6 +39,22 @@ def button_texts(widget):
 
 def label_texts(widget):
     return [w.cget("text") for w in widgets_of_class(widget, "TLabel")]
+
+
+class FailingKeyring:
+    """A machine where keyring is installed but no backend answers.
+
+    Defined here rather than imported so this module stays runnable on its own.
+    """
+
+    def get_password(self, service, username):
+        raise credentials.KeyringError("No recommended backend was available")
+
+    def set_password(self, service, username, value):
+        raise credentials.KeyringError("No recommended backend was available")
+
+    def delete_password(self, service, username):
+        raise credentials.KeyringError("No recommended backend was available")
 
 
 def display_available():
@@ -106,6 +123,18 @@ class PageRenderTests(unittest.TestCase):
         self.assertEqual(os.path.normcase(path), os.path.normcase(self.db_path))
 
     def test_every_page_renders(self):
+        for name in PAGE_NAMES:
+            with self.subTest(page=name):
+                self.gui.show_page(name)
+                self.gui.update_idletasks()
+
+    def test_every_page_renders_without_a_credential_store(self):
+        # The Linux and CI case: keyring is installed but no backend answers.
+        # Rendering must not depend on a credential store being present, and a
+        # missing one must read as "no stored secret" rather than an error.
+        saved = credentials.keyring
+        credentials.keyring = FailingKeyring()
+        self.addCleanup(setattr, credentials, "keyring", saved)
         for name in PAGE_NAMES:
             with self.subTest(page=name):
                 self.gui.show_page(name)

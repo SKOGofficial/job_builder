@@ -39,15 +39,15 @@ import queue
 import threading
 import time
 
+from utilities import credentials
+
 try:
-    import keyring
     import requests
     from dotenv import load_dotenv
 
     GROQ_AVAILABLE = True
     GROQ_IMPORT_ERROR = ""
 except ImportError as exc:  # pragma: no cover - exercised only without the deps
-    keyring = None
     requests = None
     load_dotenv = None
     GROQ_AVAILABLE = False
@@ -134,24 +134,21 @@ def _load_env():
 
 
 def stored_api_key():
-    """Return the key held in the OS credential store, if any."""
-    if not keyring:
-        return None
-    return keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+    """Return the key held in the OS credential store, if any.
+
+    Reports None rather than raising on a machine with no credential store, so
+    the .env fallback below is what actually runs there.
+    """
+    return credentials.read_secret(KEYRING_SERVICE, KEYRING_USERNAME)
 
 
 def save_api_key(value):
     """Move a key into the OS credential store."""
-    if not keyring:
-        raise GroqNotConfigured(MISSING_PACKAGES_HINT)
-    keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, value.strip())
+    credentials.write_secret(KEYRING_SERVICE, KEYRING_USERNAME, value.strip())
 
 
 def forget_api_key():
-    if keyring and stored_api_key():
-        keyring.delete_password(KEYRING_SERVICE, KEYRING_USERNAME)
-        return True
-    return False
+    return credentials.delete_secret(KEYRING_SERVICE, KEYRING_USERNAME)
 
 
 def api_key():

@@ -143,6 +143,9 @@ How your data is handled:
   instruct the classifier is labelled Unclear rather than obeyed.
 - The Groq key is a real credential, unlike the Gmail Desktop client ID and secret which are
   public per RFC 8252, so it is read from the OS credential store first.
+- On a machine with no usable credential store — a bare Linux install, a CI runner, a headless
+  server — that read reports nothing and `.env` is used instead. Storing a secret still fails
+  loudly there, since silently not saving a credential is worse than an error.
 
 ## Tests
 

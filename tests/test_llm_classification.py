@@ -15,6 +15,7 @@ import unittest
 
 import app
 import clients.llm_client as llm
+from utilities import credentials
 
 
 class FakeResponse:
@@ -52,8 +53,9 @@ class EnvIsolationMixin:
         # _load_env would otherwise pull in the real .env.
         self.saved_loader = llm.load_dotenv
         llm.load_dotenv = None
-        self.saved_keyring = llm.keyring
-        llm.keyring = None
+        # Keep the developer's real credential store out of the tests.
+        self.saved_keyring = credentials.keyring
+        credentials.keyring = None
         self.addCleanup(self.restore_env)
 
     def restore_env(self):
@@ -63,7 +65,7 @@ class EnvIsolationMixin:
             else:
                 os.environ[name] = value
         llm.load_dotenv = self.saved_loader
-        llm.keyring = self.saved_keyring
+        credentials.keyring = self.saved_keyring
 
 
 class FakeKeyring:
@@ -80,6 +82,58 @@ class FakeKeyring:
         self.value = None
 
 
+class FailingKeyring:
+    """A machine where keyring is installed but no backend answers."""
+
+    def get_password(self, service, username):
+        raise credentials.KeyringError("No recommended backend was available")
+
+    def set_password(self, service, username, value):
+        raise credentials.KeyringError("No recommended backend was available")
+
+    def delete_password(self, service, username):
+        raise credentials.KeyringError("No recommended backend was available")
+
+
+class CredentialStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(setattr, credentials, "keyring", credentials.keyring)
+
+    def test_read_reports_nothing_when_no_backend_answers(self):
+        credentials.keyring = FailingKeyring()
+        self.assertIsNone(credentials.read_secret("service", "user"))
+
+    def test_read_reports_nothing_when_the_package_is_missing(self):
+        credentials.keyring = None
+        self.assertIsNone(credentials.read_secret("service", "user"))
+
+    def test_backend_available_is_false_without_a_backend(self):
+        credentials.keyring = FailingKeyring()
+        self.assertFalse(credentials.backend_available())
+        credentials.keyring = None
+        self.assertFalse(credentials.backend_available())
+
+    def test_write_raises_so_a_lost_secret_is_never_silent(self):
+        credentials.keyring = FailingKeyring()
+        with self.assertRaises(credentials.CredentialStoreUnavailable):
+            credentials.write_secret("service", "user", "value")
+        credentials.keyring = None
+        with self.assertRaises(credentials.CredentialStoreUnavailable):
+            credentials.write_secret("service", "user", "value")
+
+    def test_delete_reports_false_without_a_backend(self):
+        credentials.keyring = FailingKeyring()
+        self.assertFalse(credentials.delete_secret("service", "user"))
+
+    def test_round_trip_with_a_working_backend(self):
+        credentials.keyring = FakeKeyring()
+        credentials.write_secret("service", "user", "secret")
+        self.assertEqual(credentials.read_secret("service", "user"), "secret")
+        self.assertTrue(credentials.delete_secret("service", "user"))
+        self.assertIsNone(credentials.read_secret("service", "user"))
+        self.assertFalse(credentials.delete_secret("service", "user"))
+
+
 class ConfigTests(EnvIsolationMixin, unittest.TestCase):
     def setUp(self):
         self.isolate_env()
@@ -90,9 +144,21 @@ class ConfigTests(EnvIsolationMixin, unittest.TestCase):
 
     def test_keyring_wins_over_env(self):
         # The stored key is the real credential, so it takes precedence.
-        llm.keyring = FakeKeyring("keyring-key")
+        credentials.keyring = FakeKeyring("keyring-key")
         os.environ["GROQ_API_KEY"] = "env-key"
         self.assertEqual(llm.api_key(), "keyring-key")
+
+    def test_env_is_used_when_the_credential_store_is_unusable(self):
+        # The CI case: keyring installed, nothing behind it. Reading the key
+        # must fall through to .env instead of taking the page down.
+        credentials.keyring = FailingKeyring()
+        os.environ["GROQ_API_KEY"] = "env-key"
+        self.assertEqual(llm.api_key(), "env-key")
+        self.assertTrue(llm.is_configured())
+
+    def test_unconfigured_without_keyring_or_env_does_not_raise_upward(self):
+        credentials.keyring = FailingKeyring()
+        self.assertFalse(llm.is_configured())
 
     def test_placeholder_key_counts_as_unconfigured(self):
         # Copying .env.example without editing it must not send a junk key.
