@@ -96,14 +96,76 @@ How matching works:
   to fetch it.
 - Scanning runs only when you press **Check for replies**. There is no background polling.
 
+## AI classification (Groq)
+
+Matched replies can be labelled automatically, so you are not reading every email to
+work out whether it was a rejection or an interview invite.
+
+Setup:
+
+1. Create an API key at https://console.groq.com.
+2. Copy `.env.example` to `.env` and set `GROQ_API_KEY`.
+3. Optionally use **Settings -> Move key to Credential Manager** to get the key out of
+   the project folder. The credential store takes precedence over `.env` when both are set.
+
+No extra packages are needed. Groq's endpoint is OpenAI-compatible REST, so it uses the
+`requests`, `keyring`, and `python-dotenv` that Gmail support already installs.
+
+What it does:
+
+- Each stored reply is labelled **Rejected**, **Offer**, **Interview**, **OA Received**,
+  **Acknowledgement**, or **Unclear**. The last two never change a job.
+- A label at or above `GROQ_CONFIDENCE_THRESHOLD` (default 85%) **applies the job status
+  automatically**. Below it, the label only pre-fills the dropdown for you to confirm.
+- Every automatic change is reversible. The match records the status and response date it
+  replaced, and **Undo** on the Email matches page restores both. This matters most for
+  Rejected: applying it stamps a response date, which drops the job out of the pool that
+  future Gmail scans check.
+- A cycle starts automatically after **Check for replies** finds something, and can be run
+  on demand from the Email matches page. Only unclassified messages are sent.
+
+Rate limits:
+
+- The free tier allows 30 requests and 12,000 tokens per minute for
+  `llama-3.3-70b-versatile`. At roughly 900 tokens per classification the **token** ceiling
+  binds first, so requests are paced from tokens rather than sent in a burst. Bodies are
+  truncated to 2,000 characters before sending for the same reason.
+- Default pace is 12 requests/min, overridable with `GROQ_REQUESTS_PER_MINUTE`.
+- If Groq returns **429 Too Many Requests**, the cycle stops cleanly rather than retrying.
+  Everything already classified is kept, the page shows how far it got and the suggested
+  wait, and a **Resume classification** button restarts from the first unclassified message.
+
+How your data is handled:
+
+- Sent per message: the sender, subject, and the first 2,000 characters of the body.
+- The email is untrusted third-party text, and so is the model's reply. The model may only
+  return one of the six labels above; anything else becomes Unclear. An email that tries to
+  instruct the classifier is labelled Unclear rather than obeyed.
+- The Groq key is a real credential, unlike the Gmail Desktop client ID and secret which are
+  public per RFC 8252, so it is read from the OS credential store first.
+
 ## Tests
 
 ```powershell
-.venv\Scripts\python.exe -m unittest test_gmail_matching
+.venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
-The tests use a temporary SQLite database and never touch `job_applications.sqlite3`,
-and they require no network access or Google credentials.
+Or one module at a time:
+
+```powershell
+.venv\Scripts\python.exe -m unittest tests.test_llm_classification
+```
+
+- `tests/test_gmail_matching.py` covers query building, company matching, body extraction,
+  and the email match store.
+- `tests/test_llm_classification.py` covers Groq configuration, prompting, response
+  validation, pacing, and the classification cycle including its worker thread.
+- `tests/test_app_pages.py` renders every page. These need a display; on a headless Linux
+  runner, wrap the run with `xvfb-run`.
+
+The tests use a temporary SQLite database and never touch `job_applications.sqlite3`. They
+need no network access, no Google credentials, and no Groq key: the HTTP call, the pacer's
+clock, and the model client are all injected.
 
 ## Product report website
 

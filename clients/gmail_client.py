@@ -452,3 +452,9 @@ class GmailWorkflow:
             summary += "\n\nReview them on the Email matches page."
         messagebox.showinfo("Gmail check complete", summary)
         self.app.show_page("email_matches")
+
+        # New matches are exactly what the classifier exists to label, so a scan
+        # that found something rolls straight into a classification cycle.
+        classifier = getattr(self.app, "classifier", None)
+        if found and classifier is not None and classifier.is_configured():
+            classifier.start()

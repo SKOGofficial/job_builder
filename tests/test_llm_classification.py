@@ -1,0 +1,742 @@
+"""Tests for Groq configuration, prompting, pacing, and the classification cycle.
+
+Nothing here reaches the network. The HTTP call is injected as `poster`, the
+pacer's clock and sleep are injected, and the runner is driven by a stub client,
+so the whole cycle including its worker thread runs offline and instantly.
+
+Store tests use a temporary SQLite database, so the real job_applications.sqlite3
+is never touched.
+"""
+
+import json
+import os
+import tempfile
+import unittest
+
+import app
+import clients.llm_client as llm
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None, headers=None, text=""):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.headers = headers or {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+def completion(content):
+    return {
+        "choices": [{"message": {"content": content}}],
+        "usage": {"total_tokens": 850},
+    }
+
+
+class EnvIsolationMixin:
+    """Keeps tests off the developer's real .env and keyring."""
+
+    GROQ_VARS = (
+        "GROQ_API_KEY",
+        "GROQ_MODEL",
+        "GROQ_REQUESTS_PER_MINUTE",
+        "GROQ_CONFIDENCE_THRESHOLD",
+    )
+
+    def isolate_env(self):
+        self.saved_env = {name: os.environ.get(name) for name in self.GROQ_VARS}
+        for name in self.GROQ_VARS:
+            os.environ.pop(name, None)
+        # _load_env would otherwise pull in the real .env.
+        self.saved_loader = llm.load_dotenv
+        llm.load_dotenv = None
+        self.saved_keyring = llm.keyring
+        llm.keyring = None
+        self.addCleanup(self.restore_env)
+
+    def restore_env(self):
+        for name, value in self.saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        llm.load_dotenv = self.saved_loader
+        llm.keyring = self.saved_keyring
+
+
+class FakeKeyring:
+    def __init__(self, value=None):
+        self.value = value
+
+    def get_password(self, service, username):
+        return self.value
+
+    def set_password(self, service, username, value):
+        self.value = value
+
+    def delete_password(self, service, username):
+        self.value = None
+
+
+class ConfigTests(EnvIsolationMixin, unittest.TestCase):
+    def setUp(self):
+        self.isolate_env()
+
+    def test_key_comes_from_env_when_keyring_is_empty(self):
+        os.environ["GROQ_API_KEY"] = "env-key"
+        self.assertEqual(llm.api_key(), "env-key")
+
+    def test_keyring_wins_over_env(self):
+        # The stored key is the real credential, so it takes precedence.
+        llm.keyring = FakeKeyring("keyring-key")
+        os.environ["GROQ_API_KEY"] = "env-key"
+        self.assertEqual(llm.api_key(), "keyring-key")
+
+    def test_placeholder_key_counts_as_unconfigured(self):
+        # Copying .env.example without editing it must not send a junk key.
+        os.environ["GROQ_API_KEY"] = llm.PLACEHOLDER_KEY
+        with self.assertRaises(llm.GroqNotConfigured):
+            llm.api_key()
+
+    def test_missing_key_raises(self):
+        with self.assertRaises(llm.GroqNotConfigured):
+            llm.api_key()
+
+    def test_is_configured_reflects_key_presence(self):
+        self.assertFalse(llm.is_configured())
+        os.environ["GROQ_API_KEY"] = "env-key"
+        self.assertTrue(llm.is_configured())
+
+    def test_defaults_apply_when_env_is_absent_or_junk(self):
+        self.assertEqual(llm.model_name(), llm.DEFAULT_MODEL)
+        self.assertEqual(llm.requests_per_minute(), llm.DEFAULT_REQUESTS_PER_MINUTE)
+        os.environ["GROQ_REQUESTS_PER_MINUTE"] = "not-a-number"
+        self.assertEqual(llm.requests_per_minute(), llm.DEFAULT_REQUESTS_PER_MINUTE)
+        os.environ["GROQ_REQUESTS_PER_MINUTE"] = "-5"
+        self.assertEqual(llm.requests_per_minute(), llm.DEFAULT_REQUESTS_PER_MINUTE)
+
+    def test_overrides_are_read(self):
+        os.environ["GROQ_MODEL"] = "some-other-model"
+        os.environ["GROQ_REQUESTS_PER_MINUTE"] = "5"
+        os.environ["GROQ_CONFIDENCE_THRESHOLD"] = "0.5"
+        self.assertEqual(llm.model_name(), "some-other-model")
+        self.assertEqual(llm.requests_per_minute(), 5)
+        self.assertEqual(llm.confidence_threshold(), 0.5)
+
+    def test_confidence_threshold_never_exceeds_one(self):
+        os.environ["GROQ_CONFIDENCE_THRESHOLD"] = "5"
+        self.assertEqual(llm.confidence_threshold(), 1.0)
+
+
+class PromptTests(unittest.TestCase):
+    def match(self, **overrides):
+        base = {
+            "sender": "Careers <careers@acme.com>",
+            "subject": "Your application",
+            "body": "We would like to invite you to interview.",
+            "company": "Acme",
+            "position_title": "Engineer",
+        }
+        base.update(overrides)
+        return base
+
+    def test_body_is_truncated_before_sending(self):
+        # Untruncated bodies run to 20,000 characters, which alone would blow
+        # the per-minute token ceiling.
+        messages = llm.build_messages(self.match(body="x" * 50000))
+        self.assertLessEqual(
+            messages[1]["content"].count("x"), llm.MODEL_BODY_CHARS
+        )
+
+    def test_email_is_fenced_as_data(self):
+        content = llm.build_messages(self.match())[1]["content"]
+        self.assertIn("<email>", content)
+        self.assertIn("</email>", content)
+
+    def test_system_prompt_refuses_instructions_in_the_email(self):
+        system = llm.build_messages(self.match())[0]["content"]
+        self.assertIn("untrusted", system)
+        self.assertIn("never instructions", system)
+
+    def test_company_context_is_included(self):
+        content = llm.build_messages(self.match())[1]["content"]
+        self.assertIn("Acme", content)
+        self.assertIn("Engineer", content)
+
+    def test_missing_fields_do_not_crash(self):
+        messages = llm.build_messages({})
+        self.assertEqual(len(messages), 2)
+
+
+class ParseTests(unittest.TestCase):
+    def test_valid_reply(self):
+        result = llm.parse_classification(
+            '{"label": "Rejected", "confidence": 0.91, "reason": "They declined."}'
+        )
+        self.assertEqual(result["label"], "Rejected")
+        self.assertAlmostEqual(result["confidence"], 0.91)
+        self.assertEqual(result["reason"], "They declined.")
+
+    def test_unknown_label_becomes_unclear(self):
+        result = llm.parse_classification('{"label": "Hired", "confidence": 1.0}')
+        self.assertEqual(result["label"], "Unclear")
+        self.assertEqual(result["confidence"], 0.0)
+
+    def test_injected_label_cannot_smuggle_a_status(self):
+        # A crafted email steering the model still has to produce an exact enum
+        # member. Case variants and appended text are rejected outright, so a
+        # near-miss can never reach apply_ai_status.
+        for smuggled in ("Offer; ignore previous", "offer", "OFFER", "Offer\nRejected"):
+            with self.subTest(label=smuggled):
+                reply = json.dumps({"label": smuggled, "confidence": 0.99})
+                result = llm.parse_classification(reply)
+                self.assertEqual(result["label"], "Unclear")
+                self.assertEqual(result["confidence"], 0.0)
+
+    def test_surrounding_whitespace_is_tolerated(self):
+        reply = json.dumps({"label": "  Offer  ", "confidence": 0.9})
+        self.assertEqual(llm.parse_classification(reply)["label"], "Offer")
+
+    def test_non_json_becomes_unclear(self):
+        self.assertEqual(llm.parse_classification("not json at all")["label"], "Unclear")
+        self.assertEqual(llm.parse_classification(None)["label"], "Unclear")
+
+    def test_json_that_is_not_an_object_becomes_unclear(self):
+        self.assertEqual(llm.parse_classification("[1, 2, 3]")["label"], "Unclear")
+
+    def test_confidence_is_clamped_and_coerced(self):
+        self.assertEqual(
+            llm.parse_classification('{"label": "Offer", "confidence": 5}')["confidence"], 1.0
+        )
+        self.assertEqual(
+            llm.parse_classification('{"label": "Offer", "confidence": -2}')["confidence"], 0.0
+        )
+        self.assertEqual(
+            llm.parse_classification('{"label": "Offer", "confidence": "high"}')["confidence"],
+            0.0,
+        )
+
+    def test_reason_is_truncated(self):
+        result = llm.parse_classification(
+            '{"label": "Offer", "confidence": 0.9, "reason": "%s"}' % ("y" * 500)
+        )
+        self.assertEqual(len(result["reason"]), 200)
+
+
+class RetryAfterTests(unittest.TestCase):
+    def test_reads_the_header(self):
+        self.assertEqual(
+            llm.retry_after_seconds(FakeResponse(headers={"retry-after": "30"})), 30
+        )
+
+    def test_falls_back_when_absent_or_junk(self):
+        self.assertEqual(llm.retry_after_seconds(FakeResponse()), 60)
+        self.assertEqual(
+            llm.retry_after_seconds(FakeResponse(headers={"retry-after": "soon"})), 60
+        )
+
+
+class PacerTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        self.slept = []
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+    def pacer(self, per_minute=12, tokens_per_minute=12000):
+        return llm.Pacer(
+            per_minute=per_minute,
+            tokens_per_minute=tokens_per_minute,
+            sleep=self.sleep,
+            clock=self.clock,
+        )
+
+    def test_first_call_does_not_wait(self):
+        self.pacer().wait()
+        self.assertEqual(self.slept, [])
+
+    def test_second_call_is_spaced_by_the_interval(self):
+        pacer = self.pacer(per_minute=12)
+        pacer.wait()
+        pacer.wait()
+        self.assertEqual(self.slept, [5.0])
+
+    def test_no_wait_once_the_interval_has_already_passed(self):
+        pacer = self.pacer(per_minute=12)
+        pacer.wait()
+        self.now += 10
+        pacer.wait()
+        self.assertEqual(self.slept, [])
+
+    def test_token_ceiling_delays_beyond_the_request_interval(self):
+        # The token limit is what actually binds on the free tier.
+        pacer = self.pacer(per_minute=60, tokens_per_minute=1000)
+        pacer.wait()
+        pacer.record(900)
+        self.now += 1
+        pacer.wait(projected_tokens=900)
+        self.assertTrue(self.slept)
+        self.assertGreater(sum(self.slept), 1.0)
+
+    def test_spent_tokens_leave_the_window_after_a_minute(self):
+        pacer = self.pacer(per_minute=60, tokens_per_minute=1000)
+        pacer.record(900)
+        self.now += 61
+        self.assertEqual(pacer.token_delay(self.now, 900), 0.0)
+
+
+class ClientTests(unittest.TestCase):
+    def client(self, response, pacer=None):
+        calls = []
+
+        def poster(url, **kwargs):
+            calls.append((url, kwargs))
+            return response
+
+        client = llm.GroqClient(key="k", pacer=pacer or llm.Pacer(sleep=lambda _s: None))
+        client.poster = poster
+        return client, calls
+
+    def payload(self):
+        return {"sender": "a@b.com", "subject": "Hi", "body": "We are moving forward."}
+
+    def test_successful_classification(self):
+        response = FakeResponse(
+            payload=completion('{"label": "Interview", "confidence": 0.93, "reason": "Invite."}')
+        )
+        client, calls = self.client(response)
+        result = client.classify(self.payload())
+        self.assertEqual(result["label"], "Interview")
+        self.assertEqual(calls[0][0], llm.API_URL)
+        self.assertEqual(
+            calls[0][1]["headers"]["Authorization"], "Bearer k"
+        )
+        self.assertEqual(
+            calls[0][1]["json"]["response_format"], {"type": "json_object"}
+        )
+
+    def test_rate_limit_raises_with_retry_after(self):
+        response = FakeResponse(status_code=429, headers={"retry-after": "42"})
+        client, _calls = self.client(response)
+        with self.assertRaises(llm.GroqRateLimited) as caught:
+            client.classify(self.payload())
+        self.assertEqual(caught.exception.retry_after, 42)
+
+    def test_server_error_raises(self):
+        client, _calls = self.client(FakeResponse(status_code=500, text="boom"))
+        with self.assertRaises(RuntimeError):
+            client.classify(self.payload())
+
+    def test_empty_choices_becomes_unclear(self):
+        client, _calls = self.client(FakeResponse(payload={"choices": []}))
+        self.assertEqual(client.classify(self.payload())["label"], "Unclear")
+
+    def test_reported_token_usage_feeds_the_pacer(self):
+        pacer = llm.Pacer(sleep=lambda _s: None)
+        response = FakeResponse(payload=completion('{"label": "Offer", "confidence": 0.9}'))
+        client, _calls = self.client(response, pacer=pacer)
+        client.classify(self.payload())
+        self.assertEqual(sum(n for _at, n in pacer._spent), 850)
+
+
+class StubClient:
+    def __init__(self, results=None, error=None):
+        self.results = list(results or [])
+        self.error = error
+        self.seen = []
+
+    def classify(self, payload):
+        self.seen.append(payload)
+        if self.error is not None:
+            raise self.error
+        return self.results.pop(0)
+
+
+class PageSpy:
+    """Records how the runner asked the page to redraw."""
+
+    def __init__(self):
+        self.updates = []
+
+    def on_classification_update(self, final=False):
+        self.updates.append(final)
+
+
+class FakeApp:
+    """Enough of the app for the runner: a store, a page registry, after()."""
+
+    def __init__(self, store):
+        self.store = store
+        self.pages = {}
+        self.active_page = "email_matches"
+        self.scheduled = []
+
+    def after(self, delay, callback):
+        # Recorded, never run: the tests drain the queue themselves so no Tk
+        # event loop is needed.
+        self.scheduled.append((delay, callback))
+        return f"after#{len(self.scheduled)}"
+
+
+class RunnerTests(EnvIsolationMixin, unittest.TestCase):
+    def setUp(self):
+        self.isolate_env()
+        handle, self.db_path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(handle)
+        self.store = app.JobStore(self.db_path)
+        self.app = FakeApp(self.store)
+        self.addCleanup(self.cleanup)
+
+    def cleanup(self):
+        self.store.conn.close()
+        os.unlink(self.db_path)
+
+    def add_match(self, company="Acme", status="Applied", message_id="msg-1", body="Hello."):
+        job_id = self.store.create_job(
+            {
+                "posting_url": f"https://{company.lower()}.com/jobs/{message_id}",
+                "position_title": "Engineer",
+                "company": company,
+                "job_type": "Internship",
+                "requires_oa": False,
+                "completed_oa": False,
+                "received_references": False,
+                "payment_amount": "",
+                "payment_period": "Unspecified",
+                "status": status,
+                "application_date": "2026-07-28",
+                "response_date": None,
+                "notes": "",
+            }
+        )
+        self.store.record_email_match(
+            job_id,
+            {
+                "id": message_id,
+                "sender": "careers@acme.com",
+                "subject": "Update",
+                "date": "Tue, 28 Jul 2026 10:00:00 -0400",
+                "body": body,
+                "snippet": body[:40],
+            },
+        )
+        return job_id
+
+    def run_cycle(self, results=None, error=None):
+        """Start a cycle, wait for the worker, then drain on this thread."""
+        stub = StubClient(results=results, error=error)
+        runner = llm.ClassificationRunner(self.app, client_factory=lambda: stub)
+        runner.start()
+        if runner._thread is not None:
+            runner._thread.join(timeout=5)
+            self.assertFalse(runner._thread.is_alive(), "worker thread did not finish")
+        runner.drain()
+        return runner, stub
+
+    def job_row(self, job_id):
+        return self.store.conn.execute(
+            "SELECT status, response_date FROM jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+
+    def match_row(self):
+        return self.store.conn.execute("SELECT * FROM email_matches").fetchone()
+
+    # Applying -------------------------------------------------------------
+
+    def test_confident_label_applies_the_status(self):
+        job_id = self.add_match()
+        runner, _stub = self.run_cycle(
+            [{"label": "Rejected", "confidence": 0.95, "reason": "Turned down."}]
+        )
+        self.assertEqual(runner.state, llm.DONE)
+        self.assertEqual(runner.applied, 1)
+        self.assertEqual(self.job_row(job_id)["status"], "Rejected")
+        match = self.match_row()
+        self.assertEqual(match["ai_status"], "Rejected")
+        self.assertEqual(match["ai_applied"], 1)
+        self.assertEqual(match["ai_previous_status"], "Applied")
+
+    def test_low_confidence_records_without_applying(self):
+        job_id = self.add_match()
+        runner, _stub = self.run_cycle(
+            [{"label": "Rejected", "confidence": 0.4, "reason": "Might be."}]
+        )
+        self.assertEqual(runner.applied, 0)
+        self.assertEqual(self.job_row(job_id)["status"], "Applied")
+        match = self.match_row()
+        self.assertEqual(match["ai_status"], "Rejected")
+        self.assertEqual(match["ai_applied"], 0)
+        self.assertIsNotNone(match["ai_classified_at"])
+
+    def test_inert_labels_never_apply_however_confident(self):
+        for label in llm.INERT_LABELS:
+            with self.subTest(label=label):
+                job_id = self.add_match(message_id=f"msg-{label}")
+                runner, _stub = self.run_cycle(
+                    [{"label": label, "confidence": 1.0, "reason": "Routine."}]
+                )
+                self.assertEqual(runner.applied, 0)
+                self.assertEqual(self.job_row(job_id)["status"], "Applied")
+
+    def test_undo_restores_status_and_response_date(self):
+        job_id = self.add_match()
+        self.run_cycle([{"label": "Rejected", "confidence": 0.99, "reason": "No."}])
+        before = self.job_row(job_id)
+        self.assertEqual(before["status"], "Rejected")
+        self.assertTrue(before["response_date"])
+
+        self.assertTrue(self.store.undo_ai_status(self.match_row()["id"]))
+        after = self.job_row(job_id)
+        self.assertEqual(after["status"], "Applied")
+        self.assertIn(after["response_date"], (None, ""))
+        # The job is back in the pool future Gmail scans look at.
+        self.assertIn(job_id, [row["job_id"] for row in self.store.jobs_awaiting_response()])
+
+    def test_undo_keeps_the_classification_so_it_is_not_redone(self):
+        self.add_match()
+        self.run_cycle([{"label": "Rejected", "confidence": 0.99, "reason": "No."}])
+        self.store.undo_ai_status(self.match_row()["id"])
+        self.assertEqual(self.store.unclassified_email_matches(), [])
+
+    def test_undo_is_a_no_op_when_nothing_was_applied(self):
+        self.add_match()
+        self.run_cycle([{"label": "Unclear", "confidence": 0.2, "reason": "?"}])
+        self.assertFalse(self.store.undo_ai_status(self.match_row()["id"]))
+
+    # Cycle behaviour ------------------------------------------------------
+
+    def test_rate_limit_stops_the_cycle_and_keeps_earlier_work(self):
+        self.add_match(company="Acme", message_id="msg-1")
+        self.add_match(company="Globex", message_id="msg-2")
+
+        class FlakyClient:
+            def __init__(self):
+                self.calls = 0
+
+            def classify(self, payload):
+                self.calls += 1
+                if self.calls > 1:
+                    raise llm.GroqRateLimited("limit", retry_after=42)
+                return {"label": "Rejected", "confidence": 0.99, "reason": "No."}
+
+        runner = llm.ClassificationRunner(self.app, client_factory=FlakyClient)
+        runner.start()
+        runner._thread.join(timeout=5)
+        runner.drain()
+
+        self.assertEqual(runner.state, llm.RATE_LIMITED)
+        self.assertEqual(runner.retry_after, 42)
+        self.assertEqual(runner.processed, 1)
+        # The first classification survived the stop.
+        classified = self.store.conn.execute(
+            "SELECT COUNT(*) AS n FROM email_matches WHERE ai_classified_at IS NOT NULL"
+        ).fetchone()["n"]
+        self.assertEqual(classified, 1)
+
+    def test_resume_picks_up_only_the_unclassified_remainder(self):
+        self.add_match(company="Acme", message_id="msg-1")
+        self.add_match(company="Globex", message_id="msg-2")
+        self.run_cycle(
+            [
+                {"label": "Unclear", "confidence": 0.1, "reason": "?"},
+                {"label": "Unclear", "confidence": 0.1, "reason": "?"},
+            ]
+        )
+        self.assertEqual(self.store.unclassified_email_matches(), [])
+        runner, stub = self.run_cycle([])
+        self.assertEqual(runner.state, llm.DONE)
+        self.assertEqual(stub.seen, [])
+
+    def test_matches_without_a_body_are_skipped(self):
+        self.add_match(body="")
+        runner, stub = self.run_cycle([])
+        self.assertEqual(stub.seen, [])
+        self.assertEqual(runner.state, llm.DONE)
+
+    def test_worker_receives_plain_dicts_not_database_rows(self):
+        # The worker thread must not hold anything tied to the main thread's
+        # sqlite connection.
+        self.add_match()
+        _runner, stub = self.run_cycle(
+            [{"label": "Unclear", "confidence": 0.1, "reason": "?"}]
+        )
+        self.assertEqual(len(stub.seen), 1)
+        self.assertIs(type(stub.seen[0]), dict)
+
+    def test_client_failure_surfaces_as_an_error_state(self):
+        self.add_match()
+        runner, _stub = self.run_cycle(error=RuntimeError("network down"))
+        self.assertEqual(runner.state, llm.ERROR)
+        self.assertIn("network down", runner.message)
+
+    def test_missing_configuration_reports_instead_of_starting(self):
+        self.add_match()
+
+        def factory():
+            raise llm.GroqNotConfigured("no key")
+
+        runner = llm.ClassificationRunner(self.app, client_factory=factory)
+        runner.start()
+        self.assertEqual(runner.state, llm.ERROR)
+        self.assertIsNone(runner._thread)
+
+    def test_nothing_to_do_finishes_without_a_thread(self):
+        runner = llm.ClassificationRunner(self.app, client_factory=StubClient)
+        runner.start()
+        self.assertEqual(runner.state, llm.DONE)
+        self.assertIsNone(runner._thread)
+
+    def test_stop_ends_the_cycle_early(self):
+        for index in range(3):
+            self.add_match(company=f"Co{index}", message_id=f"msg-{index}")
+
+        holder = {}
+
+        class StoppingClient:
+            def classify(self, payload):
+                # Ask to stop while the first message is in flight. The worker
+                # checks the flag before it takes the next one.
+                holder["runner"].stop()
+                return {"label": "Unclear", "confidence": 0.1, "reason": "?"}
+
+        runner = llm.ClassificationRunner(self.app, client_factory=StoppingClient)
+        holder["runner"] = runner
+        runner.start()
+        runner._thread.join(timeout=5)
+        runner.drain()
+
+        self.assertEqual(runner.state, llm.STOPPED)
+        self.assertEqual(runner.processed, 1)
+        self.assertIn("1 of 3", runner.message)
+
+    def test_start_clears_a_stale_stop_flag(self):
+        # A previous stop must not cancel the next cycle before it begins.
+        self.add_match()
+        runner = llm.ClassificationRunner(
+            self.app,
+            client_factory=lambda: StubClient(
+                [{"label": "Unclear", "confidence": 0.1, "reason": "?"}]
+            ),
+        )
+        runner.stop()
+        runner.start()
+        runner._thread.join(timeout=5)
+        runner.drain()
+        self.assertEqual(runner.state, llm.DONE)
+        self.assertEqual(runner.processed, 1)
+
+    # Redraw signalling ----------------------------------------------------
+
+    def test_entering_running_forces_a_full_redraw(self):
+        # The progress bar and the Stop button only exist in a full redraw, so
+        # the transition into RUNNING must not take the in-place path.
+        self.add_match()
+        spy = PageSpy()
+        self.app.pages["email_matches"] = spy
+        runner = llm.ClassificationRunner(
+            self.app,
+            client_factory=lambda: StubClient(
+                [{"label": "Unclear", "confidence": 0.1, "reason": "?"}]
+            ),
+        )
+        runner.start()
+        self.addCleanup(runner._thread.join, 5)
+        self.assertIn(True, spy.updates)
+
+    def test_progress_within_a_state_updates_in_place(self):
+        spy = PageSpy()
+        self.app.pages["email_matches"] = spy
+        runner = llm.ClassificationRunner(self.app)
+        runner.state = llm.RUNNING
+        runner.total = 2
+        runner.events.put({"kind": "progress", "label": "Acme"})
+        runner.drain()
+        self.assertEqual(spy.updates, [False])
+
+    def test_reaching_a_terminal_state_forces_a_full_redraw(self):
+        spy = PageSpy()
+        self.app.pages["email_matches"] = spy
+        runner = llm.ClassificationRunner(self.app)
+        runner.state = llm.RUNNING
+        runner.events.put({"kind": llm.DONE})
+        runner.drain()
+        self.assertEqual(spy.updates, [True])
+
+    def test_progress_text_describes_the_running_cycle(self):
+        runner = llm.ClassificationRunner(self.app)
+        runner.state = llm.RUNNING
+        runner.total = 4
+        runner.processed = 1
+        runner.current = "Acme"
+        self.assertEqual(runner.progress_text(), "Classifying 2 of 4 — Acme")
+
+
+class AiColumnMigrationTests(unittest.TestCase):
+    OLD_SCHEMA = """
+        CREATE TABLE email_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            gmail_message_id TEXT NOT NULL,
+            sender TEXT,
+            subject TEXT,
+            received_date TEXT,
+            reviewed INTEGER NOT NULL DEFAULT 0,
+            dismissed INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(job_id, gmail_message_id)
+        );
+    """
+
+    def setUp(self):
+        import sqlite3
+
+        handle, self.db_path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(handle)
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript(self.OLD_SCHEMA)
+        conn.execute(
+            """
+            INSERT INTO email_matches (
+                job_id, gmail_message_id, sender, subject, received_date, created_at
+            )
+            VALUES ('JOB1', 'msg-old', 'a@b.com', 'Old', '', '2026-07-01')
+            """
+        )
+        conn.commit()
+        conn.close()
+        self.addCleanup(os.unlink, self.db_path)
+
+    def test_ai_columns_are_added_to_an_old_database(self):
+        store = app.JobStore(self.db_path)
+        self.addCleanup(store.conn.close)
+        columns = {
+            row["name"] for row in store.conn.execute("PRAGMA table_info(email_matches)")
+        }
+        for expected in (
+            "ai_status",
+            "ai_confidence",
+            "ai_reason",
+            "ai_classified_at",
+            "ai_applied",
+            "ai_previous_status",
+            "ai_previous_response_date",
+        ):
+            self.assertIn(expected, columns)
+
+    def test_existing_rows_default_to_not_applied(self):
+        store = app.JobStore(self.db_path)
+        self.addCleanup(store.conn.close)
+        row = store.conn.execute("SELECT * FROM email_matches").fetchone()
+        self.assertEqual(row["ai_applied"], 0)
+        self.assertIsNone(row["ai_status"])
+
+
+if __name__ == "__main__":
+    unittest.main()

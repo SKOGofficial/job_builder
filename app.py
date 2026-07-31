@@ -14,9 +14,12 @@ import tkinter as tk
 from tkinter import ttk
 
 import clients.gmail_client as _gmail_client_mod
+import clients.llm_client as _llm_client_mod
 from clients.gmail_client import GMAIL_AVAILABLE, GMAIL_IMPORT_ERROR, GmailWorkflow
+from clients.llm_client import GROQ_AVAILABLE, GROQ_IMPORT_ERROR, ClassificationRunner
 
 gmail_client = _gmail_client_mod if GMAIL_AVAILABLE else None
+llm_client = _llm_client_mod if GROQ_AVAILABLE else None
 from pages import DRAWER_ENTRIES, NAV_TABS, PAGE_CLASSES
 from utilities.store import DB_PATH, JobStore, normalize_url, today_iso, url_hash
 from utilities.theme import (
@@ -47,6 +50,9 @@ __all__ = [
     "GMAIL_AVAILABLE",
     "GMAIL_IMPORT_ERROR",
     "gmail_client",
+    "GROQ_AVAILABLE",
+    "GROQ_IMPORT_ERROR",
+    "llm_client",
 ]
 
 DEFAULT_PAGE = "add"
@@ -69,6 +75,9 @@ class JobTrackerApp(tk.Tk):
         # Pages are built once and reused, so per-page state such as the
         # dashboard time range survives navigation.
         self.pages = {cls.name: cls(self) for cls in PAGE_CLASSES}
+        # Owns the classification cycle. It lives on the app rather than the
+        # page so a run in progress survives the user navigating away.
+        self.classifier = ClassificationRunner(self)
 
         self.configure(bg=self.theme["bg"])
         apply_styles(self, self.theme, self.theme_name)

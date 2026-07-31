@@ -155,6 +155,34 @@ def apply_styles(root, theme, theme_name):
             padding=(8, 8),
         )
 
+    # Progressbar draws from its own options rather than inheriting ".", so both
+    # the trough and the bar need setting for each theme.
+    style.configure(
+        "Horizontal.TProgressbar",
+        troughcolor=theme["surface_2"],
+        background=theme["primary"],
+        bordercolor=theme["border"],
+        lightcolor=theme["primary"],
+        darkcolor=theme["primary"],
+        thickness=8,
+    )
+    style.configure(
+        "Paused.Horizontal.TProgressbar",
+        troughcolor=theme["surface_2"],
+        background=theme["warning"],
+        bordercolor=theme["border"],
+        lightcolor=theme["warning"],
+        darkcolor=theme["warning"],
+        thickness=8,
+    )
+
+    style.configure(
+        "Badge.TLabel",
+        background=theme["surface_2"],
+        foreground=theme["text"],
+        padding=(8, 3),
+        font=("Segoe UI Semibold", 9),
+    )
     style.configure(
         "Treeview",
         background=theme["surface"],

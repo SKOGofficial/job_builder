@@ -12,6 +12,7 @@ import tempfile
 import unittest
 
 import app
+import clients.llm_client as llm
 import utilities.store as store
 from pages import DRAWER_ENTRIES, NAV_TABS, PAGE_CLASSES
 from pages.email_matches import NO_BODY_HINT
@@ -29,6 +30,14 @@ def descendants(widget):
 
 def widgets_of_class(widget, class_name):
     return [w for w in descendants(widget) if w.winfo_class() == class_name]
+
+
+def button_texts(widget):
+    return [w.cget("text") for w in widgets_of_class(widget, "TButton")]
+
+
+def label_texts(widget):
+    return [w.cget("text") for w in widgets_of_class(widget, "TLabel")]
 
 
 def display_available():
@@ -262,6 +271,171 @@ class PageRenderTests(unittest.TestCase):
         self.gui.update_idletasks()
         self.assertEqual(self.gui.store.pending_email_matches(), [])
         self.assertEqual(widgets_of_class(self.gui.content, "Text"), [])
+
+    # AI classification UI -------------------------------------------------
+
+    def configured_classifier(self, state=llm.IDLE, **attributes):
+        """Present a classifier in a chosen state, without needing a real key."""
+        runner = self.gui.classifier
+        runner.is_configured = lambda: True
+        runner.state = state
+        for name, value in attributes.items():
+            setattr(runner, name, value)
+        self.addCleanup(runner.__dict__.pop, "is_configured", None)
+        self.addCleanup(setattr, runner, "state", llm.IDLE)
+        self.addCleanup(setattr, runner, "message", "")
+        return runner
+
+    def test_classifier_offers_a_run_when_idle(self):
+        self.seed_match()
+        self.configured_classifier(llm.IDLE)
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+        self.assertTrue(any("Classify" in text for text in button_texts(self.gui.content)))
+        self.assertEqual(widgets_of_class(self.gui.content, "TProgressbar"), [])
+
+    def test_running_state_shows_a_progress_bar_and_stop(self):
+        self.seed_match()
+        self.configured_classifier(
+            llm.RUNNING, total=4, processed=1, current="Acme", message=""
+        )
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+
+        (bar,) = widgets_of_class(self.gui.content, "TProgressbar")
+        self.assertEqual(int(bar.cget("maximum")), 4)
+        self.assertEqual(int(bar.cget("value")), 1)
+        self.assertIn("Stop", button_texts(self.gui.content))
+        self.assertTrue(
+            any("Classifying 2 of 4" in text for text in label_texts(self.gui.content))
+        )
+
+    def test_rate_limited_state_offers_resume(self):
+        self.seed_match()
+        self.configured_classifier(
+            llm.RATE_LIMITED,
+            total=4,
+            processed=2,
+            retry_after=42,
+            message="Groq rate limit reached after 2 of 4. Try again in about 42s.",
+        )
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+
+        self.assertIn("Resume classification", button_texts(self.gui.content))
+        (bar,) = widgets_of_class(self.gui.content, "TProgressbar")
+        # Paused styling makes the stall visible rather than looking idle.
+        self.assertEqual(str(bar.cget("style")), "Paused.Horizontal.TProgressbar")
+        self.assertTrue(any("rate limit" in text for text in label_texts(self.gui.content)))
+
+    def test_stopped_and_error_states_offer_resume(self):
+        for state in (llm.STOPPED, llm.ERROR):
+            with self.subTest(state=state):
+                self.configured_classifier(state, message="stopped early")
+                self.gui.show_page("email_matches")
+                self.gui.update_idletasks()
+                self.assertIn("Resume classification", button_texts(self.gui.content))
+
+    def test_unconfigured_classifier_points_at_settings(self):
+        runner = self.gui.classifier
+        runner.is_configured = lambda: False
+        self.addCleanup(runner.__dict__.pop, "is_configured", None)
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+        self.assertIn("Open Settings", button_texts(self.gui.content))
+
+    def test_mid_cycle_update_does_not_rebuild_the_page(self):
+        # Rebuilding on every classified message would be wasteful and would
+        # reset the scroll position, so only the two progress widgets change.
+        self.seed_match()
+        runner = self.configured_classifier(llm.RUNNING, total=4, processed=1, current="Acme")
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+        page = self.gui.pages["email_matches"]
+        original_label = page.progress_label
+        original_bar = page.progress_bar
+
+        runner.processed = 3
+        runner.current = "Globex"
+        page.on_classification_update(final=False)
+        self.gui.update_idletasks()
+
+        self.assertIs(page.progress_label, original_label)
+        self.assertIs(page.progress_bar, original_bar)
+        self.assertIn("Classifying 4 of 4", original_label.cget("text"))
+        self.assertEqual(int(original_bar.cget("value")), 3)
+
+    def test_final_update_redraws_the_page(self):
+        self.seed_match()
+        runner = self.configured_classifier(llm.RUNNING, total=1, processed=1)
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+        page = self.gui.pages["email_matches"]
+        original_label = page.progress_label
+
+        runner.state = llm.DONE
+        runner.message = "Classified 1 message(s); 1 status(es) applied automatically."
+        page.on_classification_update(final=True)
+        self.gui.update_idletasks()
+
+        self.assertIsNot(page.progress_label, original_label)
+        self.assertTrue(
+            any("applied automatically" in text for text in label_texts(self.gui.content))
+        )
+
+    def test_applied_classification_shows_a_badge_and_undo(self):
+        match_id = self.seed_match()
+        self.configured_classifier(llm.DONE)
+        self.gui.store.record_classification(match_id, "Rejected", 0.94, "They declined.")
+        self.gui.store.apply_ai_status(match_id, "Rejected")
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+
+        labels = label_texts(self.gui.content)
+        self.assertTrue(any("AI: Rejected · 94%" in text for text in labels))
+        self.assertTrue(any("They declined." in text for text in labels))
+        self.assertIn("Undo", button_texts(self.gui.content))
+
+    def test_undo_button_restores_the_previous_status(self):
+        match_id = self.seed_match()
+        self.configured_classifier(llm.DONE)
+        self.gui.store.record_classification(match_id, "Rejected", 0.94, "They declined.")
+        self.gui.store.apply_ai_status(match_id, "Rejected")
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+
+        undo = next(
+            w for w in widgets_of_class(self.gui.content, "TButton")
+            if w.cget("text") == "Undo"
+        )
+        undo.invoke()
+        self.gui.update_idletasks()
+
+        match = self.gui.store.pending_email_matches()[0]
+        self.assertEqual(match["job_status"], "Applied")
+        self.assertEqual(match["ai_applied"], 0)
+        self.assertNotIn("Undo", button_texts(self.gui.content))
+
+    def test_low_confidence_classification_only_preselects(self):
+        match_id = self.seed_match()
+        self.configured_classifier(llm.DONE)
+        self.gui.store.record_classification(match_id, "Offer", 0.40, "Maybe an offer.")
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+
+        self.assertNotIn("Undo", button_texts(self.gui.content))
+        (combo,) = widgets_of_class(self.gui.content, "TCombobox")
+        self.assertEqual(combo.get(), "Offer")
+
+    def test_inert_label_does_not_preselect_a_status(self):
+        match_id = self.seed_match()
+        self.configured_classifier(llm.DONE)
+        self.gui.store.record_classification(match_id, "Acknowledgement", 0.99, "Routine.")
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+
+        (combo,) = widgets_of_class(self.gui.content, "TCombobox")
+        self.assertEqual(combo.get(), "Interview")
 
     def test_page_state_survives_navigation(self):
         # Page objects are reused, so per-page state must not reset on return.

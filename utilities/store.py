@@ -81,6 +81,13 @@ class JobStore:
                 received_date TEXT,
                 snippet TEXT,
                 body_text TEXT,
+                ai_status TEXT,
+                ai_confidence REAL,
+                ai_reason TEXT,
+                ai_classified_at TEXT,
+                ai_applied INTEGER NOT NULL DEFAULT 0,
+                ai_previous_status TEXT,
+                ai_previous_response_date TEXT,
                 reviewed INTEGER NOT NULL DEFAULT 0,
                 dismissed INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -106,9 +113,22 @@ class JobStore:
         existing = {
             row["name"] for row in self.conn.execute("PRAGMA table_info(email_matches)")
         }
-        for column in ("snippet", "body_text"):
+        added = [
+            ("snippet", "TEXT"),
+            ("body_text", "TEXT"),
+            ("ai_status", "TEXT"),
+            ("ai_confidence", "REAL"),
+            ("ai_reason", "TEXT"),
+            ("ai_classified_at", "TEXT"),
+            ("ai_applied", "INTEGER NOT NULL DEFAULT 0"),
+            ("ai_previous_status", "TEXT"),
+            ("ai_previous_response_date", "TEXT"),
+        ]
+        for column, declaration in added:
             if column not in existing:
-                self.conn.execute(f"ALTER TABLE email_matches ADD COLUMN {column} TEXT")
+                self.conn.execute(
+                    f"ALTER TABLE email_matches ADD COLUMN {column} {declaration}"
+                )
 
     # Job records -----------------------------------------------------------
 
@@ -333,6 +353,107 @@ class JobStore:
             "UPDATE email_matches SET dismissed = 1 WHERE id = ?", (match_id,)
         )
         self.conn.commit()
+
+    # AI classification -----------------------------------------------------
+
+    def unclassified_email_matches(self, limit=None):
+        """Pending matches that have body text but no classification yet.
+
+        Rows already classified are skipped, so a cycle stopped by a rate limit
+        resumes where it left off instead of spending quota on repeat work.
+        """
+        sql = """
+            SELECT m.*, j.position_title, j.company, j.status AS job_status
+            FROM email_matches m
+            JOIN jobs j ON j.job_id = m.job_id
+            WHERE m.reviewed = 0
+              AND m.dismissed = 0
+              AND m.ai_classified_at IS NULL
+              AND m.body_text IS NOT NULL
+              AND TRIM(m.body_text) <> ''
+            ORDER BY m.created_at DESC
+        """
+        if limit is None:
+            return self.conn.execute(sql).fetchall()
+        return self.conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
+
+    def record_classification(self, match_id, label, confidence, reason):
+        """Store what the model inferred. Applies nothing to the job."""
+        self.conn.execute(
+            """
+            UPDATE email_matches
+            SET ai_status = ?, ai_confidence = ?, ai_reason = ?, ai_classified_at = ?
+            WHERE id = ?
+            """,
+            (
+                label,
+                confidence,
+                reason,
+                datetime.now().isoformat(timespec="seconds"),
+                match_id,
+            ),
+        )
+        self.conn.commit()
+
+    def apply_ai_status(self, match_id, status):
+        """Apply a confident classification, remembering what it replaced.
+
+        The previous status and response date are captured before the write so
+        undo_ai_status can restore the job exactly. Without them an auto-applied
+        Rejected would be unrecoverable: update_status stamps a response date,
+        and jobs_awaiting_response then drops the job from future Gmail scans.
+        """
+        match = self.conn.execute(
+            "SELECT job_id FROM email_matches WHERE id = ?", (match_id,)
+        ).fetchone()
+        if match is None:
+            return False
+        job = self.conn.execute(
+            "SELECT id, status, response_date FROM jobs WHERE job_id = ?",
+            (match["job_id"],),
+        ).fetchone()
+        if job is None:
+            return False
+        self.conn.execute(
+            """
+            UPDATE email_matches
+            SET ai_applied = 1, ai_previous_status = ?, ai_previous_response_date = ?
+            WHERE id = ?
+            """,
+            (job["status"], job["response_date"], match_id),
+        )
+        self.update_status(job["id"], status)
+        self.conn.commit()
+        return True
+
+    def undo_ai_status(self, match_id):
+        """Put the job back exactly as it stood before the AI touched it."""
+        match = self.conn.execute(
+            "SELECT * FROM email_matches WHERE id = ?", (match_id,)
+        ).fetchone()
+        if match is None or not match["ai_applied"]:
+            return False
+        self.conn.execute(
+            "UPDATE jobs SET status = ?, response_date = ?, updated_at = ? WHERE job_id = ?",
+            (
+                match["ai_previous_status"],
+                match["ai_previous_response_date"],
+                datetime.now().isoformat(timespec="seconds"),
+                match["job_id"],
+            ),
+        )
+        # The classification is kept: undo means the label was wrong, so the
+        # message must not be picked up and reclassified on the next cycle.
+        self.conn.execute(
+            """
+            UPDATE email_matches
+            SET ai_applied = 0, ai_previous_status = NULL, ai_previous_response_date = NULL
+            WHERE id = ?
+            """,
+            (match_id,),
+        )
+        self.conn.commit()
+        return True
 
     # Profile key/value -----------------------------------------------------
 
