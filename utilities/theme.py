@@ -18,6 +18,11 @@ STATUS_COLORS = {
 #: Line colour for the cumulative applications chart.
 CHART_COLOR = "#0891b2"
 
+#: Brand blue, carried over from the original palette. Quasar's stock primary is
+#: a lighter blue that only reaches 3.1:1 against white text; this reaches
+#: 5.2:1, so header labels clear WCAG AA rather than washing out.
+PRIMARY_COLOR = "#2563eb"
+
 TIME_RANGES = [("7d", 7), ("14d", 14), ("30d", 30), ("90d", 90), ("All time", None)]
 
 JOB_TYPES = ["Internship", "Full time", "Part time", "Contract", "Unpaid"]

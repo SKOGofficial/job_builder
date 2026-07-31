@@ -367,3 +367,75 @@ async def test_profile_text_round_trips(user, store):
     store.save_profile_value("profile_text", "London, targeting backend roles")
     await user.open("/profile")
     await user.should_see("London, targeting backend roles")
+
+
+# Navigation ----------------------------------------------------------------
+
+
+async def test_top_nav_reaches_its_pages(user, state):
+    await user.open("/")
+    user.find("Dashboard").click()
+    await user.should_see("Application dashboard")
+    user.find("Add application").click()
+    await user.should_see("Add a job application")
+    user.find("All jobs").click()
+    await user.should_see("All job postings")
+
+
+async def test_drawer_reaches_its_pages(user, state):
+    for label, heading in [
+        ("Email matches", "Suggested replies matched"),
+        ("Settings", "AI classification (Groq)"),
+        ("Profile", "Store contact details"),
+        ("Resume & Experiences", "Store experience bullets"),
+    ]:
+        await user.open("/")
+        user.find(label).click()
+        await user.should_see(heading)
+
+
+# Settings ------------------------------------------------------------------
+
+
+async def test_settings_shows_every_card(user, state):
+    await user.open("/settings")
+    await user.should_see("Appearance")
+    await user.should_see("Dark mode")
+    await user.should_see("Gmail")
+    await user.should_see("AI classification (Groq)")
+
+
+async def test_settings_can_run_a_classification_cycle(user, state, store):
+    job_id = add_match(store, company="Acme", index=1)
+    use_stub_classifier(
+        state, [{"label": "Interview", "confidence": 0.95, "reason": "A call is proposed."}]
+    )
+
+    await user.open("/settings")
+    user.find("Classify 1 message(s)").click()
+    await user.should_see("1 status(es) applied automatically")
+
+    job = store.conn.execute(
+        "SELECT status FROM jobs WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    assert job["status"] == "Interview"
+
+
+async def test_settings_offers_resume_after_a_rate_limit(user, state, store):
+    add_match(store, company="Acme", index=1)
+    add_match(store, company="Globex", index=2)
+    state.classifier.client_factory = lambda: RateLimitedGroq(allow=1)
+    state.classifier.is_configured = lambda: True
+
+    await user.open("/settings")
+    user.find("Classify 2 message(s)").click()
+    await user.should_see("Groq rate limit reached")
+    await user.should_see("Resume classification")
+
+
+async def test_dark_mode_choice_is_stored(user, state, store):
+    assert store.get_profile_value("theme", "light") == "light"
+    await user.open("/settings")
+    user.find("Dark mode").click()
+    await user.should_see("Appearance")
+    assert store.get_profile_value("theme", "light") == "dark"

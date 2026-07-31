@@ -6,9 +6,18 @@ then hands back a container for the page body.
 
 from contextlib import contextmanager
 
-from nicegui import ui
+from nicegui import context, ui
 
+from utilities.theme import PRIMARY_COLOR
 from web.state import get_state
+
+#: Quasar buttons default to the primary colour, which is the same blue the
+#: header is painted with. Left alone, the nav reads as blue-on-blue and is
+#: effectively invisible, so everything on the header states white explicitly.
+HEADER_BUTTON = "flat dense no-caps color=white"
+#: The current page is a white pill with the header colour showing through.
+HEADER_BUTTON_ACTIVE = "unelevated dense no-caps color=white text-color=primary"
+HEADER_ICON = "flat round dense color=white"
 
 #: Top tabs, mirroring the ones the Tkinter shell used.
 NAV_TABS = [
@@ -31,9 +40,22 @@ def card(padding="p-6"):
     return ui.card().classes(f"w-full {padding} gap-2 shadow-sm").props("flat bordered")
 
 
+def page_timer(interval, callback):
+    """A repeating timer that stops when its client goes away.
+
+    A plain ui.timer keeps firing after the user navigates off the page, and
+    NiceGUI then raises "The parent slot of Timer has been deleted" on every
+    tick. Cancelling on disconnect keeps the log clean and stops the work.
+    """
+    timer = ui.timer(interval, callback)
+    context.client.on_disconnect(timer.cancel)
+    return timer
+
+
 @contextmanager
 def page_shell(title, subtitle="", active=""):
     state = get_state()
+    ui.colors(primary=PRIMARY_COLOR)
     dark = ui.dark_mode(value=state.dark)
 
     def toggle_dark():
@@ -42,26 +64,35 @@ def page_shell(title, subtitle="", active=""):
 
     with ui.header().classes("items-center justify-between px-6 py-3"):
         with ui.row().classes("items-center gap-3"):
-            ui.button(icon="menu", on_click=lambda: drawer.toggle()).props("flat round dense")
+            ui.button(icon="menu", on_click=lambda: drawer.toggle()).props(
+                HEADER_ICON
+            ).tooltip("Toggle menu")
             ui.label("Job Board Tracker").classes("text-lg font-semibold")
-            ui.label("SQLite-backed application history").classes("text-xs opacity-70")
+            ui.label("SQLite-backed application history").classes(
+                "text-xs opacity-70 hidden sm:block"
+            )
         with ui.row().classes("items-center gap-1"):
             for label, target in NAV_TABS:
-                button = ui.button(label, on_click=lambda t=target: ui.navigate.to(t))
-                button.props("flat dense no-caps" if target != active else "unelevated dense no-caps")
-            ui.button(icon="dark_mode", on_click=toggle_dark).props("flat round dense").tooltip(
+                ui.button(label, on_click=lambda t=target: ui.navigate.to(t)).props(
+                    HEADER_BUTTON if target != active else HEADER_BUTTON_ACTIVE
+                )
+            ui.button(icon="dark_mode", on_click=toggle_dark).props(HEADER_ICON).tooltip(
                 "Toggle dark mode"
             )
 
-    with ui.left_drawer(value=False).classes("p-4 gap-2") as drawer:
+    # Open by default: these four pages are only reachable from here, and a
+    # closed drawer behind an unlabelled icon makes them look unimplemented.
+    # Quasar collapses it to an overlay on narrow screens on its own.
+    with ui.left_drawer(value=True).classes("p-4 gap-2").props("bordered") as drawer:
         ui.label("Menu").classes("text-base font-semibold mb-2")
         for label, target, icon in DRAWER_ENTRIES:
             ui.button(label, icon=icon, on_click=lambda t=target: ui.navigate.to(t)).props(
                 "flat align=left no-caps"
+                + (" color=primary" if target == active else " color=inherit")
             ).classes("w-full")
         ui.separator().classes("my-2")
         ui.label(
-            "These sections store local profile context for future automation features."
+            "These sections store local profile context and the Gmail and AI automations."
         ).classes("text-xs opacity-60")
 
     with ui.column().classes("w-full max-w-6xl mx-auto p-6 gap-4"):

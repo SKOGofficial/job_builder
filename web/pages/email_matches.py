@@ -14,7 +14,7 @@ from nicegui import ui
 from clients import llm_client
 from clients.gmail_client import MISSING_PACKAGES_HINT
 from utilities.theme import STATUSES
-from web.shell import card, page_shell
+from web.shell import card, page_shell, page_timer
 from web.state import get_state
 
 NO_BODY_HINT = (
@@ -265,4 +265,4 @@ def email_matches_page():
         gmail_card()
         classifier_card()
         match_list()
-        ui.timer(0.4, watch)
+        page_timer(0.4, watch)
