@@ -14,7 +14,21 @@ import unittest
 import app
 import utilities.store as store
 from pages import DRAWER_ENTRIES, NAV_TABS, PAGE_CLASSES
+from pages.email_matches import NO_BODY_HINT
 from utilities.theme import TIME_RANGES
+
+
+def descendants(widget):
+    """Every widget under this one, depth first."""
+    found = []
+    for child in widget.winfo_children():
+        found.append(child)
+        found.extend(descendants(child))
+    return found
+
+
+def widgets_of_class(widget, class_name):
+    return [w for w in descendants(widget) if w.winfo_class() == class_name]
 
 
 def display_available():
@@ -120,6 +134,134 @@ class PageRenderTests(unittest.TestCase):
                 dashboard.set_range(days)
                 self.gui.update_idletasks()
                 self.assertEqual(dashboard.range_days, days)
+
+    # Email match cards ----------------------------------------------------
+
+    def seed_match(self, body="Thanks for applying. Can we talk Tuesday?"):
+        """Put one pending match on the page and clean it up afterwards."""
+        job_id = self.gui.store.create_job(
+            {
+                "posting_url": "https://acme.com/jobs/render",
+                "position_title": "Engineer",
+                "company": "Acme",
+                "job_type": "Internship",
+                "requires_oa": False,
+                "completed_oa": False,
+                "received_references": False,
+                "payment_amount": "",
+                "payment_period": "Unspecified",
+                "status": "Applied",
+                "application_date": "2026-07-28",
+                "response_date": None,
+                "notes": "",
+            }
+        )
+        self.gui.store.record_email_match(
+            job_id,
+            {
+                "id": "msg-render",
+                "sender": "Careers <careers@acme.com>",
+                "subject": "Interview?",
+                "date": "Tue, 28 Jul 2026 10:00:00 -0400",
+                "body": body,
+                "snippet": body[:40],
+            },
+        )
+        match_id = self.gui.store.pending_email_matches()[0]["id"]
+
+        def cleanup():
+            self.gui.store.conn.execute("DELETE FROM email_matches")
+            self.gui.store.conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            self.gui.store.conn.commit()
+            self.gui.pages["email_matches"].expanded.clear()
+
+        self.addCleanup(cleanup)
+        return match_id
+
+    def toggle_button(self):
+        buttons = widgets_of_class(self.gui.content, "TButton")
+        return next(b for b in buttons if b.cget("text") in ("▶", "▼"))
+
+    def test_email_match_card_starts_collapsed(self):
+        self.seed_match()
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+        (body,) = widgets_of_class(self.gui.content, "Text")
+        # The pane is built but never handed to the geometry manager, so an
+        # unmanaged parent is what "collapsed" looks like.
+        self.assertEqual(body.master.winfo_manager(), "")
+        self.assertEqual(self.toggle_button().cget("text"), "▶")
+
+    def test_email_match_card_expands_to_show_the_message(self):
+        match_id = self.seed_match()
+        page = self.gui.pages["email_matches"]
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+
+        self.toggle_button().invoke()
+        self.gui.update_idletasks()
+
+        self.assertIn(match_id, page.expanded)
+        (body,) = widgets_of_class(self.gui.content, "Text")
+        self.assertEqual(body.master.winfo_manager(), "pack")
+        self.assertIn("Can we talk Tuesday?", body.get("1.0", "end"))
+        self.assertEqual(self.toggle_button().cget("text"), "▼")
+
+    def test_expanded_message_is_read_only(self):
+        self.seed_match()
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+        self.toggle_button().invoke()
+        (body,) = widgets_of_class(self.gui.content, "Text")
+        self.assertEqual(str(body.cget("state")), "disabled")
+
+    def test_expanded_state_survives_navigation(self):
+        match_id = self.seed_match()
+        page = self.gui.pages["email_matches"]
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+        self.toggle_button().invoke()
+
+        self.gui.show_page("jobs")
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+
+        self.assertIn(match_id, page.expanded)
+        (body,) = widgets_of_class(self.gui.content, "Text")
+        self.assertEqual(body.master.winfo_manager(), "pack")
+
+    def test_collapsing_hides_the_message_again(self):
+        match_id = self.seed_match()
+        page = self.gui.pages["email_matches"]
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+        self.toggle_button().invoke()
+        self.toggle_button().invoke()
+        self.gui.update_idletasks()
+
+        self.assertNotIn(match_id, page.expanded)
+        (body,) = widgets_of_class(self.gui.content, "Text")
+        self.assertEqual(body.master.winfo_manager(), "")
+
+    def test_match_without_body_shows_a_placeholder(self):
+        # Rows recorded before bodies were stored must still render.
+        self.seed_match(body="")
+        self.gui.show_page("email_matches")
+        self.gui.update_idletasks()
+        self.toggle_button().invoke()
+        self.gui.update_idletasks()
+
+        self.assertEqual(widgets_of_class(self.gui.content, "Text"), [])
+        labels = [w.cget("text") for w in widgets_of_class(self.gui.content, "TLabel")]
+        self.assertIn(NO_BODY_HINT, labels)
+
+    def test_dismissing_clears_the_card(self):
+        match_id = self.seed_match()
+        self.gui.show_page("email_matches")
+        self.gui.pages["email_matches"].dismiss(match_id)
+        self.gui.update_idletasks()
+        self.assertEqual(self.gui.store.pending_email_matches(), [])
+        self.assertEqual(widgets_of_class(self.gui.content, "Text"), [])
 
     def test_page_state_survives_navigation(self):
         # Page objects are reused, so per-page state must not reset on return.

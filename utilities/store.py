@@ -26,6 +26,7 @@ def normalize_url(url):
 
 
 def url_hash(url):
+    """creates a hash of the url to use as a unique identifier for the job posting"""
     return hashlib.sha256(normalize_url(url).encode("utf-8")).hexdigest()[:12].upper()
 
 
@@ -78,6 +79,8 @@ class JobStore:
                 sender TEXT,
                 subject TEXT,
                 received_date TEXT,
+                snippet TEXT,
+                body_text TEXT,
                 reviewed INTEGER NOT NULL DEFAULT 0,
                 dismissed INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -90,7 +93,22 @@ class JobStore:
             CREATE INDEX IF NOT EXISTS idx_email_matches_job_id ON email_matches(job_id);
             """
         )
+        self.migrate()
         self.conn.commit()
+
+    def migrate(self):
+        """Add columns that later versions introduced.
+
+        CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a database
+        made before message bodies were stored keeps the old column set until it
+        is widened here. Adding a column is additive and keeps existing rows.
+        """
+        existing = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(email_matches)")
+        }
+        for column in ("snippet", "body_text"):
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE email_matches ADD COLUMN {column} TEXT")
 
     # Job records -----------------------------------------------------------
 
@@ -244,14 +262,19 @@ class JobStore:
         ).fetchall()
 
     def record_email_match(self, job_id, message):
-        """Store a suggested match. Ignores duplicates so re-scanning is safe."""
+        """Store a suggested match. Ignores duplicates so re-scanning is safe.
+
+        `snippet` and `body_text` are optional: a caller that only has headers,
+        or whose body fetch failed, still records a usable match.
+        """
         now = datetime.now().isoformat(timespec="seconds")
         cursor = self.conn.execute(
             """
             INSERT OR IGNORE INTO email_matches (
-                job_id, gmail_message_id, sender, subject, received_date, created_at
+                job_id, gmail_message_id, sender, subject, received_date,
+                snippet, body_text, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -259,6 +282,8 @@ class JobStore:
                 message["sender"],
                 message["subject"],
                 message["date"],
+                message.get("snippet", ""),
+                message.get("body", ""),
                 now,
             ),
         )

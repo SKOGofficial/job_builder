@@ -13,8 +13,15 @@ Credential model:
 
 The only scope requested is gmail.readonly. Nothing here sends, deletes, or
 modifies mail.
+
+Message text is fetched in two passes. Headers alone decide whether a message
+matches an application; the body is downloaded only afterwards, for messages
+that already matched, so mail the user will never see is never read.
 """
 
+import base64
+import binascii
+import html
 import os
 import re
 from datetime import date, timedelta
@@ -53,6 +60,10 @@ REVOKE_URI = "https://oauth2.googleapis.com/revoke"
 MISSING_PACKAGES_HINT = (
     "Gmail support needs extra packages. Run: pip install -r requirements.txt"
 )
+
+#: Upper bound on stored body text. Long newsletters would otherwise bloat the
+#: database and the Text widget for no reading benefit.
+MAX_BODY_CHARS = 20000
 
 
 class GmailNotConfigured(Exception):
@@ -185,8 +196,10 @@ def search_messages(query, max_results=25, creds=None):
 def get_message_headers(message_id, creds=None):
     """Fetch only the headers for a message.
 
-    format="metadata" with an explicit header allowlist means message bodies are
-    never downloaded, so nothing sensitive is held in memory or written to disk.
+    format="metadata" with an explicit header allowlist keeps this call to the
+    three headers matching needs. Bodies are a separate call (get_message_body)
+    made only once a message has matched, so a message that never matches is
+    never read beyond these headers.
     """
     service = _service(creds)
     message = (
@@ -210,6 +223,78 @@ def get_message_headers(message_id, creds=None):
         "sender": headers.get("from", ""),
         "subject": headers.get("subject", ""),
         "date": headers.get("date", ""),
+    }
+
+
+def _decode_part(body):
+    """Base64url-decode one payload part, tolerating missing or bad data."""
+    data = (body or {}).get("data")
+    if not data:
+        return ""
+    # Gmail strips base64 padding; put it back before decoding.
+    padded = data + "=" * (-len(data) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(padded)
+    except (binascii.Error, ValueError):
+        return ""
+    return raw.decode("utf-8", errors="replace")
+
+
+def _html_to_text(markup):
+    """Reduce an HTML part to readable plain text."""
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", markup)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|tr|h[1-6])\s*>", "\n\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t\f\v]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
+def _collect_parts(payload, mime_type):
+    """Return decoded text from every part of the given MIME type, depth first."""
+    if not isinstance(payload, dict):
+        return []
+    found = []
+    if payload.get("mimeType") == mime_type:
+        text = _decode_part(payload.get("body"))
+        if text:
+            found.append(text)
+    for part in payload.get("parts") or []:
+        found.extend(_collect_parts(part, mime_type))
+    return found
+
+
+def extract_body(payload, max_chars=MAX_BODY_CHARS):
+    """Pull readable text out of a Gmail message payload.
+
+    Prefers text/plain and falls back to text/html with the tags stripped, since
+    plenty of recruiting mail ships HTML only. Attachments contribute nothing:
+    parts without inline text data are skipped rather than downloaded.
+    """
+    parts = _collect_parts(payload, "text/plain")
+    if not any(part.strip() for part in parts):
+        parts = [_html_to_text(part) for part in _collect_parts(payload, "text/html")]
+    text = "\n\n".join(part.strip() for part in parts if part.strip())
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n\n[... truncated ...]"
+    return text
+
+
+def get_message_body(message_id, creds=None):
+    """Fetch a full message and return its readable text plus Gmail's snippet."""
+    service = _service(creds)
+    message = (
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="full")
+        .execute()
+    )
+    return {
+        "body": extract_body(message.get("payload", {})),
+        "snippet": html.unescape(message.get("snippet", "") or ""),
     }
 
 
@@ -256,9 +341,10 @@ def message_matches_company(message, company):
     """Conservative check that a message really relates to this company.
 
     Requires either the sender's domain to contain the company slug, or the
-    company slug to appear in the subject. Body text is deliberately not
-    considered: company names are short and collide with unrelated mail, and a
-    false positive here would suggest a wrong status change to the user.
+    company slug to appear in the subject. Body text stays out of this decision
+    even though matches now store it: company names are short and collide with
+    unrelated mail, and a false positive here would suggest a wrong status
+    change to the user.
     """
     slug = company_slug(company)
     if not slug:
@@ -349,6 +435,13 @@ class GmailWorkflow:
                 headers = get_message_headers(stub["id"], creds=creds)
                 if not message_matches_company(headers, job["company"]):
                     continue
+                try:
+                    headers.update(get_message_body(stub["id"], creds=creds))
+                except Exception:
+                    # A body that will not download is not worth losing the
+                    # match over; the page shows a placeholder for empty text.
+                    headers.setdefault("body", "")
+                    headers.setdefault("snippet", "")
                 if store.record_email_match(job["job_id"], headers):
                     found += 1
 

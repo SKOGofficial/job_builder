@@ -69,8 +69,13 @@ Setup:
 How it handles your data:
 
 - The only scope requested is `gmail.readonly`. The app never sends, deletes, or modifies mail.
-- Only message headers are fetched (`From`, `Subject`, `Date`). Message bodies are never downloaded.
-- Stored per match: the Gmail message ID plus those three headers. No body text is kept.
+- Fetching happens in two passes. Headers (`From`, `Subject`, `Date`) are fetched first and are
+  the only thing matching looks at. The body is downloaded afterwards, **only for messages that
+  already matched**, so mail you will never be shown is never read beyond those three headers.
+- Stored per match: the Gmail message ID, those three headers, Gmail's snippet, and the message
+  text (plain text where available, otherwise the HTML part with tags stripped, capped at 20,000
+  characters). Attachments are never downloaded.
+- Everything stays in the local `job_applications.sqlite3` file. Nothing is uploaded anywhere.
 - The refresh token is the only real credential and is stored in Windows Credential Manager
   through `keyring`, not in the project folder. For a Desktop OAuth client the client ID and
   secret are public per RFC 8252, so they live in `.env` as ordinary configuration.
@@ -82,8 +87,13 @@ How matching works:
 - Only jobs in Pending, Applied, or OA Received with no response date are checked.
 - A message must either come from a domain containing the company name, or carry the company
   name in its subject. Free mail domains such as gmail.com never count as a domain match.
+- The body is never used to decide a match, only to show you what the email said. Company names
+  are short and collide with unrelated mail, so a body-text match would suggest wrong statuses.
 - Matches are **suggestions only**. The app never changes a job status on its own; every match
   is confirmed or dismissed by you on the **Email matches** page.
+- On that page each match starts collapsed. Click the arrow or the title to expand it and read
+  the message. Matches recorded before this feature show a placeholder instead of text; re-scan
+  to fetch it.
 - Scanning runs only when you press **Check for replies**. There is no background polling.
 
 ## Tests
