@@ -48,7 +48,8 @@ def page_timer(interval, callback):
     tick. Cancelling on disconnect keeps the log clean and stops the work.
     """
     timer = ui.timer(interval, callback)
-    context.client.on_disconnect(timer.cancel)
+    # on_disconnect passes client as argument; timer.cancel() takes no args
+    context.client.on_disconnect(lambda _: timer.cancel())
     return timer
 
 

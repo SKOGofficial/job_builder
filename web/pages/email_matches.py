@@ -57,7 +57,11 @@ def email_matches_page():
         async def scan_now():
             found = await scanner.scan()
             refresh_all()
-            ui.notify(scanner.message, type="negative" if scanner.state == "error" else "positive")
+            # Only notify if we're still in a valid context (not navigated away)
+            try:
+                ui.notify(scanner.message, type="negative" if scanner.state == "error" else "positive")
+            except RuntimeError:
+                pass
             # New matches are exactly what the classifier exists to label, so a
             # scan that found something rolls straight into a cycle.
             if found and classifier.available and classifier.is_configured():

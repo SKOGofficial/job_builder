@@ -44,12 +44,15 @@ def settings_page():
         async def scan_now():
             found = await scanner.scan()
             refresh_all()
-            ui.notify(
-                scanner.message,
-                type="negative" if scanner.state == gmail_client.ERROR else "positive",
-                multi_line=True,
-                close_button=True,
-            )
+            try:
+                ui.notify(
+                    scanner.message,
+                    type="negative" if scanner.state == gmail_client.ERROR else "positive",
+                    multi_line=True,
+                    close_button=True,
+                )
+            except RuntimeError:
+                pass
             if found and classifier.available and classifier.is_configured():
                 await classifier.run()
                 refresh_all()
@@ -57,7 +60,10 @@ def settings_page():
         async def classify_now():
             await classifier.run()
             refresh_all()
-            ui.notify(classifier.message, multi_line=True, close_button=True)
+            try:
+                ui.notify(classifier.message, multi_line=True, close_button=True)
+            except RuntimeError:
+                pass
 
         # Gmail ---------------------------------------------------------------
 
