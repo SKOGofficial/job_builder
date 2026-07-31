@@ -10,6 +10,7 @@ so the page stays scannable when many matches are pending.
 import tkinter as tk
 from tkinter import ttk
 
+from clients import llm_client
 from clients.gmail_client import MISSING_PACKAGES_HINT
 from pages.base import BasePage
 from utilities.theme import STATUSES
@@ -37,10 +38,16 @@ class EmailMatchesPage(BasePage):
         #: Match ids currently showing their message. Page instances are reused,
         #: so what the user opened survives navigating away and back.
         self.expanded = set()
+        #: Progress widgets, refreshed in place while a cycle runs so the page
+        #: is not rebuilt on every classified message.
+        self.progress_label = None
+        self.progress_bar = None
 
     def render(self):
         self.render_heading()
         gmail = self.app.gmail
+        self.progress_label = None
+        self.progress_bar = None
 
         if not gmail.available:
             card = self.card(self.content)
@@ -49,6 +56,8 @@ class EmailMatchesPage(BasePage):
                 card, text=MISSING_PACKAGES_HINT, style="MutedSurface.TLabel", wraplength=620
             ).pack(anchor="w")
             return
+
+        matches = self.store.pending_email_matches()
 
         toolbar = ttk.Frame(self.content, style="TFrame")
         toolbar.pack(fill="x", pady=(0, 12))
@@ -62,8 +71,13 @@ class EmailMatchesPage(BasePage):
                 text="Connect Gmail in Settings",
                 command=lambda: self.show_page("settings"),
             ).pack(side="left")
+        if matches:
+            ttk.Label(toolbar, text=f"{len(matches)} pending", style="Muted.TLabel").pack(
+                side="left", padx=(14, 0)
+            )
 
-        matches = self.store.pending_email_matches()
+        self.render_classifier_card()
+
         if not matches:
             card = self.card(self.content)
             card.pack(fill="x")
@@ -74,15 +88,110 @@ class EmailMatchesPage(BasePage):
             ).pack(anchor="w")
             return
 
-        ttk.Label(
-            toolbar,
-            text=f"{len(matches)} pending",
-            style="Muted.TLabel",
-        ).pack(side="left", padx=(14, 0))
-
         column = self.scroll_area()
         for match in matches:
             self.render_match_card(column, match)
+
+    # AI classification -----------------------------------------------------
+
+    def render_classifier_card(self):
+        """Progress, state, and the controls for the classification cycle."""
+        runner = self.app.classifier
+        if not runner.available:
+            return
+
+        card = self.card(self.content, padding=(18, 14))
+        card.pack(fill="x", pady=(0, 12))
+
+        row = ttk.Frame(card, style="Surface.TFrame")
+        row.pack(fill="x")
+        ttk.Label(row, text="AI classification", style="CardTitle.TLabel").pack(side="left")
+
+        if not runner.is_configured():
+            ttk.Label(
+                card,
+                text=(
+                    "No Groq API key found. Add GROQ_API_KEY to .env, or store it in "
+                    "Credential Manager from Settings."
+                ),
+                style="MutedSurface.TLabel",
+                wraplength=760,
+            ).pack(anchor="w", pady=(6, 0))
+            ttk.Button(
+                card, text="Open Settings", command=lambda: self.show_page("settings")
+            ).pack(anchor="w", pady=(10, 0))
+            return
+
+        if runner.state == llm_client.RUNNING:
+            ttk.Button(row, text="Stop", command=runner.stop).pack(side="right")
+        elif runner.state in (llm_client.RATE_LIMITED, llm_client.STOPPED, llm_client.ERROR):
+            ttk.Button(
+                row,
+                text="Resume classification",
+                style="Primary.TButton",
+                command=runner.resume,
+            ).pack(side="right")
+        else:
+            waiting = runner.pending_count()
+            ttk.Button(
+                row,
+                text=f"Classify {waiting} message(s)" if waiting else "Classify with AI",
+                style="Primary.TButton" if waiting else "TButton",
+                command=runner.start,
+            ).pack(side="right")
+
+        self.progress_label = ttk.Label(
+            card,
+            text=runner.progress_text() or "Idle.",
+            style="MutedSurface.TLabel",
+            wraplength=760,
+        )
+        self.progress_label.pack(anchor="w", pady=(8, 0))
+
+        if runner.state == llm_client.RUNNING:
+            self.progress_bar = ttk.Progressbar(
+                card,
+                orient="horizontal",
+                mode="determinate",
+                maximum=max(runner.total, 1),
+                value=runner.processed,
+                style="Horizontal.TProgressbar",
+            )
+            self.progress_bar.pack(fill="x", pady=(8, 0))
+        elif runner.state == llm_client.RATE_LIMITED:
+            # A filled warning-coloured bar shows how far the cycle got before
+            # Groq cut it off, so Resume has visible context.
+            self.progress_bar = ttk.Progressbar(
+                card,
+                orient="horizontal",
+                mode="determinate",
+                maximum=max(runner.total, 1),
+                value=runner.processed,
+                style="Paused.Horizontal.TProgressbar",
+            )
+            self.progress_bar.pack(fill="x", pady=(8, 0))
+
+    def on_classification_update(self, final=False):
+        """Called by the runner on the main thread as the cycle progresses.
+
+        Mid-cycle updates only touch the two progress widgets. A full redraw is
+        reserved for terminal states, where the buttons and the cards' AI badges
+        both change.
+        """
+        if self.app.active_page != self.name:
+            return
+        live = (
+            not final
+            and self.progress_label is not None
+            and self.progress_label.winfo_exists()
+        )
+        if not live:
+            self.show_page(self.name)
+            return
+        runner = self.app.classifier
+        self.progress_label.configure(text=runner.progress_text())
+        if self.progress_bar is not None and self.progress_bar.winfo_exists():
+            self.progress_bar.configure(value=runner.processed)
 
     # Layout helpers --------------------------------------------------------
 
@@ -159,6 +268,7 @@ class EmailMatchesPage(BasePage):
             style="MutedSurface.TLabel",
         ).pack(anchor="w", pady=(2, 10))
 
+        self.render_ai_badge(card, match)
         body = self.build_body(card, match)
         if match_id in self.expanded:
             body.pack(fill="both", expand=True, pady=(0, 12))
@@ -166,7 +276,10 @@ class EmailMatchesPage(BasePage):
         actions = ttk.Frame(card, style="Surface.TFrame")
         actions.pack(fill="x")
         ttk.Label(actions, text="Set status to", style="Surface.TLabel").pack(side="left")
-        status_var = tk.StringVar(value="Interview")
+        # The model's label pre-fills the dropdown when it maps to a real status.
+        # Acknowledgement and Unclear deliberately do not.
+        suggested = match["ai_status"] if match["ai_status"] in STATUSES else "Interview"
+        status_var = tk.StringVar(value=suggested)
         ttk.Combobox(
             actions, textvariable=status_var, values=STATUSES, state="readonly", width=16
         ).pack(side="left", padx=8)
@@ -179,6 +292,39 @@ class EmailMatchesPage(BasePage):
         ttk.Button(actions, text="Dismiss", command=lambda: self.dismiss(match_id)).pack(
             side="left"
         )
+
+    def render_ai_badge(self, card, match):
+        """Show what the model concluded, and whether it acted on it."""
+        label = match["ai_status"]
+        if not label:
+            return
+
+        row = ttk.Frame(card, style="Surface.TFrame")
+        row.pack(fill="x", pady=(0, 6))
+        ttk.Label(
+            row,
+            text=f"AI: {label} · {(match['ai_confidence'] or 0.0):.0%}",
+            style="Badge.TLabel",
+        ).pack(side="left")
+
+        if match["ai_applied"]:
+            previous = match["ai_previous_status"] or "unset"
+            ttk.Label(
+                row,
+                text=f"Applied automatically, replacing {previous}.",
+                style="MutedSurface.TLabel",
+            ).pack(side="left", padx=(10, 0))
+            ttk.Button(row, text="Undo", command=lambda: self.undo(match["id"])).pack(
+                side="left", padx=(10, 0)
+            )
+
+        if match["ai_reason"]:
+            ttk.Label(
+                card,
+                text=match["ai_reason"],
+                style="MutedSurface.TLabel",
+                wraplength=760,
+            ).pack(anchor="w", pady=(0, 8))
 
     def build_body(self, card, match):
         """Build the collapsible message pane. Not packed until it is expanded."""
@@ -237,4 +383,9 @@ class EmailMatchesPage(BasePage):
     def dismiss(self, match_id):
         self.store.dismiss_email_match(match_id)
         self.expanded.discard(match_id)
+        self.show_page("email_matches")
+
+    def undo(self, match_id):
+        """Revert a status the classifier applied on its own."""
+        self.store.undo_ai_status(match_id)
         self.show_page("email_matches")
