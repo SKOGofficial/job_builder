@@ -4,7 +4,8 @@ A local desktop application for tracking job applications across job boards and 
 
 ## What is implemented
 
-- Desktop UI built with Python `tkinter` and a local SQLite database.
+- UI built with [NiceGUI](https://nicegui.io), served locally and opened in a native window,
+  backed by a local SQLite database.
 - Job insertion portal centered on the main screen.
 - URL-first workflow that generates deterministic Job IDs from the normalized job posting URL.
 - Duplicate URL detection before saving.
@@ -20,7 +21,7 @@ A local desktop application for tracking job applications across job boards and 
   - Application status
   - Application and response dates
   - Notes
-- All jobs page with a searchable-style table layout and row details.
+- All jobs page with a searchable, sortable, paginated table and per-row details.
 - Status update flow for applications after they are saved.
 - Dashboard with:
   - Number of jobs applied to
@@ -40,17 +41,21 @@ A local desktop application for tracking job applications across job boards and 
 
 ## Running the app
 
-The tracker itself uses only Python standard library modules. The optional Gmail integration
-needs extra packages, so the project ships a virtual environment setup.
-
 ```powershell
 py -3.14 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 .venv\Scripts\python.exe app.py
 ```
 
-The app still launches without those packages installed; the Gmail features simply
-report that they are unavailable.
+That opens a native window. Two flags are available:
+
+- `--browser` opens a normal browser tab instead. This is also the automatic fallback when
+  `pywebview` is not installed.
+- `--port 8123` moves it off the default 8080.
+
+The server binds to `127.0.0.1`, so it is reachable only from this machine. Gmail and Groq
+features report that they are unavailable when their packages or credentials are missing;
+everything else keeps working.
 
 The SQLite database is created automatically as `job_applications.sqlite3` in the project folder.
 
@@ -150,25 +155,29 @@ How your data is handled:
 ## Tests
 
 ```powershell
-.venv\Scripts\python.exe -m unittest discover -s tests -t .
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.venv\Scripts\python.exe -m pytest
 ```
 
 Or one module at a time:
 
 ```powershell
-.venv\Scripts\python.exe -m unittest tests.test_llm_classification
+.venv\Scripts\python.exe -m pytest tests/test_web_pages.py
 ```
 
 - `tests/test_gmail_matching.py` covers query building, company matching, body extraction,
-  and the email match store.
+  the email match store, and the scan cycle.
 - `tests/test_llm_classification.py` covers Groq configuration, prompting, response
-  validation, pacing, and the classification cycle including its worker thread.
-- `tests/test_app_pages.py` renders every page. These need a display; on a headless Linux
-  runner, wrap the run with `xvfb-run`.
+  validation, pacing, and the classification cycle.
+- `tests/test_web_pages.py` opens every route and clicks through the app using NiceGUI's
+  user simulation. No browser and no display are needed, so this runs on a bare CI runner.
+
+The backend tests are `unittest.TestCase` classes and the page tests are pytest-style;
+`pytest` collects both, which is why it is the single command.
 
 The tests use a temporary SQLite database and never touch `job_applications.sqlite3`. They
-need no network access, no Google credentials, and no Groq key: the HTTP call, the pacer's
-clock, and the model client are all injected.
+need no network access, no Google credentials, and no Groq key: the HTTP calls, the pacer's
+clock, the model client, and the async executor are all injected.
 
 ## Product report website
 

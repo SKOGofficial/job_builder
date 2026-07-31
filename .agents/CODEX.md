@@ -4,13 +4,13 @@ Use this file as the operating guide for future Codex sessions in this repositor
 
 ## Project Summary
 
-Job Board Tracker is a local desktop application for logging job applications and tracking follow-up state. It is built with Python standard library `tkinter` and SQLite, with no required third-party runtime dependencies today.
+Job Board Tracker is a local desktop application for logging job applications and tracking follow-up state. It is built with NiceGUI and SQLite, served on loopback and opened in a native window.
 
 Primary goal: make it easy to record every job application, detect duplicate postings, track responses and OA progress, and review progress through useful dashboard views.
 
 ## Current Files
 
-- `app.py`: Tkinter application, SQLite store, dashboard drawing, profile storage, and all UI logic.
+- `app.py`: entry point. Parses arguments and calls `ui.run`; the UI itself lives in `web/`.
 - `README.md`: user-facing project overview and run instructions.
 - `job_applications.sqlite3`: local user data, ignored by git. Do not delete, reset, overwrite, or commit it.
 - `.agents/IMPLEMENTATION_PLAN.md`: feature backlog and acceptance checklist.

@@ -11,6 +11,9 @@ Credential model:
 - The refresh token is the only real credential. It lives in Windows Credential
   Manager through keyring, never in the project folder.
 
+This module holds no UI code. Scan progress is published to subscribers and the
+caller decides how to display it, so the same client works behind any front end.
+
 The only scope requested is gmail.readonly. Nothing here sends, deletes, or
 modifies mail.
 
@@ -19,13 +22,13 @@ matches an application; the body is downloaded only afterwards, for messages
 that already matched, so mail the user will never see is never read.
 """
 
+import asyncio
 import base64
 import binascii
 import html
 import os
 import re
 from datetime import date, timedelta
-from tkinter import messagebox
 
 from utilities import credentials
 
@@ -364,9 +367,38 @@ def message_matches_company(message, company):
     return bool(subject_slug) and slug in subject_slug
 
 
-class GmailWorkflow:
-    def __init__(self, app):
-        self.app = app
+IDLE, RUNNING, DONE, ERROR = "idle", "running", "done", "error"
+
+
+class GmailScanner:
+    """Scans for replies to open applications and records them as suggestions.
+
+    Nothing is applied to a job here. Every hit becomes a pending suggestion the
+    user confirms or dismisses on the Email matches page.
+
+    The scan is async so the UI stays responsive during what is a long run of
+    network calls. Every blocking Google call goes through an injectable
+    executor (asyncio.to_thread by default), while database access stays on the
+    calling thread, which is the one that owns the sqlite connection.
+
+    This class holds no reference to a UI toolkit. Progress reaches the screen
+    through subscribers, and the caller decides how to present it.
+    """
+
+    def __init__(self, store, executor=None, credential_loader=None):
+        self.store = store
+        self.executor = executor or asyncio.to_thread
+        self.credential_loader = credential_loader or load_credentials
+        self.state = IDLE
+        self.total = 0
+        self.checked = 0
+        self.found = 0
+        self.current = ""
+        self.message = ""
+        self.skipped = []
+        self.listeners = []
+
+    # Status ----------------------------------------------------------------
 
     @property
     def available(self):
@@ -375,92 +407,104 @@ class GmailWorkflow:
     def is_connected(self):
         return GMAIL_AVAILABLE and is_connected()
 
-    def connect(self):
-        try:
-            run_auth_flow()
-        except GmailNotConfigured as exc:
-            messagebox.showerror("Gmail not configured", str(exc))
-            return
-        except Exception as exc:
-            messagebox.showerror("Could not connect", str(exc))
-            return
-        messagebox.showinfo("Gmail connected", "Gmail is connected with read-only access.")
-        self.app.show_page("settings")
+    @property
+    def busy(self):
+        return self.state == RUNNING
 
-    def disconnect(self):
-        if not messagebox.askyesno(
-            "Disconnect Gmail",
-            "Revoke this app's access to your Gmail account and remove the stored token?",
-        ):
-            return
-        try:
-            disconnect()
-        except Exception as exc:
-            messagebox.showerror("Could not disconnect", str(exc))
-            return
-        messagebox.showinfo("Gmail disconnected", "Access was revoked and the token removed.")
-        self.app.show_page("settings")
+    def subscribe(self, callback):
+        self.listeners.append(callback)
+        return callback
 
-    def scan(self):
-        """Look for replies to open applications and record them as suggestions.
+    def unsubscribe(self, callback):
+        if callback in self.listeners:
+            self.listeners.remove(callback)
 
-        Nothing is applied to a job here. Every hit becomes a pending suggestion
-        the user confirms or dismisses on the Email matches page.
-        """
-        store = self.app.store
-        try:
-            creds = load_credentials()
-        except Exception as exc:
-            messagebox.showerror("Gmail unavailable", str(exc))
-            return
+    def emit(self):
+        for callback in list(self.listeners):
+            callback(self)
 
-        jobs = store.jobs_awaiting_response()
+    def progress_text(self):
+        if self.state == RUNNING:
+            suffix = f" — {self.current}" if self.current else ""
+            return f"Checking {min(self.checked + 1, self.total)} of {self.total}{suffix}"
+        return self.message
+
+    # Scanning --------------------------------------------------------------
+
+    async def scan(self):
+        """Run one scan. Returns the number of new matches recorded."""
+        if self.busy:
+            return 0
+        self.state = RUNNING
+        self.checked = 0
+        self.found = 0
+        self.current = ""
+        self.message = ""
+        self.skipped = []
+
+        jobs = self.store.jobs_awaiting_response()
+        self.total = len(jobs)
         if not jobs:
-            messagebox.showinfo("Nothing to check", "No applications are waiting on a response.")
-            return
+            self.state = DONE
+            self.message = "No applications are waiting on a response."
+            self.emit()
+            return 0
+        self.emit()
 
-        found = 0
-        skipped = []
+        try:
+            creds = await self.executor(self.credential_loader)
+        except Exception as exc:
+            self.state = ERROR
+            self.message = f"Gmail unavailable: {exc}"
+            self.emit()
+            return 0
+
         for job in jobs:
+            self.current = job["company"] or job["position_title"] or ""
+            self.emit()
             query = build_query(job["company"], job["application_date"])
             if not query:
-                skipped.append(job["position_title"])
+                self.skipped.append(job["position_title"])
+                self.checked += 1
                 continue
             try:
-                messages = search_messages(query, creds=creds)
+                await self.scan_job(job, query, creds)
             except Exception as exc:
-                messagebox.showerror(
-                    "Gmail search failed",
-                    f"Stopped after checking {found} match(es).\n\n{exc}",
+                self.state = ERROR
+                self.message = (
+                    f"Gmail search failed after {self.found} match(es): {exc}"
                 )
-                break
-            seen = store.known_message_ids(job["job_id"])
-            for stub in messages:
-                if stub["id"] in seen:
-                    continue
-                headers = get_message_headers(stub["id"], creds=creds)
-                if not message_matches_company(headers, job["company"]):
-                    continue
-                try:
-                    headers.update(get_message_body(stub["id"], creds=creds))
-                except Exception:
-                    # A body that will not download is not worth losing the
-                    # match over; the page shows a placeholder for empty text.
-                    headers.setdefault("body", "")
-                    headers.setdefault("snippet", "")
-                if store.record_email_match(job["job_id"], headers):
-                    found += 1
+                self.emit()
+                return self.found
+            self.checked += 1
+            self.emit()
 
-        summary = f"Found {found} new possible repl{'y' if found == 1 else 'ies'}."
-        if skipped:
-            summary += f"\n\nSkipped {len(skipped)} job(s) with no company name recorded."
-        if found:
-            summary += "\n\nReview them on the Email matches page."
-        messagebox.showinfo("Gmail check complete", summary)
-        self.app.show_page("email_matches")
+        self.state = DONE
+        self.message = self.summary()
+        self.emit()
+        return self.found
 
-        # New matches are exactly what the classifier exists to label, so a scan
-        # that found something rolls straight into a classification cycle.
-        classifier = getattr(self.app, "classifier", None)
-        if found and classifier is not None and classifier.is_configured():
-            classifier.start()
+    async def scan_job(self, job, query, creds):
+        messages = await self.executor(search_messages, query, 25, creds)
+        seen = self.store.known_message_ids(job["job_id"])
+        for stub in messages:
+            if stub["id"] in seen:
+                continue
+            headers = await self.executor(get_message_headers, stub["id"], creds)
+            if not message_matches_company(headers, job["company"]):
+                continue
+            try:
+                headers.update(await self.executor(get_message_body, stub["id"], creds))
+            except Exception:
+                # A body that will not download is not worth losing the match
+                # over; the page shows a placeholder for empty text.
+                headers.setdefault("body", "")
+                headers.setdefault("snippet", "")
+            if self.store.record_email_match(job["job_id"], headers):
+                self.found += 1
+
+    def summary(self):
+        text = f"Found {self.found} new possible repl{'y' if self.found == 1 else 'ies'}."
+        if self.skipped:
+            text += f" Skipped {len(self.skipped)} job(s) with no company name recorded."
+        return text

@@ -1,0 +1,7 @@
+# Test-only dependencies. The app itself needs nothing from this file.
+#
+# The page tests use NiceGUI's user simulation, which is pytest-fixture based.
+# pytest also collects the unittest-style backend tests, so one runner covers
+# everything.
+pytest
+pytest-asyncio
