@@ -1,12 +1,11 @@
 from utilities.store import DB_PATH, JobStore, normalize_url, today_iso, url_hash
 from utilities.theme import (
+    CHART_COLOR,
     JOB_TYPES,
     PAY_PERIODS,
     STATUS_COLORS,
     STATUSES,
-    THEMES,
     TIME_RANGES,
-    apply_styles,
 )
 
 __all__ = [
@@ -15,11 +14,10 @@ __all__ = [
     "normalize_url",
     "url_hash",
     "today_iso",
-    "THEMES",
+    "CHART_COLOR",
     "STATUS_COLORS",
     "TIME_RANGES",
     "JOB_TYPES",
     "STATUSES",
     "PAY_PERIODS",
-    "apply_styles",
 ]

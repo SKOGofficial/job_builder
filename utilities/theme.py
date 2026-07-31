@@ -1,41 +1,11 @@
-"""Palettes, domain vocabulary, and ttk style setup.
+"""Domain vocabulary and the colors charts are drawn with.
 
-Kept separate so pages can read colors and option lists without importing the
-application shell.
+The ttk style sheet that used to live here went with the Tkinter UI. What
+remains is framework-independent: the option lists the forms offer, and the
+status colors. Light and dark rendering is now the front end's job.
 """
 
-THEMES = {
-    "light": {
-        "bg": "#f7f8fb",
-        "surface": "#ffffff",
-        "surface_2": "#edf1f7",
-        "text": "#17202a",
-        "muted": "#64748b",
-        "border": "#d7dee8",
-        "primary": "#2563eb",
-        "primary_hover": "#1d4ed8",
-        "accent": "#0f766e",
-        "warning": "#b45309",
-        "danger": "#b91c1c",
-        "chart": "#0891b2",
-    },
-    "dark": {
-        "bg": "#101318",
-        "surface": "#171c24",
-        "surface_2": "#202735",
-        "text": "#eff4fb",
-        "muted": "#a7b3c4",
-        "border": "#303948",
-        "primary": "#60a5fa",
-        "primary_hover": "#93c5fd",
-        "accent": "#2dd4bf",
-        "warning": "#fbbf24",
-        "danger": "#f87171",
-        "chart": "#22d3ee",
-    },
-}
-
-# Fixed per status, so the pie chart reads the same in both themes.
+#: Fixed per status so a chart reads the same in both light and dark mode.
 STATUS_COLORS = {
     "Pending": "#eab308",
     "OA Received": "#a855f7",
@@ -45,155 +15,16 @@ STATUS_COLORS = {
     "Withdrawn": "#9ca3af",
 }
 
+#: Line colour for the cumulative applications chart.
+CHART_COLOR = "#0891b2"
+
+#: Brand blue, carried over from the original palette. Quasar's stock primary is
+#: a lighter blue that only reaches 3.1:1 against white text; this reaches
+#: 5.2:1, so header labels clear WCAG AA rather than washing out.
+PRIMARY_COLOR = "#2563eb"
+
 TIME_RANGES = [("7d", 7), ("14d", 14), ("30d", 30), ("90d", 90), ("All time", None)]
 
 JOB_TYPES = ["Internship", "Full time", "Part time", "Contract", "Unpaid"]
 STATUSES = ["Pending", "Applied", "OA Received", "Interview", "Offer", "Rejected", "Withdrawn"]
 PAY_PERIODS = ["Per hour", "Monthly", "Annual", "Unspecified"]
-
-
-def apply_styles(root, theme, theme_name):
-    """Configure every ttk style used by the app for the active theme."""
-    from tkinter import ttk
-
-    style = ttk.Style(root)
-    style.theme_use("clam")
-    style.configure(
-        ".",
-        background=theme["bg"],
-        foreground=theme["text"],
-        fieldbackground=theme["surface"],
-        font=("Segoe UI", 10),
-    )
-    style.configure("TFrame", background=theme["bg"], bordercolor=theme["border"])
-    style.configure("Surface.TFrame", background=theme["surface"], bordercolor=theme["border"])
-    style.configure("TLabel", background=theme["bg"], foreground=theme["text"])
-    style.configure("Muted.TLabel", background=theme["bg"], foreground=theme["muted"])
-    style.configure("Surface.TLabel", background=theme["surface"], foreground=theme["text"])
-    style.configure("MutedSurface.TLabel", background=theme["surface"], foreground=theme["muted"])
-    style.configure(
-        "Title.TLabel",
-        background=theme["bg"],
-        foreground=theme["text"],
-        font=("Segoe UI Semibold", 22),
-    )
-    style.configure(
-        "CardTitle.TLabel",
-        background=theme["surface"],
-        foreground=theme["text"],
-        font=("Segoe UI Semibold", 14),
-    )
-    style.configure(
-        "TButton",
-        background=theme["surface_2"],
-        foreground=theme["text"],
-        bordercolor=theme["border"],
-        focusthickness=0,
-        padding=(14, 8),
-    )
-    style.map(
-        "TButton",
-        background=[("active", theme["border"])],
-        foreground=[("active", theme["text"])],
-    )
-
-    on_primary = "#ffffff" if theme_name == "light" else "#08111f"
-    style.configure(
-        "Primary.TButton",
-        background=theme["primary"],
-        foreground=on_primary,
-        bordercolor=theme["primary"],
-    )
-    style.map("Primary.TButton", background=[("active", theme["primary_hover"])])
-
-    style.configure(
-        "Tab.TButton",
-        background=theme["surface"],
-        foreground=theme["text"],
-        bordercolor=theme["border"],
-        relief="flat",
-        padding=(14, 10),
-    )
-    style.map("Tab.TButton", background=[("active", theme["surface_2"])])
-    style.configure(
-        "ActiveTab.TButton",
-        background=theme["bg"],
-        foreground=theme["text"],
-        bordercolor=theme["border"],
-        relief="flat",
-        padding=(14, 10),
-    )
-    style.map("ActiveTab.TButton", background=[("active", theme["surface_2"])])
-
-    style.configure(
-        "Range.TButton",
-        background=theme["surface_2"],
-        foreground=theme["muted"],
-        bordercolor=theme["border"],
-        relief="flat",
-        padding=(10, 4),
-        font=("Segoe UI", 8),
-    )
-    style.map("Range.TButton", background=[("active", theme["surface"])])
-    style.configure(
-        "RangeActive.TButton",
-        background=theme["primary"],
-        foreground=on_primary,
-        bordercolor=theme["primary"],
-        relief="flat",
-        padding=(10, 4),
-        font=("Segoe UI", 8),
-    )
-    style.map("RangeActive.TButton", background=[("active", theme["primary_hover"])])
-
-    for widget in ("TEntry", "TCombobox"):
-        style.configure(
-            widget,
-            bordercolor=theme["border"],
-            lightcolor=theme["border"],
-            darkcolor=theme["border"],
-            padding=(8, 8),
-        )
-
-    # Progressbar draws from its own options rather than inheriting ".", so both
-    # the trough and the bar need setting for each theme.
-    style.configure(
-        "Horizontal.TProgressbar",
-        troughcolor=theme["surface_2"],
-        background=theme["primary"],
-        bordercolor=theme["border"],
-        lightcolor=theme["primary"],
-        darkcolor=theme["primary"],
-        thickness=8,
-    )
-    style.configure(
-        "Paused.Horizontal.TProgressbar",
-        troughcolor=theme["surface_2"],
-        background=theme["warning"],
-        bordercolor=theme["border"],
-        lightcolor=theme["warning"],
-        darkcolor=theme["warning"],
-        thickness=8,
-    )
-
-    style.configure(
-        "Badge.TLabel",
-        background=theme["surface_2"],
-        foreground=theme["text"],
-        padding=(8, 3),
-        font=("Segoe UI Semibold", 9),
-    )
-    style.configure(
-        "Treeview",
-        background=theme["surface"],
-        foreground=theme["text"],
-        fieldbackground=theme["surface"],
-        bordercolor=theme["border"],
-        rowheight=34,
-    )
-    style.configure(
-        "Treeview.Heading",
-        background=theme["surface_2"],
-        foreground=theme["text"],
-        font=("Segoe UI Semibold", 10),
-    )

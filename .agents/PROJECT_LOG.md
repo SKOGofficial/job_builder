@@ -2,6 +2,27 @@
 
 Use this file to record meaningful project changes, implementation decisions, and verification notes.
 
+## 2026-07-31 - UI moved from Tkinter to NiceGUI
+
+- Replaced the Tkinter UI with NiceGUI under `web/`. `pages/` was deleted; `app.py` is now just
+  an entry point. The backend under `clients/` and `utilities/` carried over unchanged in
+  behaviour, which was the point of keeping it UI-free.
+- Removed the last UI coupling in `clients/`: `gmail_client.py` imported `tkinter.messagebox`.
+  `GmailWorkflow` became the async `GmailScanner`, publishing progress to subscribers instead
+  of opening dialogs.
+- `ClassificationRunner` moved from `threading.Thread` + `queue.Queue` + `after()` polling to an
+  async cycle with an injectable executor (`asyncio.to_thread` by default). Database access
+  stays on the calling thread; only the blocking HTTP call is offloaded.
+- Hand-drawn Canvas charts (~190 lines) were replaced by `ui.echart`, and the Treeview by
+  `ui.table`, which brings sorting, filtering, and pagination.
+- `utilities/theme.py` lost its ttk style sheet and keeps only domain vocabulary and chart
+  colours.
+- Tests: the Tkinter render tests were replaced by `tests/test_web_pages.py`, which drives the
+  app through NiceGUI's user simulation — no browser, no display, so CI no longer needs Tk or
+  xvfb. `pytest` now runs both the unittest backend suites and the page tests.
+- Verified: 128 tests pass. Rendering of every route was also checked against a running server
+  with a seeded database, including that both ECharts draw to real canvases.
+
 ## 2026-07-29 - Codebase reorganization: clients, utilities, and tests
 
 - Organized client integrations into `clients/` directory (`clients/gmail_client.py` and `clients/llm_client.py`).

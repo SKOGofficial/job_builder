@@ -33,10 +33,9 @@ ceiling binds first, so requests are paced from tokens rather than fired in a
 burst. A 429 stops the cycle cleanly instead of hammering the endpoint.
 """
 
+import asyncio
 import json
 import os
-import queue
-import threading
 import time
 
 from utilities import credentials
@@ -384,9 +383,6 @@ class GroqClient:
 
 # Cycle orchestration ------------------------------------------------------
 
-#: How often the main thread drains the worker's event queue.
-POLL_MS = 120
-
 IDLE, RUNNING, RATE_LIMITED, STOPPED, DONE, ERROR = (
     "idle", "running", "rate_limited", "stopped", "done", "error"
 )
@@ -395,21 +391,26 @@ IDLE, RUNNING, RATE_LIMITED, STOPPED, DONE, ERROR = (
 class ClassificationRunner:
     """Drives the classification cycle for the UI.
 
-    Threading contract, which the rest of the app depends on:
+    Concurrency contract, which the rest of the app depends on:
 
-    - The worker thread performs HTTP only. It never touches a Tk widget and
-      never touches the store's sqlite connection, both of which are bound to
-      the thread that created them.
-    - Results travel back over a Queue that the main thread drains from an
-      after() poll, so every database write happens on the main thread.
+    - Every blocking HTTP call goes through an injectable executor, which is
+      asyncio.to_thread by default, so a slow request never stalls the event
+      loop and the progress bar keeps moving.
+    - Database access stays on the calling thread. sqlite connections belong to
+      the thread that opened them, and the executor only ever receives the
+      pure classify call plus a plain dict.
 
-    State lives here rather than on the page because the page is rebuilt on
-    every navigation; a cycle must survive the user looking at another tab.
+    The executor is injected rather than imported so this module stays free of
+    any UI framework and the cycle can be driven by a plain asyncio test.
+
+    State lives here rather than on a page because pages come and go; a cycle
+    must survive the user looking at another tab.
     """
 
-    def __init__(self, app, client_factory=None):
-        self.app = app
+    def __init__(self, store, client_factory=None, executor=None):
+        self.store = store
         self.client_factory = client_factory or GroqClient.from_config
+        self.executor = executor or asyncio.to_thread
         self.state = IDLE
         self.total = 0
         self.processed = 0
@@ -418,10 +419,8 @@ class ClassificationRunner:
         self.message = ""
         self.retry_after = 0
         self.threshold = DEFAULT_CONFIDENCE_THRESHOLD
-        self.events = queue.Queue()
-        self._stop = threading.Event()
-        self._thread = None
-        self._poll_id = None
+        self.listeners = []
+        self._stop = False
 
     # Status ---------------------------------------------------------------
 
@@ -437,30 +436,47 @@ class ClassificationRunner:
         return self.state == RUNNING
 
     def pending_count(self):
-        return len(self.app.store.unclassified_email_matches())
+        return len(self.store.unclassified_email_matches())
+
+    def subscribe(self, callback):
+        self.listeners.append(callback)
+        return callback
+
+    def unsubscribe(self, callback):
+        if callback in self.listeners:
+            self.listeners.remove(callback)
+
+    def emit(self):
+        for callback in list(self.listeners):
+            callback(self)
 
     # Control --------------------------------------------------------------
 
-    def start(self):
-        """Begin a cycle over every unclassified match."""
+    def stop(self):
+        """Ask the cycle to finish after the request in flight."""
+        self._stop = True
+
+    async def run(self):
+        """Classify every unclassified match, pacing as the client dictates."""
         if self.busy:
             return
-        matches = self.app.store.unclassified_email_matches()
+        self._stop = False
+        matches = self.store.unclassified_email_matches()
         if not matches:
             self.state = DONE
             self.message = "Nothing new to classify."
-            self.notify(final=True)
+            self.emit()
             return
         try:
             client = self.client_factory()
         except GroqNotConfigured as exc:
             self.state = ERROR
             self.message = str(exc)
-            self.notify(final=True)
+            self.emit()
             return
 
-        # The worker gets plain dicts. Handing it sqlite Rows would tempt it
-        # into touching a connection that belongs to this thread.
+        # The executor receives plain dicts. Handing it sqlite Rows would tempt
+        # a worker thread into touching a connection it does not own.
         payloads = [
             {
                 "id": row["id"],
@@ -480,122 +496,56 @@ class ClassificationRunner:
         self.message = ""
         self.retry_after = 0
         self.state = RUNNING
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self.work, args=(client, payloads), daemon=True
-        )
-        self._thread.start()
-        self.poll()
-        # A full redraw, not an in-place one: entering RUNNING swaps the button
-        # for Stop and is what puts the progress bar on the page at all.
-        self.notify(final=True)
+        self.emit()
 
-    def stop(self):
-        """Ask the worker to finish after the request in flight."""
-        self._stop.set()
-
-    def resume(self):
-        """Restart after a rate limit or a stop, from the first unclassified row."""
-        self.start()
-
-    # Worker thread --------------------------------------------------------
-
-    def work(self, client, payloads):
-        """Runs off the main thread. HTTP only: no widgets, no database."""
         for payload in payloads:
-            if self._stop.is_set():
-                self.events.put({"kind": STOPPED})
+            if self._stop:
+                self.state = STOPPED
+                self.message = f"Stopped after {self.processed} of {self.total}."
+                self.emit()
                 return
-            self.events.put(
-                {
-                    "kind": "progress",
-                    "label": payload["company"] or payload["position_title"] or "",
-                }
-            )
+            self.current = payload["company"] or payload["position_title"] or ""
+            self.emit()
             try:
-                result = client.classify(payload)
+                result = await self.executor(client.classify, payload)
             except GroqRateLimited as exc:
-                self.events.put({"kind": RATE_LIMITED, "retry_after": exc.retry_after})
+                self.state = RATE_LIMITED
+                self.retry_after = exc.retry_after
+                self.message = (
+                    f"Groq rate limit reached after {self.processed} of {self.total}. "
+                    f"Try again in about {self.retry_after}s."
+                )
+                self.emit()
                 return
             except Exception as exc:
-                self.events.put({"kind": ERROR, "detail": str(exc)})
+                self.state = ERROR
+                self.message = f"Classification stopped: {exc}"
+                self.emit()
                 return
-            self.events.put(
-                {"kind": "result", "match_id": payload["id"], "result": result}
-            )
-        self.events.put({"kind": DONE})
-
-    # Main thread ----------------------------------------------------------
-
-    def poll(self):
-        self.drain()
-        if self.state == RUNNING:
-            self._poll_id = self.app.after(POLL_MS, self.poll)
-        else:
-            self._poll_id = None
-
-    def drain(self):
-        """Apply queued worker events. Every database write happens here."""
-        was = self.state
-        changed = False
-        while True:
-            try:
-                event = self.events.get_nowait()
-            except queue.Empty:
-                break
-            changed = True
-            self.handle(event)
-        if changed:
-            # Progress within a state updates the two widgets in place. A state
-            # change alters which controls exist, so it needs a full redraw.
-            self.notify(final=self.state != was)
-
-    def handle(self, event):
-        kind = event["kind"]
-        if kind == "progress":
-            self.current = event["label"]
-        elif kind == "result":
             self.processed += 1
-            self.save(event["match_id"], event["result"])
-        elif kind == RATE_LIMITED:
-            self.state = RATE_LIMITED
-            self.retry_after = event.get("retry_after", 0)
-            self.message = (
-                f"Groq rate limit reached after {self.processed} of {self.total}. "
-                f"Try again in about {self.retry_after}s."
-            )
-        elif kind == ERROR:
-            self.state = ERROR
-            self.message = f"Classification stopped: {event.get('detail', '')}"
-        elif kind == STOPPED:
-            self.state = STOPPED
-            self.message = f"Stopped after {self.processed} of {self.total}."
-        elif kind == DONE:
-            self.state = DONE
-            self.message = (
-                f"Classified {self.processed} message(s); "
-                f"{self.applied} status(es) applied automatically."
-            )
+            self.save(payload["id"], result)
+            self.emit()
+
+        self.state = DONE
+        self.message = (
+            f"Classified {self.processed} message(s); "
+            f"{self.applied} status(es) applied automatically."
+        )
+        self.emit()
 
     def save(self, match_id, result):
-        store = self.app.store
-        store.record_classification(
+        """Record the label, and apply it when it is confident enough."""
+        self.store.record_classification(
             match_id, result["label"], result["confidence"], result["reason"]
         )
         if (
             result["label"] in APPLICABLE_LABELS
             and result["confidence"] >= self.threshold
-            and store.apply_ai_status(match_id, result["label"])
+            and self.store.apply_ai_status(match_id, result["label"])
         ):
             self.applied += 1
 
-    def notify(self, final=False):
-        """Tell the email matches page to redraw, if it is on screen."""
-        page = self.app.pages.get("email_matches")
-        if page is not None:
-            page.on_classification_update(final=final)
-
-    # Descriptions used by the page ---------------------------------------
+    # Descriptions used by the UI -----------------------------------------
 
     def progress_text(self):
         if self.state == RUNNING:

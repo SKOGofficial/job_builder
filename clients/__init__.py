@@ -1,11 +1,12 @@
 import clients.gmail_client as gmail_client
+import clients.llm_client as llm_client
 from clients.gmail_client import (
     GMAIL_AVAILABLE,
     GMAIL_IMPORT_ERROR,
     MISSING_PACKAGES_HINT,
     GmailNotConfigured,
     GmailNotConnected,
-    GmailWorkflow,
+    GmailScanner,
     build_query,
     client_config,
     company_slug,
@@ -19,6 +20,14 @@ from clients.gmail_client import (
     sender_domain,
     stored_refresh_token,
 )
+from clients.llm_client import (
+    GROQ_AVAILABLE,
+    GROQ_IMPORT_ERROR,
+    ClassificationRunner,
+    GroqClient,
+    GroqNotConfigured,
+    GroqRateLimited,
+)
 
 __all__ = [
     "GMAIL_AVAILABLE",
@@ -26,7 +35,7 @@ __all__ = [
     "MISSING_PACKAGES_HINT",
     "GmailNotConfigured",
     "GmailNotConnected",
-    "GmailWorkflow",
+    "GmailScanner",
     "build_query",
     "client_config",
     "company_slug",
@@ -40,4 +49,11 @@ __all__ = [
     "sender_domain",
     "stored_refresh_token",
     "gmail_client",
+    "GROQ_AVAILABLE",
+    "GROQ_IMPORT_ERROR",
+    "ClassificationRunner",
+    "GroqClient",
+    "GroqNotConfigured",
+    "GroqRateLimited",
+    "llm_client",
 ]

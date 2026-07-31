@@ -293,6 +293,175 @@ class EmailMatchStoreTests(unittest.TestCase):
         reopened.conn.close()
 
 
+async def immediate(func, *args):
+    """Executor stand-in that calls straight through, no thread involved."""
+    return func(*args)
+
+
+@unittest.skipUnless(HAVE_GMAIL, "google/keyring packages not installed")
+class GmailScannerTests(unittest.IsolatedAsyncioTestCase):
+    """The scan cycle, with every Google call replaced by a local fake."""
+
+    def setUp(self):
+        handle, self.db_path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(handle)
+        self.store = app.JobStore(self.db_path)
+        self.addCleanup(self.cleanup)
+        self.searched = []
+
+    def cleanup(self):
+        self.store.conn.close()
+        os.unlink(self.db_path)
+
+    def add_job(self, company="Acme", status="Applied", index=0):
+        return self.store.create_job(
+            {
+                "posting_url": f"https://{company.lower()}.com/jobs/{index}",
+                "position_title": "Engineer",
+                "company": company,
+                "job_type": "Full time",
+                "requires_oa": False,
+                "completed_oa": False,
+                "received_references": False,
+                "payment_amount": "",
+                "payment_period": "Unspecified",
+                "status": status,
+                "application_date": (date.today() - timedelta(days=2)).isoformat(),
+                "response_date": None,
+                "notes": "",
+            }
+        )
+
+    def fake_gmail(self, messages=None, headers=None, body="Body text.", search_error=None):
+        """Swap the module's network functions for local fakes."""
+        messages = messages if messages is not None else [{"id": "m1"}]
+        headers = headers or {
+            "id": "m1",
+            "thread_id": "t1",
+            "sender": "careers@acme.com",
+            "subject": "Your application to Acme",
+            "date": "Tue, 28 Jul 2026 10:00:00 -0400",
+        }
+
+        def search(query, max_results=25, creds=None):
+            self.searched.append(query)
+            if search_error:
+                raise search_error
+            return messages
+
+        def get_headers(message_id, creds=None):
+            return dict(headers, id=message_id)
+
+        def get_body(message_id, creds=None):
+            return {"body": body, "snippet": body[:40]}
+
+        for name, replacement in (
+            ("search_messages", search),
+            ("get_message_headers", get_headers),
+            ("get_message_body", get_body),
+        ):
+            original = getattr(gmail_client, name)
+            setattr(gmail_client, name, replacement)
+            self.addCleanup(setattr, gmail_client, name, original)
+
+    def scanner(self):
+        return gmail_client.GmailScanner(
+            self.store, executor=immediate, credential_loader=lambda: "creds"
+        )
+
+    async def test_nothing_awaiting_finishes_without_calling_gmail(self):
+        self.add_job(status="Rejected")
+        scanner = self.scanner()
+        self.fake_gmail()
+        found = await scanner.scan()
+        self.assertEqual(found, 0)
+        self.assertEqual(scanner.state, gmail_client.DONE)
+        self.assertIn("No applications are waiting", scanner.message)
+        self.assertEqual(self.searched, [])
+
+    async def test_matching_message_is_recorded_with_its_body(self):
+        self.add_job(company="Acme")
+        self.fake_gmail(body="We would like to interview you.")
+        scanner = self.scanner()
+        found = await scanner.scan()
+
+        self.assertEqual(found, 1)
+        self.assertEqual(scanner.state, gmail_client.DONE)
+        match = self.store.pending_email_matches()[0]
+        self.assertEqual(match["body_text"], "We would like to interview you.")
+        self.assertIn("Found 1 new possible reply", scanner.message)
+
+    async def test_unrelated_message_is_not_recorded(self):
+        self.add_job(company="Acme")
+        self.fake_gmail(
+            headers={
+                "id": "m1",
+                "sender": "news@othersite.com",
+                "subject": "Weekly digest",
+                "date": "",
+            }
+        )
+        scanner = self.scanner()
+        self.assertEqual(await scanner.scan(), 0)
+        self.assertEqual(self.store.pending_email_matches(), [])
+
+    async def test_already_known_messages_are_skipped(self):
+        self.add_job(company="Acme")
+        self.fake_gmail()
+        self.assertEqual(await self.scanner().scan(), 1)
+        # A second scan sees the same message id and records nothing new.
+        self.assertEqual(await self.scanner().scan(), 0)
+        self.assertEqual(len(self.store.pending_email_matches()), 1)
+
+    async def test_job_without_a_company_is_skipped_not_searched(self):
+        self.add_job(company="")
+        self.fake_gmail()
+        scanner = self.scanner()
+        await scanner.scan()
+        self.assertEqual(self.searched, [])
+        self.assertEqual(len(scanner.skipped), 1)
+        self.assertIn("Skipped 1 job", scanner.message)
+
+    async def test_credential_failure_reports_an_error(self):
+        self.add_job()
+        self.fake_gmail()
+        scanner = gmail_client.GmailScanner(
+            self.store,
+            executor=immediate,
+            credential_loader=lambda: (_ for _ in ()).throw(RuntimeError("no token")),
+        )
+        self.assertEqual(await scanner.scan(), 0)
+        self.assertEqual(scanner.state, gmail_client.ERROR)
+        self.assertIn("no token", scanner.message)
+
+    async def test_search_failure_stops_and_keeps_earlier_matches(self):
+        self.add_job(company="Acme", index=1)
+        self.fake_gmail(search_error=RuntimeError("quota exceeded"))
+        scanner = self.scanner()
+        await scanner.scan()
+        self.assertEqual(scanner.state, gmail_client.ERROR)
+        self.assertIn("quota exceeded", scanner.message)
+
+    async def test_subscribers_see_progress(self):
+        self.add_job(company="Acme", index=1)
+        self.add_job(company="Globex", index=2)
+        self.fake_gmail()
+        scanner = self.scanner()
+        states = []
+        scanner.subscribe(lambda s: states.append((s.state, s.checked)))
+        await scanner.scan()
+        self.assertEqual(states[0][0], gmail_client.RUNNING)
+        self.assertEqual(states[-1], (gmail_client.DONE, 2))
+
+    async def test_progress_text_describes_the_running_scan(self):
+        scanner = self.scanner()
+        scanner.state = gmail_client.RUNNING
+        scanner.total = 3
+        scanner.checked = 1
+        scanner.current = "Acme"
+        self.assertEqual(scanner.progress_text(), "Checking 2 of 3 — Acme")
+
+
 class SchemaMigrationTests(unittest.TestCase):
     """Opening a pre-body database must widen it without losing rows."""
 

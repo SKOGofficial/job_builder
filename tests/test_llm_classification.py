@@ -425,39 +425,27 @@ class StubClient:
         return self.results.pop(0)
 
 
-class PageSpy:
-    """Records how the runner asked the page to redraw."""
+class ListenerSpy:
+    """Records the states the runner published, in order."""
 
     def __init__(self):
-        self.updates = []
+        self.states = []
 
-    def on_classification_update(self, final=False):
-        self.updates.append(final)
-
-
-class FakeApp:
-    """Enough of the app for the runner: a store, a page registry, after()."""
-
-    def __init__(self, store):
-        self.store = store
-        self.pages = {}
-        self.active_page = "email_matches"
-        self.scheduled = []
-
-    def after(self, delay, callback):
-        # Recorded, never run: the tests drain the queue themselves so no Tk
-        # event loop is needed.
-        self.scheduled.append((delay, callback))
-        return f"after#{len(self.scheduled)}"
+    def __call__(self, runner):
+        self.states.append((runner.state, runner.processed))
 
 
-class RunnerTests(EnvIsolationMixin, unittest.TestCase):
+async def immediate(func, *args):
+    """Executor stand-in that calls straight through, no thread involved."""
+    return func(*args)
+
+
+class RunnerTests(EnvIsolationMixin, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.isolate_env()
         handle, self.db_path = tempfile.mkstemp(suffix=".sqlite3")
         os.close(handle)
         self.store = app.JobStore(self.db_path)
-        self.app = FakeApp(self.store)
         self.addCleanup(self.cleanup)
 
     def cleanup(self):
@@ -495,15 +483,13 @@ class RunnerTests(EnvIsolationMixin, unittest.TestCase):
         )
         return job_id
 
-    def run_cycle(self, results=None, error=None):
-        """Start a cycle, wait for the worker, then drain on this thread."""
+    def runner(self, results=None, error=None, client_factory=None):
         stub = StubClient(results=results, error=error)
-        runner = llm.ClassificationRunner(self.app, client_factory=lambda: stub)
-        runner.start()
-        if runner._thread is not None:
-            runner._thread.join(timeout=5)
-            self.assertFalse(runner._thread.is_alive(), "worker thread did not finish")
-        runner.drain()
+        runner = llm.ClassificationRunner(
+            self.store,
+            client_factory=client_factory or (lambda: stub),
+            executor=immediate,
+        )
         return runner, stub
 
     def job_row(self, job_id):
@@ -516,11 +502,13 @@ class RunnerTests(EnvIsolationMixin, unittest.TestCase):
 
     # Applying -------------------------------------------------------------
 
-    def test_confident_label_applies_the_status(self):
+    async def test_confident_label_applies_the_status(self):
         job_id = self.add_match()
-        runner, _stub = self.run_cycle(
+        runner, _stub = self.runner(
             [{"label": "Rejected", "confidence": 0.95, "reason": "Turned down."}]
         )
+        await runner.run()
+
         self.assertEqual(runner.state, llm.DONE)
         self.assertEqual(runner.applied, 1)
         self.assertEqual(self.job_row(job_id)["status"], "Rejected")
@@ -529,11 +517,13 @@ class RunnerTests(EnvIsolationMixin, unittest.TestCase):
         self.assertEqual(match["ai_applied"], 1)
         self.assertEqual(match["ai_previous_status"], "Applied")
 
-    def test_low_confidence_records_without_applying(self):
+    async def test_low_confidence_records_without_applying(self):
         job_id = self.add_match()
-        runner, _stub = self.run_cycle(
+        runner, _stub = self.runner(
             [{"label": "Rejected", "confidence": 0.4, "reason": "Might be."}]
         )
+        await runner.run()
+
         self.assertEqual(runner.applied, 0)
         self.assertEqual(self.job_row(job_id)["status"], "Applied")
         match = self.match_row()
@@ -541,19 +531,24 @@ class RunnerTests(EnvIsolationMixin, unittest.TestCase):
         self.assertEqual(match["ai_applied"], 0)
         self.assertIsNotNone(match["ai_classified_at"])
 
-    def test_inert_labels_never_apply_however_confident(self):
+    async def test_inert_labels_never_apply_however_confident(self):
         for label in llm.INERT_LABELS:
             with self.subTest(label=label):
                 job_id = self.add_match(message_id=f"msg-{label}")
-                runner, _stub = self.run_cycle(
+                runner, _stub = self.runner(
                     [{"label": label, "confidence": 1.0, "reason": "Routine."}]
                 )
+                await runner.run()
                 self.assertEqual(runner.applied, 0)
                 self.assertEqual(self.job_row(job_id)["status"], "Applied")
 
-    def test_undo_restores_status_and_response_date(self):
+    async def test_undo_restores_status_and_response_date(self):
         job_id = self.add_match()
-        self.run_cycle([{"label": "Rejected", "confidence": 0.99, "reason": "No."}])
+        runner, _stub = self.runner(
+            [{"label": "Rejected", "confidence": 0.99, "reason": "No."}]
+        )
+        await runner.run()
+
         before = self.job_row(job_id)
         self.assertEqual(before["status"], "Rejected")
         self.assertTrue(before["response_date"])
@@ -565,20 +560,24 @@ class RunnerTests(EnvIsolationMixin, unittest.TestCase):
         # The job is back in the pool future Gmail scans look at.
         self.assertIn(job_id, [row["job_id"] for row in self.store.jobs_awaiting_response()])
 
-    def test_undo_keeps_the_classification_so_it_is_not_redone(self):
+    async def test_undo_keeps_the_classification_so_it_is_not_redone(self):
         self.add_match()
-        self.run_cycle([{"label": "Rejected", "confidence": 0.99, "reason": "No."}])
+        runner, _stub = self.runner(
+            [{"label": "Rejected", "confidence": 0.99, "reason": "No."}]
+        )
+        await runner.run()
         self.store.undo_ai_status(self.match_row()["id"])
         self.assertEqual(self.store.unclassified_email_matches(), [])
 
-    def test_undo_is_a_no_op_when_nothing_was_applied(self):
+    async def test_undo_is_a_no_op_when_nothing_was_applied(self):
         self.add_match()
-        self.run_cycle([{"label": "Unclear", "confidence": 0.2, "reason": "?"}])
+        runner, _stub = self.runner([{"label": "Unclear", "confidence": 0.2, "reason": "?"}])
+        await runner.run()
         self.assertFalse(self.store.undo_ai_status(self.match_row()["id"]))
 
     # Cycle behaviour ------------------------------------------------------
 
-    def test_rate_limit_stops_the_cycle_and_keeps_earlier_work(self):
+    async def test_rate_limit_stops_the_cycle_and_keeps_earlier_work(self):
         self.add_match(company="Acme", message_id="msg-1")
         self.add_match(company="Globex", message_id="msg-2")
 
@@ -592,74 +591,78 @@ class RunnerTests(EnvIsolationMixin, unittest.TestCase):
                     raise llm.GroqRateLimited("limit", retry_after=42)
                 return {"label": "Rejected", "confidence": 0.99, "reason": "No."}
 
-        runner = llm.ClassificationRunner(self.app, client_factory=FlakyClient)
-        runner.start()
-        runner._thread.join(timeout=5)
-        runner.drain()
+        runner, _stub = self.runner(client_factory=FlakyClient)
+        await runner.run()
 
         self.assertEqual(runner.state, llm.RATE_LIMITED)
         self.assertEqual(runner.retry_after, 42)
         self.assertEqual(runner.processed, 1)
-        # The first classification survived the stop.
         classified = self.store.conn.execute(
             "SELECT COUNT(*) AS n FROM email_matches WHERE ai_classified_at IS NOT NULL"
         ).fetchone()["n"]
         self.assertEqual(classified, 1)
 
-    def test_resume_picks_up_only_the_unclassified_remainder(self):
+    async def test_resume_picks_up_only_the_unclassified_remainder(self):
         self.add_match(company="Acme", message_id="msg-1")
         self.add_match(company="Globex", message_id="msg-2")
-        self.run_cycle(
+        runner, _stub = self.runner(
             [
                 {"label": "Unclear", "confidence": 0.1, "reason": "?"},
                 {"label": "Unclear", "confidence": 0.1, "reason": "?"},
             ]
         )
+        await runner.run()
         self.assertEqual(self.store.unclassified_email_matches(), [])
-        runner, stub = self.run_cycle([])
-        self.assertEqual(runner.state, llm.DONE)
+
+        second, stub = self.runner([])
+        await second.run()
+        self.assertEqual(second.state, llm.DONE)
         self.assertEqual(stub.seen, [])
 
-    def test_matches_without_a_body_are_skipped(self):
+    async def test_matches_without_a_body_are_skipped(self):
         self.add_match(body="")
-        runner, stub = self.run_cycle([])
+        runner, stub = self.runner([])
+        await runner.run()
         self.assertEqual(stub.seen, [])
         self.assertEqual(runner.state, llm.DONE)
 
-    def test_worker_receives_plain_dicts_not_database_rows(self):
-        # The worker thread must not hold anything tied to the main thread's
-        # sqlite connection.
+    async def test_executor_receives_plain_dicts_not_database_rows(self):
+        # Whatever runs the blocking call must not hold anything tied to the
+        # sqlite connection this thread owns.
         self.add_match()
-        _runner, stub = self.run_cycle(
-            [{"label": "Unclear", "confidence": 0.1, "reason": "?"}]
-        )
+        runner, stub = self.runner([{"label": "Unclear", "confidence": 0.1, "reason": "?"}])
+        await runner.run()
         self.assertEqual(len(stub.seen), 1)
         self.assertIs(type(stub.seen[0]), dict)
 
-    def test_client_failure_surfaces_as_an_error_state(self):
+    async def test_client_failure_surfaces_as_an_error_state(self):
         self.add_match()
-        runner, _stub = self.run_cycle(error=RuntimeError("network down"))
+        runner, _stub = self.runner(error=RuntimeError("network down"))
+        await runner.run()
         self.assertEqual(runner.state, llm.ERROR)
         self.assertIn("network down", runner.message)
 
-    def test_missing_configuration_reports_instead_of_starting(self):
+    async def test_missing_configuration_reports_instead_of_running(self):
         self.add_match()
 
         def factory():
             raise llm.GroqNotConfigured("no key")
 
-        runner = llm.ClassificationRunner(self.app, client_factory=factory)
-        runner.start()
+        runner = llm.ClassificationRunner(
+            self.store, client_factory=factory, executor=immediate
+        )
+        await runner.run()
         self.assertEqual(runner.state, llm.ERROR)
-        self.assertIsNone(runner._thread)
+        self.assertEqual(runner.processed, 0)
 
-    def test_nothing_to_do_finishes_without_a_thread(self):
-        runner = llm.ClassificationRunner(self.app, client_factory=StubClient)
-        runner.start()
+    async def test_nothing_to_do_finishes_immediately(self):
+        runner, stub = self.runner([])
+        await runner.run()
         self.assertEqual(runner.state, llm.DONE)
-        self.assertIsNone(runner._thread)
+        self.assertEqual(stub.seen, [])
+        self.assertIn("Nothing new", runner.message)
 
-    def test_stop_ends_the_cycle_early(self):
+    async def test_stop_ends_the_cycle_early(self):
         for index in range(3):
             self.add_match(company=f"Co{index}", message_id=f"msg-{index}")
 
@@ -667,81 +670,66 @@ class RunnerTests(EnvIsolationMixin, unittest.TestCase):
 
         class StoppingClient:
             def classify(self, payload):
-                # Ask to stop while the first message is in flight. The worker
+                # Ask to stop while the first message is in flight. The loop
                 # checks the flag before it takes the next one.
                 holder["runner"].stop()
                 return {"label": "Unclear", "confidence": 0.1, "reason": "?"}
 
-        runner = llm.ClassificationRunner(self.app, client_factory=StoppingClient)
+        runner, _stub = self.runner(client_factory=StoppingClient)
         holder["runner"] = runner
-        runner.start()
-        runner._thread.join(timeout=5)
-        runner.drain()
+        await runner.run()
 
         self.assertEqual(runner.state, llm.STOPPED)
         self.assertEqual(runner.processed, 1)
         self.assertIn("1 of 3", runner.message)
 
-    def test_start_clears_a_stale_stop_flag(self):
+    async def test_running_again_clears_a_stale_stop_flag(self):
         # A previous stop must not cancel the next cycle before it begins.
         self.add_match()
-        runner = llm.ClassificationRunner(
-            self.app,
-            client_factory=lambda: StubClient(
-                [{"label": "Unclear", "confidence": 0.1, "reason": "?"}]
-            ),
-        )
+        runner, _stub = self.runner([{"label": "Unclear", "confidence": 0.1, "reason": "?"}])
         runner.stop()
-        runner.start()
-        runner._thread.join(timeout=5)
-        runner.drain()
+        await runner.run()
         self.assertEqual(runner.state, llm.DONE)
         self.assertEqual(runner.processed, 1)
 
-    # Redraw signalling ----------------------------------------------------
+    # Subscribers ----------------------------------------------------------
 
-    def test_entering_running_forces_a_full_redraw(self):
-        # The progress bar and the Stop button only exist in a full redraw, so
-        # the transition into RUNNING must not take the in-place path.
-        self.add_match()
-        spy = PageSpy()
-        self.app.pages["email_matches"] = spy
-        runner = llm.ClassificationRunner(
-            self.app,
-            client_factory=lambda: StubClient(
-                [{"label": "Unclear", "confidence": 0.1, "reason": "?"}]
-            ),
+    async def test_subscribers_see_the_cycle_progress(self):
+        self.add_match(company="Acme", message_id="msg-1")
+        self.add_match(company="Globex", message_id="msg-2")
+        runner, _stub = self.runner(
+            [
+                {"label": "Unclear", "confidence": 0.1, "reason": "?"},
+                {"label": "Unclear", "confidence": 0.1, "reason": "?"},
+            ]
         )
-        runner.start()
-        self.addCleanup(runner._thread.join, 5)
-        self.assertIn(True, spy.updates)
+        spy = ListenerSpy()
+        runner.subscribe(spy)
+        await runner.run()
 
-    def test_progress_within_a_state_updates_in_place(self):
-        spy = PageSpy()
-        self.app.pages["email_matches"] = spy
-        runner = llm.ClassificationRunner(self.app)
-        runner.state = llm.RUNNING
-        runner.total = 2
-        runner.events.put({"kind": "progress", "label": "Acme"})
-        runner.drain()
-        self.assertEqual(spy.updates, [False])
+        self.assertEqual(spy.states[0], (llm.RUNNING, 0))
+        self.assertEqual(spy.states[-1], (llm.DONE, 2))
+        # Progress is published as each message completes, which is what keeps
+        # the bar moving rather than jumping at the end.
+        self.assertIn((llm.RUNNING, 1), spy.states)
 
-    def test_reaching_a_terminal_state_forces_a_full_redraw(self):
-        spy = PageSpy()
-        self.app.pages["email_matches"] = spy
-        runner = llm.ClassificationRunner(self.app)
-        runner.state = llm.RUNNING
-        runner.events.put({"kind": llm.DONE})
-        runner.drain()
-        self.assertEqual(spy.updates, [True])
+    async def test_unsubscribe_stops_the_updates(self):
+        self.add_match()
+        runner, _stub = self.runner([{"label": "Unclear", "confidence": 0.1, "reason": "?"}])
+        spy = ListenerSpy()
+        runner.subscribe(spy)
+        runner.unsubscribe(spy)
+        await runner.run()
+        self.assertEqual(spy.states, [])
 
-    def test_progress_text_describes_the_running_cycle(self):
-        runner = llm.ClassificationRunner(self.app)
+    async def test_progress_text_describes_the_running_cycle(self):
+        runner, _stub = self.runner([])
         runner.state = llm.RUNNING
         runner.total = 4
         runner.processed = 1
         runner.current = "Acme"
         self.assertEqual(runner.progress_text(), "Classifying 2 of 4 — Acme")
+
 
 
 class AiColumnMigrationTests(unittest.TestCase):

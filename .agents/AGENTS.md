@@ -29,18 +29,27 @@ modules back into one file.
 - Keep `app.py` an orchestrator. It owns the window, theme, navigation, and shared widget
   helpers, and delegates everything else.
 - Keep persistence in `store.py` and presentation constants in `theme.py`, so neither imports
-  the UI shell.
-- When adding a page, create the module under `pages/` and register the class in
-  `pages/__init__.py`. Navigation is built from that registry, so nothing else needs editing.
+  the UI. Nothing under `clients/` or `utilities/` may import a UI framework.
+- When adding a page, create the module under `web/pages/` and import it in
+  `web/pages/__init__.py`. Routes register themselves through `@ui.page`.
 
 ## Known State
 
-- `app.py` is the shell and entry point: window, theme, navigation, drawer, and shared widget helpers.
-- `utilities/` holds utility modules: `store.py` (`JobStore`, `normalize_url`, `url_hash`, `today_iso`) and `theme.py` (palettes, `STATUS_COLORS`, `TIME_RANGES`, option lists, `apply_styles`). `utilties/` aliases `utilities/`.
-- `pages/` holds one module per page, all subclassing `BasePage` in `pages/base.py`. Profile and Resume share `pages/text_storage.py`. Page instances are created once and reused.
-- `clients/` holds external client integrations: `gmail_client.py` combines OAuth mechanics, Gmail API calls, and `GmailWorkflow` UI orchestration. `llm_client.py` is the placeholder for LLM orchestration.
+- `app.py` is the entry point: argument parsing and `ui.run`. The shell (header, drawer, dark
+  mode) lives in `web/shell.py`.
+- `utilities/` holds utility modules: `store.py` (`JobStore`, `normalize_url`, `url_hash`, `today_iso`) `theme.py` (`STATUS_COLORS`, `CHART_COLOR`, `TIME_RANGES`, option lists), and `credentials.py`
+  (keyring access that degrades when no backend exists).
+- `web/` holds the NiceGUI UI: `shell.py` for page chrome, `state.py` for the shared store and
+  workers, and one module per page under `web/pages/`. Profile and Resume share
+  `web/pages/text_storage.py`. Pages are rebuilt per request, so anything that must survive
+  navigation belongs on `AppState`.
+- `clients/` holds external client integrations, neither of which imports a UI framework:
+  `gmail_client.py` (OAuth, Gmail API calls, and the async `GmailScanner`) and `llm_client.py`
+  (Groq config, prompting, pacing, and the async `ClassificationRunner`). Both publish progress
+  to subscribers and take an injectable executor for blocking calls.
 - The SQLite schema is created in `JobStore.init_db`, including the `email_matches` table.
-- `tests/` holds test suites: `tests/test_gmail_matching.py` and `tests/test_app_pages.py`.
+- `tests/` holds the suites: `test_gmail_matching.py`, `test_llm_classification.py` (both
+  unittest), and `test_web_pages.py` (pytest, NiceGUI user simulation). `pytest` runs all three.
 
 ## Priority Work
 

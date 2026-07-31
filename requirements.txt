@@ -1,6 +1,15 @@
+# UI
+nicegui
+# Optional: gives a native window instead of a browser tab. The app falls back
+# to the browser when this is absent.
+pywebview
+
+# Gmail
 google-api-python-client
 google-auth
 google-auth-oauthlib
+
+# Shared: Groq talks over plain REST, so no provider SDK is needed.
 python-dotenv
 keyring
 requests
