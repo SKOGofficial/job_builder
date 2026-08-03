@@ -1,7 +1,11 @@
 """Add application: the job intake form.
 
-Validation matches the Tkinter version exactly, including the duplicate-URL
-check that offers to save a correlated Job ID rather than refusing.
+The duplicate-URL check offers to save a correlated Job ID rather than
+refusing.
+
+A job is identified by (title, company, location) rather than by its posting
+URL, so location is a real field here and the URL is optional - a role logged
+from an email may never have had one.
 """
 
 from datetime import datetime
@@ -13,7 +17,7 @@ from utilities.theme import JOB_TYPES, PAY_PERIODS, STATUSES
 from web.shell import card, page_shell
 from web.state import get_state
 
-REQUIRED = ["posting_url", "position_title", "job_type", "status", "application_date"]
+REQUIRED = ["position_title", "job_type", "status", "application_date"]
 
 
 def validation_error(data):
@@ -35,12 +39,15 @@ def add_page():
     store = get_state().store
     with page_shell(
         "Add a job application",
-        "Start with the company posting URL. Duplicate URLs are detected before the form is saved.",
+        "Title, company, and location identify the role. Duplicate URLs are detected before "
+        "the form is saved.",
         active="/add",
     ):
         with card():
             with ui.row().classes("w-full items-end gap-3"):
-                posting_url = ui.input("Job posting URL").props("dense outlined").classes("grow")
+                posting_url = ui.input("Job posting URL (optional)").props(
+                    "dense outlined"
+                ).classes("grow")
                 ui.button("Check URL", on_click=lambda: check_url(posting_url.value)).props(
                     "flat no-caps"
                 )
@@ -48,6 +55,7 @@ def add_page():
             with ui.row().classes("w-full gap-3"):
                 position_title = ui.input("Position title").props("dense outlined").classes("grow")
                 company = ui.input("Company").props("dense outlined").classes("grow")
+                location = ui.input("Location").props("dense outlined").classes("grow")
 
             with ui.row().classes("w-full gap-3"):
                 job_type = ui.select(JOB_TYPES, value=JOB_TYPES[0], label="Type").props(
@@ -81,6 +89,7 @@ def add_page():
                     "posting_url": posting_url.value or "",
                     "position_title": position_title.value or "",
                     "company": company.value or "",
+                    "location": location.value or "",
                     "job_type": job_type.value,
                     "requires_oa": requires_oa.value,
                     "completed_oa": completed_oa.value,
@@ -95,7 +104,8 @@ def add_page():
 
             def clear():
                 for field in (
-                    posting_url, position_title, company, payment_amount, response_date, notes
+                    posting_url, position_title, company, location, payment_amount,
+                    response_date, notes
                 ):
                     field.value = ""
                 job_type.value = JOB_TYPES[0]
@@ -111,9 +121,10 @@ def add_page():
                 if problem:
                     ui.notify(problem, type="negative")
                     return
-                duplicates = store.duplicate_jobs(data["posting_url"])
-                if duplicates and not await confirm_duplicate(duplicates):
-                    return
+                if data["posting_url"].strip():
+                    duplicates = store.duplicate_jobs(data["posting_url"])
+                    if duplicates and not await confirm_duplicate(duplicates):
+                        return
                 job_id = store.create_job(data)
                 ui.notify(f"Saved with Job ID {job_id}.", type="positive")
                 clear()

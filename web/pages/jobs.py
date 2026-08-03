@@ -1,4 +1,11 @@
-"""All jobs: the application table and the per-job detail dialog."""
+"""All jobs: the application table and the per-job detail dialog.
+
+The detail dialog carries the per-role email timeline. Links point at a job's
+`identity_key` rather than its row id, so a role first seen as an alert keeps
+every message attached to it when an acknowledgement promotes it into an
+application - the alert that surfaced it sits above the rejection that closed
+it, in the order they arrived.
+"""
 
 from nicegui import ui
 
@@ -6,11 +13,26 @@ from utilities.theme import STATUS_COLORS, STATUSES
 from web.shell import card, page_shell
 from web.state import get_state
 
+#: How a linked message is labelled on the timeline.
+LINK_LABELS = {
+    "alert": "Alert",
+    "update": "Update",
+    "acknowledgement": "Acknowledgement",
+}
+
+LINK_COLORS = {
+    "alert": "#a855f7",
+    "update": "#f97316",
+    "acknowledgement": "#22c55e",
+}
+
 COLUMNS = [
     {"name": "job_id", "label": "Job ID", "field": "job_id", "sortable": True, "align": "left"},
     {"name": "position_title", "label": "Position", "field": "position_title",
      "sortable": True, "align": "left"},
     {"name": "company", "label": "Company", "field": "company", "sortable": True, "align": "left"},
+    {"name": "location", "label": "Location", "field": "location", "sortable": True,
+     "align": "left"},
     {"name": "job_type", "label": "Type", "field": "job_type", "sortable": True, "align": "left"},
     {"name": "status", "label": "Status", "field": "status", "sortable": True, "align": "left"},
     {"name": "oa", "label": "OA", "field": "oa", "align": "left"},
@@ -39,8 +61,10 @@ def table_row(row):
     return {
         "id": row["id"],
         "job_id": row["job_id"],
+        "identity_key": row["identity_key"],
         "position_title": row["position_title"],
         "company": row["company"] or "",
+        "location": row["location"] or "",
         "job_type": row["job_type"],
         "status": row["status"],
         "status_color": STATUS_COLORS.get(row["status"], "#64748b"),
@@ -48,7 +72,7 @@ def table_row(row):
         "refs": "Yes" if row["received_references"] else "No",
         "payment": payment,
         "application_date": row["application_date"],
-        "posting_url": row["posting_url"],
+        "posting_url": row["posting_url"] or "",
         "notes": row["notes"] or "",
     }
 
@@ -98,21 +122,26 @@ def jobs_page():
 
 def open_detail(row, on_change):
     """Show one job's detail, with a status update that closes on save."""
-    store = get_state().store
-    with ui.dialog() as dialog, ui.card().classes("w-[36rem] max-w-full gap-3 p-6"):
+    state = get_state()
+    store, mail = state.store, state.mail
+    with ui.dialog() as dialog, ui.card().classes("w-[40rem] max-w-full gap-3 p-6"):
         ui.label(row["position_title"]).classes("text-xl font-semibold")
-        ui.link(row["posting_url"], row["posting_url"], new_tab=True).classes(
-            "text-xs break-all opacity-70"
-        )
+        if row["posting_url"]:
+            ui.link(row["posting_url"], row["posting_url"], new_tab=True).classes(
+                "text-xs break-all opacity-70"
+            )
         ui.label(f"Job ID: {row['job_id']}").classes("text-xs opacity-70")
         with ui.row().classes("gap-6"):
             ui.label(f"Company: {row['company'] or 'Not specified'}").classes("text-sm")
+            ui.label(f"Location: {row['location'] or 'Not specified'}").classes("text-sm")
             ui.label(f"Applied: {row['application_date']}").classes("text-sm")
 
         ui.label("Notes").classes("text-sm font-medium mt-2")
         ui.markdown(row["notes"] or "_No notes recorded._").classes(
             "text-sm w-full max-h-56 overflow-auto rounded p-3 bg-black/5 dark:bg-white/5"
         )
+
+        timeline(mail, row["identity_key"])
 
         with ui.row().classes("w-full items-center justify-between mt-2"):
             status = ui.select(STATUSES, value=row["status"], label="Response status").props(
@@ -129,3 +158,38 @@ def open_detail(row, on_change):
                 ui.button("Close", on_click=dialog.close).props("flat no-caps")
                 ui.button("Update", on_click=save).props("unelevated no-caps")
     dialog.open()
+
+
+def timeline(mail, identity_key):
+    """Every email about this role, oldest first."""
+    ui.label("Email timeline").classes("text-sm font-medium mt-2")
+    messages = mail.messages_for_identity(identity_key) if identity_key else []
+    if not messages:
+        ui.label(
+            "No emails linked to this role yet. The ingest pipeline attaches them as they "
+            "arrive."
+        ).classes("text-xs opacity-60")
+        return
+
+    with ui.column().classes("w-full gap-2 max-h-72 overflow-auto"):
+        for message in messages:
+            entry(message)
+
+
+def entry(message):
+    with ui.column().classes("w-full gap-1 rounded p-3 bg-black/5 dark:bg-white/5"):
+        with ui.row().classes("w-full items-center gap-2"):
+            kind = message["link_type"]
+            ui.html(
+                f'<span style="background-color:{LINK_COLORS.get(kind, "#64748b")};'
+                f'color:#fff;padding:1px 8px;border-radius:9999px;font-size:10px;'
+                f'font-weight:600">{LINK_LABELS.get(kind, kind)}</span>'
+            )
+            ui.label(message["received_date"] or "").classes("text-xs opacity-60")
+            if message["resolved_by"] == "manual":
+                ui.label("linked by you").classes("text-xs opacity-60 italic")
+        ui.label(message["subject"] or "(no subject)").classes("text-sm font-medium")
+        ui.label(message["sender"] or "").classes("text-xs opacity-70 break-all")
+        snippet = (message["snippet"] or "").strip()
+        if snippet:
+            ui.label(snippet).classes("text-xs opacity-70")

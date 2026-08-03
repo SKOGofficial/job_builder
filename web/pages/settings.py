@@ -285,6 +285,135 @@ def settings_page():
             ui.notify("The stored Groq key was deleted.", type="positive")
             groq_card.refresh()
 
+        # Ingest pipeline ------------------------------------------------------
+
+        async def run_cycle():
+            """Run one pipeline pass by hand.
+
+            The scheduler does this on a timer; the button exists so a change
+            to the denylist or a new application can be tested without waiting
+            out the interval.
+            """
+            scheduler = state.scheduler
+            if scheduler is None:
+                ui.notify("The pipeline is not running in this process.", type="warning")
+                return
+            pipeline_card.refresh()
+            await scheduler.run_once()
+            pipeline_card.refresh()
+            try:
+                ui.notify(state.pipeline.message or "Cycle complete.",
+                          multi_line=True, close_button=True)
+            except RuntimeError:
+                pass
+
+        @ui.refreshable
+        def pipeline_card():
+            with card():
+                with ui.row().classes("w-full items-center justify-between"):
+                    ui.label("Mailbox ingest").classes("text-base font-semibold")
+                    if state.pipeline is not None and state.pipeline.busy:
+                        ui.spinner(size="sm")
+                    else:
+                        ui.button("Run a cycle now", on_click=run_cycle).props(
+                            "unelevated no-caps dense"
+                        )
+
+                if state.scheduler is None:
+                    ui.label(
+                        "The poller starts with the app. It is not running in this process, "
+                        "which is expected under tests and the CLI."
+                    ).classes("text-sm opacity-70")
+                    return
+
+                status = state.scheduler.status()
+                ui.label(
+                    f"Poller {'running' if status['running'] else 'stopped'} · "
+                    f"every {status['interval']}s · {status['cycles']} cycle(s) so far"
+                ).classes("text-sm opacity-70")
+                ui.label(
+                    f"Last run: {status['last_run_at'] or 'not yet'}"
+                ).classes("text-xs opacity-60")
+                if status["message"]:
+                    ui.label(status["message"]).classes("text-sm")
+                if status["last_error"]:
+                    ui.label(f"Last error: {status['last_error']}").classes(
+                        "text-sm text-red-500"
+                    )
+
+                counts(state.mail)
+
+        def counts(mail):
+            """Where the mailbox went: filtered out, or classified into what.
+
+            The drop-per-rule split is worth watching. If the denylist rule
+            stops growing, the "not job related" button is not being found, and
+            the model is being paid to reject the same newsletters every day.
+            """
+            filters = mail.filter_stats()
+            categories = mail.category_stats()
+            if not filters and not categories:
+                ui.label("No mail mirrored yet.").classes("text-xs opacity-60")
+                return
+
+            with ui.row().classes("w-full gap-8 flex-wrap pt-1"):
+                if filters:
+                    with ui.column().classes("gap-0"):
+                        ui.label("Rough filter").classes("text-xs font-medium")
+                        for verdict, count in filters.items():
+                            ui.label(f"{verdict}: {count}").classes("text-xs opacity-70")
+                if categories:
+                    with ui.column().classes("gap-0"):
+                        ui.label("Classified").classes("text-xs font-medium")
+                        for name, count in categories.items():
+                            ui.label(f"{name}: {count}").classes("text-xs opacity-70")
+
+        # Blocked senders ------------------------------------------------------
+
+        @ui.refreshable
+        def denylist_card():
+            with card():
+                ui.label("Blocked senders").classes("text-base font-semibold")
+                ui.label(
+                    "Domains dropped before classification. Marking a message as not job "
+                    "related in the review queue adds one here."
+                ).classes("text-sm opacity-70")
+
+                with ui.row().classes("w-full items-end gap-3"):
+                    domain = ui.input("Domain", placeholder="newsletter.example.com").props(
+                        "dense outlined"
+                    ).classes("grow")
+
+                    def add():
+                        if not state.mail.deny_sender(domain.value):
+                            ui.notify("Enter a domain first.", type="warning")
+                            return
+                        domain.value = ""
+                        denylist_card.refresh()
+                        ui.notify("Domain blocked.")
+
+                    ui.button("Block", on_click=add).props("unelevated no-caps dense")
+
+                domains = sorted(state.mail.denied_domains())
+                if not domains:
+                    ui.label("Nothing blocked yet.").classes("text-xs opacity-60")
+                    return
+                with ui.row().classes("items-center gap-2 flex-wrap pt-1"):
+                    for name in domains:
+                        with ui.row().classes(
+                            "items-center gap-1 rounded-full px-3 py-1 "
+                            "bg-black/5 dark:bg-white/10"
+                        ):
+                            ui.label(name).classes("text-xs")
+                            ui.button(
+                                icon="close", on_click=lambda d=name: unblock(d)
+                            ).props("flat round dense size=xs").tooltip("Unblock")
+
+        def unblock(name):
+            state.mail.allow_sender(name)
+            denylist_card.refresh()
+            ui.notify(f"{name} unblocked.")
+
         # Wiring ---------------------------------------------------------------
 
         def refresh_all():
@@ -304,6 +433,8 @@ def settings_page():
 
         gmail_card()
         groq_card()
+        pipeline_card()
+        denylist_card()
         page_timer(0.4, watch)
 
 

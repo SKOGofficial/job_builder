@@ -33,8 +33,8 @@ def profile_page():
 @ui.page("/resume")
 def resume_page():
     text_storage_page(
-        "Resume & Experiences",
-        "Store experience bullets, project details, resume notes, and CV context for future "
-        "resume builder work.",
+        "Resume notes",
+        "Free-text resume and CV context. Individual bullets that tailored resumes are built "
+        "from live on the Experiences page.",
         "resume_text",
     )
