@@ -35,6 +35,15 @@ Primary goal: make it easy to record every job application, detect duplicate pos
 - Before changing UI text, check for broken encoding characters around the menu icon and detail separators.
 - Update `.agents/IMPLEMENTATION_PLAN.md` and `.agents/PROJECT_LOG.md` when completing meaningful work.
 
+## Git and CI Management
+
+All agents must follow these practices (defined in `.agents/AGENTS.md`):
+
+- Create feature branches from main for new work—never commit directly to main.
+- Make intermittent commits for each phase of feature development, not just at the end.
+- When a CI build fails, automatically analyze the error message and fix the root cause before re-pushing.
+- Write clear, descriptive commit messages that explain the "why" behind changes.
+
 ## Verification
 
 Use these checks when relevant:

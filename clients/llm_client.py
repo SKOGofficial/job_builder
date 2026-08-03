@@ -342,8 +342,18 @@ class GroqClient:
             raise GroqNotConfigured(MISSING_PACKAGES_HINT)
         return cls(key=api_key(), model=model_name(), per_minute=requests_per_minute())
 
-    def classify(self, match):
-        """Classify one match. Raises GroqRateLimited on 429."""
+    def complete_json(self, messages, parser, fallback, max_tokens=200):
+        """One paced, JSON-mode completion. Raises GroqRateLimited on 429.
+
+        The transport half of `classify`, factored out so other stages of the
+        pipeline - the message router, the relevance scorer - reuse the pacing,
+        the rate-limit handling, and the untrusted-output discipline instead of
+        reimplementing them against the same free-tier ceiling.
+
+        `parser` validates the model's reply; `fallback` is what to return when
+        the model gives us nothing usable. Both are supplied by the caller
+        because the valid label set differs per stage.
+        """
         self.pacer.wait()
         response = self.poster(
             API_URL,
@@ -353,10 +363,10 @@ class GroqClient:
             },
             json={
                 "model": self.model,
-                "messages": build_messages(match),
+                "messages": messages,
                 "response_format": {"type": "json_object"},
                 "temperature": 0,
-                "max_tokens": 200,
+                "max_tokens": max_tokens,
             },
             timeout=REQUEST_TIMEOUT,
         )
@@ -375,9 +385,15 @@ class GroqClient:
         self.pacer.record((payload.get("usage") or {}).get("total_tokens", 0))
         choices = payload.get("choices") or []
         if not choices:
-            return unclear("Model returned no choices.")
-        return parse_classification(
-            (choices[0].get("message") or {}).get("content", "")
+            return fallback
+        return parser((choices[0].get("message") or {}).get("content", ""))
+
+    def classify(self, match):
+        """Classify one match. Raises GroqRateLimited on 429."""
+        return self.complete_json(
+            build_messages(match),
+            parse_classification,
+            unclear("Model returned no choices."),
         )
 
 

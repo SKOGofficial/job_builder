@@ -1,0 +1,66 @@
+# systemd unit for running the tracker as a service.
+#
+#   sudo cp deploy/job-builder.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now job-builder
+#   journalctl -u job-builder -f
+#
+# Edit User, WorkingDirectory, and the .venv path to match the install.
+#
+# NOTE ON ACCESS: this binds loopback only, because the app has no
+# authentication of any kind. Anyone who can reach the port can read every
+# stored email body and the whole application history. Reach it with
+#
+#     ssh -L 8080:localhost:8080 <this-server>
+#
+# or over Tailscale/WireGuard. Do not add --host 0.0.0.0 without putting an
+# authenticating reverse proxy in front of it first.
+
+[Unit]
+Description=Job Board Tracker
+Documentation=file:///opt/job_builder/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jobbuilder
+Group=jobbuilder
+WorkingDirectory=/opt/job_builder
+
+Environment=PYTHONUNBUFFERED=1
+Environment=JOB_BUILDER_LOG_LEVEL=INFO
+# No desktop secret service on a server, so secrets live in a 0600 file.
+# See utilities/credentials.py.
+Environment=JOB_BUILDER_SECRETS=file
+Environment=JOB_BUILDER_SECRETS_PATH=/var/lib/job_builder/credentials.json
+# Poll interval in seconds. 600 is comfortable; Gmail quota is not the
+# constraint at personal-mailbox scale.
+Environment=JOB_BUILDER_POLL_SECONDS=600
+
+ExecStart=/opt/job_builder/.venv/bin/python app.py --headless --port 8080
+
+Restart=always
+RestartSec=10
+# Give up restarting only if it is crash-looping hard, so a genuine
+# misconfiguration is visible in the journal rather than hidden by a restart
+# storm.
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Hardening. The app needs its own directory and the credential file; nothing
+# else on the filesystem.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/job_builder /var/lib/job_builder
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

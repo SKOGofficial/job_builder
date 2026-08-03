@@ -1,0 +1,16 @@
+[Unit]
+Description=Back up the Job Board Tracker database
+Documentation=file:///opt/job_builder/deploy/backup.sh
+
+[Service]
+Type=oneshot
+User=jobbuilder
+Group=jobbuilder
+ExecStart=/opt/job_builder/deploy/backup.sh /opt/job_builder/job_applications.sqlite3 /var/backups/job_builder 14
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/job_builder
+ReadOnlyPaths=/opt/job_builder

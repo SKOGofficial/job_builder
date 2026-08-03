@@ -1,0 +1,59 @@
+{
+  "_comment": [
+    "Tuning data for the rough filter. Edit this rather than the code.",
+    "The filter is deliberately coarse: it drops only mail that is clearly not",
+    "from a job board or a company, and lets the LLM decide everything else.",
+    "Adding a keyword makes the filter MORE permissive (the keyword is an",
+    "escape hatch that rescues a message from being dropped)."
+  ],
+
+  "job_keywords": [
+    "job", "jobs", "role", "roles", "position", "vacancy", "vacancies",
+    "opening", "openings", "career", "careers", "hiring", "recruit",
+    "recruiter", "recruiting", "recruitment", "talent", "candidate",
+    "application", "applications", "applied", "apply", "applicant",
+    "interview", "interviewing", "assessment", "coding challenge",
+    "take-home", "onsite", "screening", "offer", "offer letter",
+    "resume", "cv", "cover letter", "referral", "shortlist",
+    "thank you for applying", "we received", "your submission",
+    "next steps", "hiring team", "talent acquisition", "people team"
+  ],
+
+  "job_board_domains": [
+    "linkedin.com", "indeed.com", "glassdoor.com", "ziprecruiter.com",
+    "monster.com", "dice.com", "seek.com.au", "totaljobs.com", "reed.co.uk",
+    "greenhouse.io", "lever.co", "ashbyhq.com", "workable.com",
+    "smartrecruiters.com", "myworkday.com", "workday.com", "icims.com",
+    "taleo.net", "successfactors.com", "jobvite.com", "bamboohr.com",
+    "breezy.hr", "recruitee.com", "teamtailor.com", "personio.de",
+    "wellfound.com", "angel.co", "otta.com", "hired.com", "triplebyte.com",
+    "builtin.com", "remoteok.com", "weworkremotely.com", "authenticjobs.com",
+    "himalayas.app", "workatastartup.com", "ycombinator.com"
+  ],
+
+  "_drop_labels_note": [
+    "SOCIAL and FORUMS are safe to drop. PROMOTIONS and UPDATES are NOT:",
+    "LinkedIn and Indeed job alerts routinely land in both, and dropping them",
+    "would silently remove the single most important source of leads."
+  ],
+  "drop_labels": ["CATEGORY_SOCIAL", "CATEGORY_FORUMS", "SPAM", "TRASH"],
+
+  "seed_denylist": [
+    "noreply@github.com",
+    "facebookmail.com",
+    "twitter.com",
+    "x.com",
+    "instagram.com",
+    "pinterest.com",
+    "nextdoor.com",
+    "meetup.com",
+    "eventbrite.com",
+    "netflix.com",
+    "spotify.com",
+    "uber.com",
+    "doordash.com",
+    "amazon.com",
+    "ebay.com",
+    "paypal.com"
+  ]
+}

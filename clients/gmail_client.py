@@ -26,11 +26,16 @@ import asyncio
 import base64
 import binascii
 import html
+import logging
 import os
 import re
+import sys
 from datetime import date, timedelta
 
 from utilities import credentials
+from utilities.identity import COMPANY_SUFFIXES, company_slug
+
+log = logging.getLogger(__name__)
 
 try:
     import keyring
@@ -131,13 +136,34 @@ def load_credentials():
     return creds
 
 
-def run_auth_flow():
-    """Open the browser for consent and store the resulting refresh token.
+#: Fixed so the consent redirect can be forwarded from a desktop:
+#:     ssh -L 8765:localhost:8765 server
+#: A random port (the previous `port=0`) cannot be tunnelled, because you do
+#: not know which port to forward until after the flow has already started.
+#: Loopback redirects on any port are permitted for Desktop OAuth clients per
+#: RFC 8252, so this needs no Google Cloud console change.
+AUTH_REDIRECT_PORT = int(os.environ.get("GMAIL_OAUTH_PORT", "8765"))
+
+
+def run_auth_flow(open_browser=None, port=None):
+    """Run OAuth consent and store the resulting refresh token.
 
     Consent happens entirely in the user's browser. This function never sees or
     handles the account password.
+
+    On a headless server pass `open_browser=False`: the flow prints the
+    authorization URL instead of trying to launch a browser that does not
+    exist. Open that URL on a machine that has one, with the port forwarded,
+    and the redirect lands back here.
+
+    `open_browser` defaults to False whenever no display is detectable, so the
+    server case works without the caller having to know.
     """
     client_id, client_secret = client_config()
+    port = AUTH_REDIRECT_PORT if port is None else port
+    if open_browser is None:
+        open_browser = display_available()
+
     flow = InstalledAppFlow.from_client_config(
         {
             "installed": {
@@ -145,12 +171,22 @@ def run_auth_flow():
                 "client_secret": client_secret,
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": TOKEN_URI,
-                "redirect_uris": ["http://localhost"],
+                "redirect_uris": [f"http://localhost:{port}"],
             }
         },
         SCOPES,
     )
-    creds = flow.run_local_server(port=0, prompt="consent")
+    creds = flow.run_local_server(
+        port=port,
+        open_browser=open_browser,
+        prompt="consent",
+        authorization_prompt_message=(
+            "Open this URL to authorise Gmail access.\n"
+            f"If this machine has no browser, forward the port first:\n"
+            f"    ssh -L {port}:localhost:{port} <this-server>\n"
+            "then open the URL on your desktop.\n\n    {url}\n"
+        ),
+    )
     if not creds.refresh_token:
         raise RuntimeError(
             "Google did not return a refresh token. Revoke the app's access in your "
@@ -158,6 +194,17 @@ def run_auth_flow():
         )
     credentials.write_secret(KEYRING_SERVICE, KEYRING_USERNAME, creds.refresh_token)
     return creds
+
+
+def display_available():
+    """Whether launching a browser on this machine could work.
+
+    Windows and macOS always have a session; on Linux a graphical session sets
+    DISPLAY or WAYLAND_DISPLAY, and an SSH shell on a server sets neither.
+    """
+    if os.name == "nt" or sys.platform == "darwin":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def disconnect():
@@ -202,13 +249,22 @@ def search_messages(query, max_results=25, creds=None):
     return response.get("messages", [])
 
 
-def get_message_headers(message_id, creds=None):
-    """Fetch only the headers for a message.
+#: Headers the rough filter and the classifier need. `List-Unsubscribe` marks
+#: automated bulk mail, which is one of the drop signals.
+METADATA_HEADERS = ["From", "Subject", "Date", "List-Unsubscribe"]
 
-    format="metadata" with an explicit header allowlist keeps this call to the
-    three headers matching needs. Bodies are a separate call (get_message_body)
-    made only once a message has matched, so a message that never matches is
-    never read beyond these headers.
+
+def get_message_headers(message_id, creds=None):
+    """Fetch only the headers and labels for a message.
+
+    format="metadata" with an explicit header allowlist keeps this call small.
+    Bodies are a separate call (get_message_body) made only once the rough
+    filter has passed the message, so mail that is obviously not job related
+    costs one metadata fetch and nothing more.
+
+    `labels` carries Gmail's own categorisation, which the rough filter uses:
+    CATEGORY_SOCIAL and CATEGORY_FORUMS are safe to drop, while PROMOTIONS and
+    UPDATES are not - job alerts routinely land in both.
     """
     service = _service(creds)
     message = (
@@ -218,7 +274,7 @@ def get_message_headers(message_id, creds=None):
             userId="me",
             id=message_id,
             format="metadata",
-            metadataHeaders=["From", "Subject", "Date"],
+            metadataHeaders=METADATA_HEADERS,
         )
         .execute()
     )
@@ -232,7 +288,111 @@ def get_message_headers(message_id, creds=None):
         "sender": headers.get("from", ""),
         "subject": headers.get("subject", ""),
         "date": headers.get("date", ""),
+        "list_unsubscribe": headers.get("list-unsubscribe", ""),
+        "labels": message.get("labelIds", []) or [],
+        "snippet": html.unescape(message.get("snippet", "") or ""),
     }
+
+
+# --- mailbox-wide sync -------------------------------------------------------
+
+
+class GmailHistoryExpired(Exception):
+    """Raised when Gmail no longer holds history from our stored cursor.
+
+    Google keeps history for roughly a week. Past that the incremental path is
+    gone and the caller has to fall back to a bounded full list and re-seed the
+    cursor. Not an error condition - just a slower path.
+    """
+
+
+def get_profile(creds=None):
+    """Mailbox profile, including the current historyId to sync forward from."""
+    service = _service(creds)
+    return service.users().getProfile(userId="me").execute()
+
+
+def list_history(start_history_id, creds=None, max_pages=20):
+    """Message IDs changed since `start_history_id`.
+
+    Returns `(message_ids, new_history_id)`. This is the cheap path: 2 quota
+    units per page against 5 for a list call, and it returns only what actually
+    changed rather than re-walking the mailbox.
+
+    Raises `GmailHistoryExpired` when the cursor is too old, which is a normal
+    outcome after downtime longer than Gmail's retention.
+    """
+    service = _service(creds)
+    message_ids = []
+    latest = start_history_id
+    page_token = None
+    pages = 0
+
+    while pages < max_pages:
+        try:
+            response = (
+                service.users()
+                .history()
+                .list(
+                    userId="me",
+                    startHistoryId=start_history_id,
+                    historyTypes=["messageAdded"],
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+        except Exception as exc:  # googleapiclient raises HttpError
+            if getattr(getattr(exc, "resp", None), "status", None) == 404:
+                raise GmailHistoryExpired(
+                    f"Gmail no longer has history from {start_history_id}"
+                ) from exc
+            raise
+
+        for record in response.get("history", []) or []:
+            for added in record.get("messagesAdded", []) or []:
+                message = added.get("message") or {}
+                if message.get("id"):
+                    message_ids.append(message["id"])
+        latest = response.get("historyId", latest)
+        page_token = response.get("nextPageToken")
+        pages += 1
+        if not page_token:
+            break
+
+    # Gmail can report the same message across pages; order is not meaningful.
+    return list(dict.fromkeys(message_ids)), latest
+
+
+def iter_message_ids(query="", creds=None, max_results=None, page_size=500):
+    """Every message ID matching a query, following pagination.
+
+    The bounded full-sync path: used to seed a new install, and to recover when
+    the history cursor has expired. `max_results` caps the walk so a first run
+    over a decade-old mailbox does not run unbounded.
+    """
+    service = _service(creds)
+    collected = []
+    page_token = None
+
+    while True:
+        response = (
+            service.users()
+            .messages()
+            .list(
+                userId="me",
+                q=query,
+                maxResults=page_size,
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        for stub in response.get("messages", []) or []:
+            collected.append(stub["id"])
+            if max_results and len(collected) >= max_results:
+                return collected
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return collected
 
 
 def _decode_part(body):
@@ -313,23 +473,20 @@ def sender_domain(sender):
     return match.group(1).lower() if match else ""
 
 
-COMPANY_SUFFIXES = {
-    "inc", "inc.", "llc", "l.l.c.", "ltd", "ltd.", "limited", "corp", "corp.",
-    "corporation", "co", "co.", "company", "plc", "gmbh", "ag", "sa", "nv", "bv",
-    "group", "holdings", "technologies", "technology", "labs", "systems",
-}
+# `COMPANY_SUFFIXES` and `company_slug` now live in `utilities/identity.py`,
+# because the identity model needs them too and `store.py` must not import
+# from `clients/`. Re-exported here so this module's public surface is
+# unchanged for existing callers.
+__all_shared__ = ("COMPANY_SUFFIXES", "company_slug")
 
+#: Free mail providers. A sender here is never treated as the company itself,
+#: no matter what the local part says.
 GENERIC_DOMAINS = {
     "gmail.com", "googlemail.com", "yahoo.com", "outlook.com", "hotmail.com",
     "live.com", "icloud.com", "aol.com", "proton.me", "protonmail.com",
+    "yahoo.co.uk", "hotmail.co.uk", "me.com", "mac.com", "gmx.com",
+    "zoho.com", "fastmail.com", "hey.com", "pm.me",
 }
-
-
-def company_slug(company):
-    """Reduce a company name to a lowercase token used for matching."""
-    cleaned = re.sub(r"[^\w\s-]", " ", (company or "").lower())
-    words = [w for w in cleaned.split() if w and w not in COMPANY_SUFFIXES]
-    return "".join(words)
 
 
 def build_query(company, application_date, extra_days=1):

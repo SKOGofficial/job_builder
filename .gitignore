@@ -3,6 +3,13 @@ __pycache__/
 job_applications.sqlite3
 job_applications.backup-*.sqlite3
 *.sqlite3-journal
+# WAL mode leaves these alongside the database.
+*.sqlite3-wal
+*.sqlite3-shm
+# Pre-migration snapshots and the backup timer's output. Real application data.
+backups/
+# Generated resumes and CVs. Derived, and they contain personal detail.
+generated/
 .env
 client_secret.json
 .venv/

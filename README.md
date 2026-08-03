@@ -1,6 +1,17 @@
 # Job Board Tracker
 
-A local desktop application for tracking job applications across job boards and company portals. The app stores application data in a SQLite database so repeated applications, response status, OA progress, references, payment information, and notes are kept in one place.
+An application for tracking job applications across job boards and company portals. It stores everything in a local SQLite database, and runs either as a desktop app or as a service on a home server that watches your inbox and keeps the tracker up to date on its own.
+
+Two lists sit at the centre of it:
+
+- **Applications** - roles you have applied to, each showing every email about that
+  role in date order: the acknowledgement, the assessment invite, the rejection.
+- **To apply** - roles picked up from job-board alert emails that you have not applied
+  to yet, each with a tailored resume and CV already generated from your stored
+  experience, plus a working link to the application portal.
+
+Acknowledgement emails ("thanks for applying") move a role from the second list to the
+first on their own.
 
 ## What is implemented
 
@@ -32,6 +43,11 @@ A local desktop application for tracking job applications across job boards and 
   - Status breakdown pie chart
 - Gmail integration that suggests replies matched to open applications, with per-match
   confirm and dismiss. See the Gmail integration section below.
+- Background ingest pipeline that polls Gmail, classifies job mail, links each email to
+  the role it concerns, turns job-board alerts into leads, and applies status changes.
+  See "The ingest pipeline" below.
+- Company research and tailored resume/CV generation for leads, using Claude with web
+  search. See "Research and resume generation" below.
 - Dark and light mode with a restrained, color-blind-friendly palette.
 - Hamburger menu with:
   - Settings, including Gmail connect and disconnect
@@ -47,15 +63,18 @@ py -3.14 -m venv .venv
 .venv\Scripts\python.exe app.py
 ```
 
-That opens a native window. Two flags are available:
+That opens a native window. The flags:
 
 - `--browser` opens a normal browser tab instead. This is also the automatic fallback when
   `pywebview` is not installed.
+- `--headless` serves without a window or a browser, for running as a service.
+- `--no-poll` starts without the background Gmail poller.
 - `--port 8123` moves it off the default 8080.
+- `--host` changes the bind address. Read the warning under "Running as a service" first.
 
-The server binds to `127.0.0.1`, so it is reachable only from this machine. Gmail and Groq
-features report that they are unavailable when their packages or credentials are missing;
-everything else keeps working.
+The server binds to `127.0.0.1`, so it is reachable only from this machine. Gmail, Groq,
+and Anthropic features report that they are unavailable when their packages or credentials
+are missing; everything else keeps working.
 
 The SQLite database is created automatically as `job_applications.sqlite3` in the project folder.
 
@@ -74,12 +93,17 @@ Setup:
 How it handles your data:
 
 - The only scope requested is `gmail.readonly`. The app never sends, deletes, or modifies mail.
-- Fetching happens in two passes. Headers (`From`, `Subject`, `Date`) are fetched first and are
-  the only thing matching looks at. The body is downloaded afterwards, **only for messages that
-  already matched**, so mail you will never be shown is never read beyond those three headers.
-- Stored per match: the Gmail message ID, those three headers, Gmail's snippet, and the message
-  text (plain text where available, otherwise the HTML part with tags stripped, capped at 20,000
-  characters). Attachments are never downloaded.
+- Fetching happens in two passes. Headers are fetched first; the body is downloaded afterwards,
+  and only for messages that got past the first pass. Attachments are never downloaded.
+- **The ingest pipeline widens this.** The per-job scanner described here only ever read
+  bodies for mail that already matched an application. The pipeline stores headers for your
+  whole mailbox and downloads bodies for anything its rough filter cannot rule out - which is
+  a large share of it. That is the trade that makes it possible to catch a recruiter email
+  matching no keyword and no known company. See "The ingest pipeline" for what is kept and
+  for how to prune it.
+- Stored per match: the Gmail message ID, headers, Gmail's snippet, and the message text
+  (plain text where available, otherwise the HTML part with tags stripped, capped at 20,000
+  characters).
 - Everything stays in the local `job_applications.sqlite3` file. Nothing is uploaded anywhere.
 - The refresh token is the only real credential and is stored in Windows Credential Manager
   through `keyring`, not in the project folder. For a Desktop OAuth client the client ID and
@@ -152,6 +176,122 @@ How your data is handled:
   server — that read reports nothing and `.env` is used instead. Storing a secret still fails
   loudly there, since silently not saving a credential is worse than an error.
 
+## The ingest pipeline
+
+The per-job Gmail scanner above asks "has anyone replied about this application?".
+The pipeline works the other way round: it pulls the mailbox in, decides what each
+message is, and lets that decide which job it touches or creates.
+
+Stages, one module each under `pipeline/`:
+
+1. **Sync** - `users.history.list` for the incremental path, falling back to a bounded
+   `messages.list` when the stored history cursor has expired (Gmail keeps roughly a
+   week). Headers only.
+2. **Rough filter** - drops mail that is confidently not from a job board or a company:
+   personal mail with no job wording, Social and Forums, and a denylist you build by
+   pressing "not job related". Everything else survives. It is deliberately permissive -
+   a filter tuned for precision silently loses the recruiter email that matches no
+   keyword, and you never learn what you missed. Every verdict is recorded, so "why
+   didn't I see that email" is answerable.
+3. **Bodies** - downloaded only for what got through.
+4. **Classify** - Groq labels each message `job_alert`, `job_update`,
+   `job_acknowledgement`, or `irrelevant`. Most mail is irrelevant and the prompt says so.
+5. **Resolve and link** - work out which role a message concerns, strongest signal first:
+   the board's own job ID, then an exact identity match, then sender domain plus title
+   similarity. **When several roles remain plausible it links nothing** and the message
+   goes to a review queue. Guessing would attach a rejection to the wrong role.
+6. **Handle** - alerts become leads, acknowledgements promote leads into applications,
+   updates apply a status change when confident enough.
+
+Links point at a role's *identity*, not at a table row, so a lead that becomes an
+application keeps every email already attached to it. The alert that first surfaced a
+role still appears on its timeline next to the rejection that closed it.
+
+### Command line
+
+Useful without the UI, and safe to run while the app is up (the database is in WAL mode):
+
+```powershell
+.venv\Scripts\python.exe cli.py status
+.venv\Scripts\python.exe cli.py backfill --days 365 --max 2000
+.venv\Scripts\python.exe cli.py sync --once
+.venv\Scripts\python.exe cli.py filter-stats --samples 20
+.venv\Scripts\python.exe cli.py prune --days 30
+.venv\Scripts\python.exe cli.py deny newsletters.example.com
+```
+
+`filter-stats` is the one to watch early on. If the denylist count is not growing, the
+"not job related" control is not being used and the model is being paid to reject the
+same newsletters every day.
+
+### Storage and pruning
+
+Headers are kept for everything, bodies for everything the filter passed. `cli.py prune`
+drops bodies of mail classified irrelevant and older than N days, keeping the ID, headers,
+and classification so nothing is re-fetched or re-classified. Linked messages are never
+pruned - they are the timeline you actually read. The scheduler runs the same pass about
+daily and vacuums afterwards.
+
+## Running as a service
+
+> **This app has no authentication.** Whoever can reach the port can read every stored
+> email body and your whole application history. Keep it on `127.0.0.1` and reach it over
+> an SSH tunnel (`ssh -L 8080:localhost:8080 <server>`), Tailscale, or WireGuard. Only use
+> `--host 0.0.0.0` behind a reverse proxy that authenticates, and treat adding real login
+> as a prerequisite rather than a nice-to-have.
+
+`deploy/` has a systemd unit, a backup script, and a backup timer:
+
+```bash
+sudo cp deploy/job-builder.service /etc/systemd/system/
+sudo cp deploy/job-builder-backup.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now job-builder job-builder-backup.timer
+journalctl -u job-builder -f
+```
+
+Two things differ on a headless box:
+
+- **Secrets.** There is usually no secret service, so `keyring` cannot store the Gmail
+  refresh token. Set `JOB_BUILDER_SECRETS=file` and the app writes a 0600 JSON file
+  instead (`JOB_BUILDER_SECRETS_PATH`, default `~/.config/job_builder/credentials.json`).
+  Opt-in on purpose - nobody should end up with a refresh token on disk without choosing it.
+- **OAuth consent.** There is no browser to open. The redirect port is pinned (default
+  8765) so it can be forwarded: run `ssh -L 8765:localhost:8765 <server>`, connect Gmail
+  from Settings or the CLI, and open the printed URL on your desktop.
+
+Backups use `VACUUM INTO` rather than `cp`. A plain copy of a live SQLite file can catch it
+mid-write, and in WAL mode also misses everything still in the `-wal` file. The script
+runs an integrity check on each backup before pruning old ones.
+
+## Research and resume generation
+
+Leads on the to-apply list arrive with a resume and CV already built, so the flow is
+open the list, click through, fill in the form, send.
+
+How it stays affordable:
+
+- **Groq** does the high-volume work - classifying every message, and scoring each new
+  lead against your profile. Free tier, already paced.
+- **Claude** (`claude-opus-5`, with server-side web search) does the low-volume work -
+  researching the company and the posting, then shaping the resume. Only leads that clear
+  the relevance score reach it.
+
+Without the gate, a daily digest of five to ten postings is $45-150 a month, most of it
+spent on roles dismissed at a glance. With it, spend follows the roles worth pursuing.
+`RESEARCH_DAILY_OUTPUT_TOKENS` is a hard daily ceiling on top of that - a backstop against
+a parser bug turning one email into hundreds of leads, not a budget you should hit. A lead
+scored too low can still be prepared by hand from the UI or with
+`cli.py prepare --lead <id>`.
+
+Generation is two separate steps. Bullet selection ranks your stored experiences against
+the posting's keywords - deterministic, no model. Rendering fills a template. Markdown and
+HTML always work; a PDF is produced as well if the `typst` binary is on PATH. Typst rather
+than LaTeX because it is a single static binary instead of a multi-gigabyte install.
+
+This needs structured experience bullets rather than the free-text resume field - a resume
+cannot be tailored from a prose blob. Add them on the Resume page.
+
 ## Tests
 
 ```powershell
@@ -171,6 +311,20 @@ Or one module at a time:
   validation, pacing, and the classification cycle.
 - `tests/test_web_pages.py` opens every route and clicks through the app using NiceGUI's
   user simulation. No browser and no display are needed, so this runs on a bare CI runner.
+- `tests/test_identity.py` covers the normalization that decides whether two spellings of
+  a job are the same job. Organised as pairs that must collapse and pairs that must not.
+- `tests/test_migrations.py` builds a pre-migration database, migrates it, and asserts
+  every row survived. The one that protects real user data.
+- `tests/test_rough_filter.py` covers each drop rule, and the cases that must **not** be
+  dropped - a recruiter mailing from Gmail, a job alert filed under Promotions.
+- `tests/test_resolver.py` covers each resolution tier, including the ambiguous case that
+  must refuse to guess.
+- `tests/test_lifecycle.py` runs alert to lead to application end to end and asserts the
+  alert email is still on the job's timeline afterwards.
+- `tests/test_ingest.py` covers incremental sync, the expired-cursor fallback, router
+  validation, and board parsing.
+- `tests/test_generation.py` covers research parsing, the spend ceiling, relevance
+  scoring, bullet selection, and rendering.
 
 The backend tests are `unittest.TestCase` classes and the page tests are pytest-style;
 `pytest` collects both, which is why it is the single command.
@@ -187,16 +341,56 @@ implementing those integrations.
 
 ## Data model
 
-The `jobs` table stores every application. Each posting URL is normalized and hashed with SHA-256 to create a stable URL-derived Job ID. If the same URL is used again, the app warns the user and can create a correlated Job ID with a numeric suffix.
+### How a job is identified
 
-The `profile` table stores local profile, settings, and resume/experience notes used by the hamburger menu pages.
+A posting URL is a poor identity: LinkedIn, Indeed, and a company's own portal each hand
+out a different URL for the same role, and alert emails wrap those in tracking links that
+change per send. So the identity is `identity_key` - a hash of the normalized
+(title, company, location) triple.
 
-The `email_matches` table stores suggested Gmail replies linked to a job: the Gmail message ID,
-sender, subject, received date, and whether the suggestion was reviewed or dismissed. It is
-created additively, so existing databases are preserved.
+Normalization collapses spelling and nothing else. "Sr." becomes "senior" and "Google LLC"
+becomes "Google", but "Engineer II" keeps its level and a senior role never merges with a
+non-senior one. Under-merging leaves two rows, which is untidy; over-merging destroys one
+role's history invisibly, so the rules lean the safe way.
+
+`job_id` remains the stable handle other tables reference, and stays URL-derived on rows
+created before the rework. `job_sources` records every URL a role has been seen at -
+one job, many boards - along with each board's own job ID, which is a far better dedupe
+key than the tracking wrapper around it.
+
+### Tables
+
+- `jobs` - applications. Gains `location`, `identity_key`, and nullable `posting_url`
+  (a job created from an acknowledgement may never have had a URL).
+- `job_sources` - the many-boards-one-role mapping.
+- `messages` - the mailbox mirror: headers, optional body, filter verdict, category.
+- `message_links` - which roles a message concerns, keyed on `identity_key`, many-to-many
+  because one alert digest carries several postings.
+- `job_leads` - the to-apply list, unique on `identity_key`.
+- `job_research`, `job_artifacts` - research payloads and generated files, both keyed on
+  `identity_key` so they survive a lead being promoted.
+- `experiences` - structured resume bullets with tags.
+- `sender_denylist` - domains you have marked as never job related.
+- `profile` - key/value store for profile text, settings, and sync cursors.
+- `email_matches` - the legacy per-job scanner's suggestions, unchanged.
+
+### Migrations
+
+Schema changes are gated on `PRAGMA user_version`. A fresh database is stamped at the
+current version and never runs migration code; an existing one is upgraded in order, each
+step in its own transaction. A structural change takes a backup first, into `backups/`.
+
+The v1 backfill computes an identity for every existing row. Where two rows collapse onto
+one key - the same role logged twice from two boards - **nothing is merged**. They are
+reported for review, because a wrong merge destroys application history and you would not
+see it happen.
 
 ## Future work
 
 - Web automation integration: use tools such as Beautiful Soup or Selenium to scrape job portals, follow relevant links, and extract information with regex operations for automatic verification of job postings and unique Job IDs.
 - Pop-up feature: create a companion web popup app in the same repo that works with the same local computer API. It can quickly store job postings for later review and help autofill resume contents.
-- Resume, CV, and Experience: add a resume builder that uses LaTeX to generate tailored resumes from existing resumes and stored experience. It should map experience bullets to the job description and keywords extracted from the posting.
+- Merge flow for duplicate identities surfaced by the v1 backfill, so two rows for one role
+  can be combined without losing either one's history.
+- Authentication, so the app can be exposed beyond loopback without a reverse proxy in front.
+- More board parsers. LinkedIn and Indeed are deterministic; everything else falls back to
+  the model, which works but costs more and is less exact.
