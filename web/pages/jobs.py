@@ -13,7 +13,9 @@ from utilities.theme import STATUS_COLORS, STATUSES
 from web.shell import card, page_shell
 from web.state import get_state
 
-#: How a linked message is labelled on the timeline.
+#: How a linked message is labelled on the timeline. Keyed on the bare kind:
+#: links are stored carrying the classifier's category (`job_update`), so the
+#: `job_` prefix is stripped before lookup.
 LINK_LABELS = {
     "alert": "Alert",
     "update": "Update",
@@ -25,6 +27,10 @@ LINK_COLORS = {
     "update": "#f97316",
     "acknowledgement": "#22c55e",
 }
+
+
+def link_kind(link_type):
+    return (link_type or "").removeprefix("job_")
 
 COLUMNS = [
     {"name": "job_id", "label": "Job ID", "field": "job_id", "sortable": True, "align": "left"},
@@ -179,7 +185,7 @@ def timeline(mail, identity_key):
 def entry(message):
     with ui.column().classes("w-full gap-1 rounded p-3 bg-black/5 dark:bg-white/5"):
         with ui.row().classes("w-full items-center gap-2"):
-            kind = message["link_type"]
+            kind = link_kind(message["link_type"])
             ui.html(
                 f'<span style="background-color:{LINK_COLORS.get(kind, "#64748b")};'
                 f'color:#fff;padding:1px 8px;border-radius:9999px;font-size:10px;'

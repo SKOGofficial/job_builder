@@ -555,6 +555,50 @@ async def test_linked_message_appears_on_the_job_timeline(user, state, store):
     await user.should_see("linked by you")
 
 
+async def test_timeline_labels_the_pipelines_own_link_types(user, state, store):
+    # The pipeline stores the classifier's category as the link type, so the
+    # timeline has to label `job_update`, not just `update`.
+    from web.pages.jobs import timeline
+
+    add_job(store, company="Acme", index=1, title="Engineer")
+    job = store.list_jobs()[0]
+    add_message(state)
+    state.mail.link_message("msg-1", job["identity_key"], "job_update",
+                            resolved_by="alert_parser")
+    state.mail.commit()
+
+    await user.open("/")
+    with user:
+        timeline(state.mail, job["identity_key"])
+    await user.should_see("Update")
+    await user.should_not_see("job_update")
+
+
+async def test_linking_from_the_review_queue_reaches_the_timeline(user, state, store):
+    from web.pages.jobs import timeline
+
+    add_job(store, company="Acme", index=1, title="Engineer")
+    job = store.list_jobs()[0]
+    add_message(state)
+
+    await user.open("/review")
+    user.find("About your application").click()
+    await user.should_see("Choose an application")
+
+    # The picker is keyed on identity, which is what a link points at.
+    select = next(iter(user.find(kind=ui.select).elements))
+    with user:
+        select.set_value(job["identity_key"])
+    user.find("Link").click()
+    await user.should_see("appears on that job's timeline")
+
+    await user.open("/")
+    with user:
+        timeline(state.mail, job["identity_key"])
+    await user.should_see("About your application")
+    await user.should_see("linked by you")
+
+
 async def test_timeline_is_empty_without_links(user, state, store):
     from web.pages.jobs import timeline
 

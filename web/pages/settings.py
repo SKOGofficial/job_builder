@@ -81,9 +81,11 @@ def settings_page():
                 )
                 ui.label(
                     "Read-only access is used to spot replies about your applications. The app "
-                    "never sends, deletes, or changes mail. Headers decide what matches; the "
-                    "message text is then saved for matched mail only, so you can read it on the "
-                    "Email matches page. Sign-in happens in your browser."
+                    "never sends, deletes, or changes mail. The ingest pipeline mirrors your "
+                    "mailbox locally: a rough filter drops mail that is obviously not job "
+                    "related, and everything else has its text stored and classified. Bodies "
+                    "for mail classified irrelevant are dropped again after the retention "
+                    "window. Sign-in happens in your browser."
                 ).classes("text-sm opacity-70")
 
                 if connected and scanner.busy:
@@ -324,23 +326,24 @@ def settings_page():
                         "The poller starts with the app. It is not running in this process, "
                         "which is expected under tests and the CLI."
                     ).classes("text-sm opacity-70")
-                    return
+                else:
+                    status = state.scheduler.status()
+                    ui.label(
+                        f"Poller {'running' if status['running'] else 'stopped'} · "
+                        f"every {status['interval']}s · {status['cycles']} cycle(s) so far"
+                    ).classes("text-sm opacity-70")
+                    ui.label(
+                        f"Last run: {status['last_run_at'] or 'not yet'}"
+                    ).classes("text-xs opacity-60")
+                    if status["message"]:
+                        ui.label(status["message"]).classes("text-sm")
+                    if status["last_error"]:
+                        ui.label(f"Last error: {status['last_error']}").classes(
+                            "text-sm text-red-500"
+                        )
 
-                status = state.scheduler.status()
-                ui.label(
-                    f"Poller {'running' if status['running'] else 'stopped'} · "
-                    f"every {status['interval']}s · {status['cycles']} cycle(s) so far"
-                ).classes("text-sm opacity-70")
-                ui.label(
-                    f"Last run: {status['last_run_at'] or 'not yet'}"
-                ).classes("text-xs opacity-60")
-                if status["message"]:
-                    ui.label(status["message"]).classes("text-sm")
-                if status["last_error"]:
-                    ui.label(f"Last error: {status['last_error']}").classes(
-                        "text-sm text-red-500"
-                    )
-
+                # Shown regardless: what the mailbox mirror holds is worth
+                # seeing even when the poller lives in another process.
                 counts(state.mail)
 
         def counts(mail):

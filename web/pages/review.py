@@ -14,6 +14,7 @@ unresolvable by design. The resolver is built to queue rather than guess.
 from nicegui import ui
 
 from clients.gmail_client import sender_domain
+from pipeline.resolver import JobResolver
 from utilities.mailstore import (
     CATEGORY_ACKNOWLEDGEMENT,
     CATEGORY_ALERT,
@@ -21,14 +22,6 @@ from utilities.mailstore import (
 )
 from web.shell import card, page_shell
 from web.state import get_state
-
-#: A link records what kind of message it was, so the job timeline can show an
-#: alert differently from a rejection.
-LINK_TYPES = {
-    CATEGORY_ALERT: "alert",
-    CATEGORY_UPDATE: "update",
-    CATEGORY_ACKNOWLEDGEMENT: "acknowledgement",
-}
 
 CATEGORY_LABELS = {
     CATEGORY_ALERT: "Job alert",
@@ -68,17 +61,20 @@ def review_page():
     ):
 
         def link(message, identity_key):
+            """Place a message by hand.
+
+            Goes through the resolver's own manual path rather than writing the
+            link here, so a hand-placed message is stored exactly the way an
+            auto-resolved one is - same link type, same commit.
+            """
             if not identity_key:
                 ui.notify("Choose a job first.", type="warning")
                 return
-            mail.link_message(
+            JobResolver(store, mail).link_manually(
                 message["gmail_message_id"],
                 identity_key,
-                LINK_TYPES.get(message["category"], "update"),
-                confidence=1.0,
-                resolved_by="manual",
+                message["category"] or CATEGORY_UPDATE,
             )
-            mail.commit()
             queue.refresh()
             ui.notify("Linked. It now appears on that job's timeline.", type="positive")
 
@@ -148,7 +144,7 @@ def review_page():
 
                         with ui.row().classes("items-center gap-2 pt-1 flex-wrap"):
                             picker = ui.select(
-                                choices, label="Link to application", with_input=True
+                                choices, label="Choose an application", with_input=True
                             ).props("dense outlined").classes("w-80")
                             ui.button(
                                 "Link",
