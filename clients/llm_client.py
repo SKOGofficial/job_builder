@@ -68,8 +68,15 @@ DEFAULT_CONFIDENCE_THRESHOLD = 0.85
 
 #: Free tier ceiling for the default model.
 TOKENS_PER_MINUTE = 12000
-#: Rough cost of one classification: prompt, headers, truncated body, reply.
+#: Fallback projection for a caller that paces without describing its request.
+#: `complete_json` measures the real request instead - see `estimate_tokens`.
+#: Left as the `Pacer.wait` default so a bare pacer still books something.
 ESTIMATED_TOKENS_PER_CALL = 900
+
+#: Bytes per token for English prose, the usual rough ratio. Applied to the
+#: JSON-serialised request, whose quoting and escaping inflate the count a
+#: little - which errs toward over-booking, the safe direction.
+CHARS_PER_TOKEN = 4
 #: Body text is truncated before it is sent. Untruncated bodies run to 20,000
 #: characters, which alone would exceed the per-minute token ceiling.
 MODEL_BODY_CHARS = 2000
@@ -264,6 +271,39 @@ def parse_classification(content):
     return {"label": label.strip(), "confidence": confidence, "reason": reason}
 
 
+def estimate_tokens(messages, max_tokens):
+    """Project what one request will actually cost the rolling token window.
+
+    A flat per-call estimate is what caused the free-tier 429s this replaces.
+    Classification sends 2,000 body characters and asks for 200 back - around
+    1,100 tokens, close to the old flat 900. Alert extraction sends 6,000
+    characters and asks for 1,500 back, which is nearer 3,400. Booking that at
+    900 let four calls drain a 12,000-token minute while the pacer believed it
+    had room for thirteen.
+
+    Measuring the request removes the guess and, more usefully, removes the
+    need for every new call site to remember to pass a number.
+
+    Summary:
+        Estimate the token cost of a chat request from its serialised messages
+        and its output ceiling.
+
+    Parameters:
+        messages (list[dict]): The chat messages about to be sent.
+        max_tokens (int): The requested output ceiling.
+
+    Returns:
+        int: Projected total tokens, input plus a worst-case output.
+
+    Note:
+        Deliberately errs high. JSON quoting inflates the character count, and
+        `max_tokens` is a ceiling replies rarely reach, so the projection is
+        conservative - which is the safe direction for a rate limit.
+    """
+    serialized = json.dumps(messages, ensure_ascii=False)
+    return len(serialized) // CHARS_PER_TOKEN + max_tokens
+
+
 def retry_after_seconds(response):
     """Read retry-after, falling back to a minute when it is absent."""
     raw = (getattr(response, "headers", None) or {}).get("retry-after")
@@ -312,9 +352,32 @@ class Pacer:
         self._last_call = now
 
     def token_delay(self, now, projected_tokens):
+        """
+        Summary:
+            How long to wait before a request of this size fits inside the
+            rolling sixty-second token window.
+
+        Parameters:
+            now (float): Current monotonic time, from the injected clock.
+            projected_tokens (int): What the pending request is expected to
+                cost. See `estimate_tokens`.
+
+        Returns:
+            float: Seconds to sleep. 0.0 when the request fits now.
+
+        Note:
+            Returns 0.0 when nothing has been spent yet, even if the request
+            alone exceeds the whole per-minute budget. Waiting cannot make room
+            that no earlier call is occupying, so blocking would stall forever;
+            better to send it and let the API answer. This mattered less when
+            every call was booked at a flat 900 tokens - now that projections
+            are measured, they can in principle exceed the ceiling.
+        """
         self._spent = [(at, n) for at, n in self._spent if now - at < 60.0]
         used = sum(n for _at, n in self._spent)
         if used + projected_tokens <= self.tokens_per_minute:
+            return 0.0
+        if not self._spent:
             return 0.0
         oldest = min(at for at, _n in self._spent)
         return max(0.0, 60.0 - (now - oldest))
@@ -353,8 +416,31 @@ class GroqClient:
         `parser` validates the model's reply; `fallback` is what to return when
         the model gives us nothing usable. Both are supplied by the caller
         because the valid label set differs per stage.
+
+        Summary:
+            Send one paced, JSON-mode completion and hand the reply to a
+            caller-supplied validator.
+
+        Parameters:
+            messages (list[dict]): The chat messages to send.
+            parser (Callable[[str], Any]): Validates the model's reply text.
+            fallback (Any): Returned when the model produces no choices.
+            max_tokens (int): Output ceiling for the request.
+
+        Returns:
+            Any: Whatever `parser` returns, or `fallback`.
+
+        Raises:
+            GroqRateLimited: On HTTP 429, carrying the retry-after hint so the
+                caller can stop its batch cleanly.
+            RuntimeError: On any other HTTP error at or above 400.
+
+        Note:
+            Pacing is booked from the real size of this request rather than a
+            flat per-call figure - see `estimate_tokens`. Call sites do not
+            need to pass anything for that to work.
         """
-        self.pacer.wait()
+        self.pacer.wait(estimate_tokens(messages, max_tokens))
         response = self.poster(
             API_URL,
             headers={

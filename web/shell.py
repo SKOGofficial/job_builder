@@ -43,7 +43,18 @@ DRAWER_ENTRIES = [
 
 
 def card(padding="p-6"):
-    """A surface panel. Cards carry the app's only border and shadow."""
+    """A surface panel. Cards carry the app's only border and shadow.
+
+    Summary:
+        Build the standard bordered, shadowed card container pages use.
+
+    Parameters:
+        padding (str): Tailwind padding class. Defaults to "p-6".
+
+    Returns:
+        ui.card: The card element, styled and ready to be used as a context
+            manager.
+    """
     return ui.card().classes(f"w-full {padding} gap-2 shadow-sm").props("flat bordered")
 
 
@@ -53,6 +64,20 @@ def page_timer(interval, callback):
     A plain ui.timer keeps firing after the user navigates off the page, and
     NiceGUI then raises "The parent slot of Timer has been deleted" on every
     tick. Cancelling on disconnect keeps the log clean and stops the work.
+
+    Summary:
+        Create a `ui.timer` that cancels itself when its client disconnects.
+
+    Parameters:
+        interval (float): Seconds between callback invocations.
+        callback (Callable): Zero-argument function invoked each tick.
+
+    Returns:
+        ui.timer: The created timer, already wired to cancel on disconnect.
+
+    Note:
+        `on_disconnect` passes the client as an argument, but `timer.cancel()`
+        takes none - the lambda wrapper is required, not stylistic.
     """
     timer = ui.timer(interval, callback)
     # on_disconnect passes client as argument; timer.cancel() takes no args
@@ -65,6 +90,22 @@ def pending_counts(state):
 
     Never raises. A count is decoration, and a page that fails to render
     because a badge query blew up would be a poor trade.
+
+    Summary:
+        Compute the drawer badge counts for the review queue and email
+        matches.
+
+    Parameters:
+        state (AppState): The shared app state to query.
+
+    Returns:
+        dict[str, int]: Route path to count, for whichever queries succeeded.
+            A route is absent from the dict rather than present at 0 if its
+            query failed.
+
+    Note:
+        Every query is wrapped so a failure here cannot break page rendering;
+        failures are logged at debug level and silently drop that badge.
     """
     counts = {}
     try:
@@ -80,11 +121,34 @@ def pending_counts(state):
 
 @contextmanager
 def page_shell(title, subtitle="", active=""):
+    """
+    Summary:
+        Draw the header, navigation, and drawer, then yield a container for
+        the page body.
+
+    Parameters:
+        title (str): Page heading shown above the body.
+        subtitle (str): Optional line under the heading. Omitted from layout
+            when empty.
+        active (str): The route of the current page, used to highlight its
+            nav tab or drawer entry.
+
+    Yields:
+        ui.column: The body container every page renders its content into.
+
+    Note:
+        Every page goes through this, so a failure here breaks the whole app
+        rather than one page.
+    """
     state = get_state()
     ui.colors(primary=PRIMARY_COLOR)
     dark = ui.dark_mode(value=state.dark)
 
     def toggle_dark():
+        """
+        Summary:
+            Flip dark mode and persist the new choice.
+        """
         dark.toggle()
         state.save_dark(bool(dark.value))
 

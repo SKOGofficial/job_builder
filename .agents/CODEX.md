@@ -34,6 +34,7 @@ Primary goal: make it easy to record every job application, detect duplicate pos
 - Keep UI dense, readable, and task-oriented.
 - Before changing UI text, check for broken encoding characters around the menu icon and detail separators.
 - Update `.agents/IMPLEMENTATION_PLAN.md` and `.agents/PROJECT_LOG.md` when completing meaningful work.
+- For every new function or method, include a docstring or structured comment with a short `Summary` describing what the method does, plus `Parameters`, `Returns`, and `Raises`. Omit any of those three that would be empty rather than writing "None." - only `Summary` is unconditional. Keep any existing prose that explains *why*, and add the fields beneath it. See `.agents/AGENTS.md` for the full rule and `utilities/store.py` for a worked example.
 
 ## Git and CI Management
 

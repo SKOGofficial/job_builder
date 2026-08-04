@@ -15,6 +15,7 @@ No network: the model client is a scripted fake, the same way
 
 import unittest
 
+from clients.llm_client import GroqRateLimited
 from pipeline.acknowledgements import AcknowledgementHandler, application_date_from
 from pipeline.alerts import AlertHandler
 from pipeline.resolver import JobResolver
@@ -337,6 +338,86 @@ class TestUpdatesAfterPromotion(unittest.TestCase):
         restored = self.store.job_by_identity(self.key)
         self.assertEqual(restored["status"], "Applied")
         self.assertIsNone(restored["response_date"])
+
+
+class RateLimitedClient:
+    """Raises GroqRateLimited on every call, like an exhausted free tier."""
+
+    def __init__(self, retry_after=42):
+        self.retry_after = retry_after
+        self.calls = 0
+
+    def complete_json(self, messages, parser, fallback, max_tokens=200):
+        self.calls += 1
+        raise GroqRateLimited("rate limited", retry_after=self.retry_after)
+
+
+class TestRateLimitStopsBatchesCleanly(unittest.TestCase):
+    """A 429 must pause a batch, not fail it and not crash the cycle.
+
+    Before this, a rate limit during alert extraction was swallowed by a
+    catch-all and logged as "Model extraction failed" - so a real rate limit
+    looked like an unparseable email, and the handler kept walking the batch
+    into the same wall. In updates and acknowledgements it escaped entirely and
+    took the whole pipeline cycle down with it.
+    """
+
+    def setUp(self):
+        self.store, self.mail, self.resolver = make_app()
+        self.client = RateLimitedClient()
+
+    def _alert(self, message_id="alert-1"):
+        return add_message(self.mail, message_id, "jobs-noreply@unknownboard.io",
+                           "5 new jobs", "<a href='https://x.test/1'>Job</a>",
+                           CATEGORY_ALERT)
+
+    def test_alert_run_stops_instead_of_walking_the_whole_batch(self):
+        for index in range(3):
+            self._alert(f"alert-{index}")
+        handler = AlertHandler(self.store, self.mail, self.client)
+
+        created, _skipped, _linked = handler.run(limit=10)
+
+        self.assertEqual(created, 0)
+        self.assertEqual(self.client.calls, 1,
+                         "must stop after the first 429, not retry each message")
+
+    def test_alert_messages_stay_unlinked_so_they_retry(self):
+        self._alert()
+        AlertHandler(self.store, self.mail, self.client).run(limit=10)
+        # Unlinked is what makes the next cycle pick it up again.
+        self.assertEqual(
+            [row["gmail_message_id"] for row in self.mail.unlinked_messages()],
+            ["alert-1"],
+        )
+
+    def test_update_run_stops_without_raising(self):
+        add_message(self.mail, "upd-1", "no-reply@stripe.com", "Update",
+                    "Some text.", CATEGORY_UPDATE)
+        result = UpdateHandler(self.store, self.mail, self.resolver,
+                               self.client).run(limit=10)
+        self.assertEqual(result["processed"], 0)
+
+    def test_acknowledgement_run_stops_without_raising(self):
+        add_message(self.mail, "ack-1", "no-reply@stripe.com", "Thanks",
+                    "We received it.", CATEGORY_ACKNOWLEDGEMENT)
+        counts = AcknowledgementHandler(self.store, self.mail, self.resolver,
+                                        self.client).run(limit=10)
+        self.assertEqual(sum(counts.values()), 0)
+
+    def test_work_done_before_the_limit_is_kept(self):
+        # A limit part-way through a batch must not discard earlier results.
+        good = FakeClient(['{"postings": [{"title": "Data Engineer", '
+                           '"company": "Acme", "location": null, "url": null}]}'])
+        self._alert("alert-a")
+        created, _s, _l = AlertHandler(self.store, self.mail, good).handle(
+            self.mail.message("alert-a"))
+        self.assertEqual(created, 1)
+
+        self._alert("alert-b")
+        AlertHandler(self.store, self.mail, self.client).run(limit=10)
+        self.assertEqual(len(self.mail.list_leads()), 1,
+                         "the lead created before the limit must survive")
 
 
 class TestApplicationDateParsing(unittest.TestCase):

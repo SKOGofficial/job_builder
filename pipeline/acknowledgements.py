@@ -22,6 +22,7 @@ corrupts every time series on the dashboard.
 import logging
 from datetime import date, datetime
 
+from clients.llm_client import GroqRateLimited
 from pipeline.extract import extract_acknowledgement
 from utilities.identity import identity_key, identity_scheme
 from utilities.mailstore import (
@@ -191,9 +192,34 @@ class AcknowledgementHandler:
         return job_id
 
     def run(self, limit=50):
+        """
+        Summary:
+            Process each unhandled acknowledgement email, stopping cleanly if
+            the model's rate limit is reached.
+
+        Parameters:
+            limit (int): Most acknowledgement emails to process in one pass.
+
+        Returns:
+            dict: Count per action taken - `promoted`, `updated`, `created`,
+                `unresolved`, or `noop`.
+
+        Note:
+            A rate limit ends the pass rather than failing the whole cycle.
+            Promotions already written are kept; unreached emails stay unlinked
+            and are retried next cycle.
+        """
         counts = {}
         for message in self._pending(limit):
-            result = self.handle(message)
+            try:
+                result = self.handle(message)
+            except GroqRateLimited as exc:
+                log.info(
+                    "Acknowledgement handling paused by the rate limit after "
+                    "%d message(s); retrying next cycle, in about %ss",
+                    sum(counts.values()), exc.retry_after,
+                )
+                break
             counts[result["action"]] = counts.get(result["action"], 0) + 1
         return counts
 

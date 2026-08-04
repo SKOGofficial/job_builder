@@ -10,6 +10,7 @@ specific boards ahead of anything broad.
 
 import logging
 
+from clients.llm_client import GroqRateLimited
 from pipeline.parsers import generic, indeed, linkedin
 from pipeline.parsers.base import Posting, collect_anchors, strip_tags
 
@@ -58,6 +59,9 @@ def parse_alert(message, client=None):
             if client is not None and any(not p.company for p in postings):
                 try:
                     postings = generic.complete(message, postings, client)
+                except GroqRateLimited:
+                    # Not a parse failure - see the note on the outer handler.
+                    raise
                 except Exception:
                     log.exception("Gap-filling failed; keeping partial postings")
             return [p for p in postings if p.title and p.company]
@@ -69,6 +73,13 @@ def parse_alert(message, client=None):
         return []
     try:
         postings = generic.extract(message, client)
+    except GroqRateLimited:
+        # A rate limit is not a parse failure, and swallowing it here was
+        # actively misleading: the alert got logged as unparseable, produced no
+        # leads, and - because nothing links it - came back on the next cycle
+        # to hit the same limit again. Letting it reach the handler lets the
+        # batch stop cleanly and resume with a fresh token budget.
+        raise
     except Exception:
         log.exception("Model extraction failed for %s",
                       message.get("gmail_message_id"))
