@@ -72,18 +72,48 @@ MIN_COOLDOWN = 5.0
 def _build_groq(_mail):
     from clients.llm_client import DISPLAY_NAME, GroqClient
 
-    return GroqClient.from_config(), DISPLAY_NAME, frozenset({SHAPE_JSON}), 0
+    return {SHAPE_JSON: GroqClient.from_config()}, DISPLAY_NAME, 0
 
 
 def _build_gemini(_mail):
+    """Both halves of Gemini, sharing one pacer.
+
+    Summary:
+        Build Gemini's classification and research clients as one provider.
+
+    Parameters:
+        _mail: Unused; Gemini's ceiling is requests, enforced by `Budget`.
+
+    Returns:
+        tuple: `(clients_by_shape, display, daily_limit)`.
+
+    Raises:
+        ProviderNotConfigured: When the packages are missing or no key
+            resolves.
+
+    Note:
+        Two client objects, one provider. Grounded research and JSON-mode
+        classification cannot share a request body - the API rejects a search
+        tool alongside a JSON response type - so they cannot share a client.
+        But they spend one project quota and one rate limit, so they must
+        share a budget, a cooldown, and a pacer. Registering them as two
+        providers would let a classification 429 leave research merrily
+        hammering the same exhausted key.
+    """
     from clients.providers import gemini
 
-    return (
-        gemini.GeminiClient.from_config(),
-        gemini.DISPLAY_NAME,
-        frozenset({SHAPE_JSON}),
-        gemini.requests_per_day(),
-    )
+    clients = {SHAPE_JSON: gemini.GeminiClient.from_config()}
+    try:
+        from clients.gemini_research import GeminiResearchClient
+
+        research = GeminiResearchClient.from_config()
+        research.pacer = clients[SHAPE_JSON].pacer
+        clients[SHAPE_RESEARCH] = research
+    except Exception as exc:
+        # Classification is still perfectly usable without the research half.
+        log.info("Gemini research is unavailable: %s", exc)
+
+    return clients, gemini.DISPLAY_NAME, gemini.requests_per_day()
 
 
 def _build_anthropic(mail):
@@ -92,14 +122,15 @@ def _build_anthropic(mail):
     limiter = SpendLimiter(mail) if mail is not None else None
     # No daily *request* ceiling: Anthropic's constraint is monetary, and
     # SpendLimiter already enforces it in output tokens against the database.
-    return ResearchClient.from_config(limiter=limiter), "Claude", \
-        frozenset({SHAPE_RESEARCH}), 0
+    return {SHAPE_RESEARCH: ResearchClient.from_config(limiter=limiter)}, "Claude", 0
 
 
 #: Provider name -> the function that builds it. Construction knowledge lives
 #: here rather than in the provider modules so those stay unaware of the pool,
 #: and so the modules keep working standalone (`cli.py`, the Settings test
 #: button) exactly as before.
+#:
+#: Each builder returns `(clients_by_shape, display, daily_limit)`.
 BUILDERS = {
     "groq": _build_groq,
     "gemini": _build_gemini,
@@ -108,41 +139,62 @@ BUILDERS = {
 
 
 class ProviderState:
-    """One provider's client and everything known about its current capacity."""
+    """One provider's clients, and everything known about its current capacity.
 
-    def __init__(self, name, client=None, display="", shapes=frozenset(),
-                 daily_limit=0, clock=time.monotonic):
+    A provider may hold more than one client - Gemini needs a different request
+    shape for grounded research than for JSON-mode classification - but it has
+    exactly one budget, one cooldown and one pacer, because those describe the
+    account rather than the endpoint. A classification 429 must stop research
+    on the same key too.
+    """
+
+    def __init__(self, name, clients=None, display="", daily_limit=0,
+                 clock=time.monotonic):
         self.name = name
         self.display = display or name.title()
-        self.client = client
-        self.shapes = shapes
+        self.clients = dict(clients or {})
         self.budget = Budget(daily_limit=daily_limit, clock=clock)
         self.cooldown_until = 0.0
         self.last_error = ""
         self._clock = clock
 
     @property
+    def client(self):
+        """
+        Summary:
+            A representative client, for reading the model name and status.
+
+        Returns:
+            The classification client when there is one, else any client, else
+                None.
+        """
+        if not self.clients:
+            return None
+        return self.clients.get(SHAPE_JSON) or next(iter(self.clients.values()))
+
+    @property
     def pacer(self):
         """
         Summary:
-            The client's pacer, or None when the provider is unconfigured.
+            The provider's pacer, or None when it is unconfigured.
 
         Returns:
-            Pacer | None: The pacer the transport already owns. Shared rather
-                than duplicated, so the rolling token window covers every task
-                this provider serves instead of one window per stage.
+            Pacer | None: One rolling token window for the whole provider.
+                Shared across its clients rather than duplicated, so two
+                endpoints on one key cannot each believe they have the full
+                per-minute allowance.
         """
         return getattr(self.client, "pacer", None)
 
     def configured(self):
         """
         Summary:
-            Whether this provider has a usable client.
+            Whether this provider has any usable client.
 
         Returns:
-            bool: True when a client was built successfully.
+            bool: True when at least one client was built successfully.
         """
-        return self.client is not None
+        return bool(self.clients)
 
     def supports(self, shape):
         """
@@ -153,9 +205,22 @@ class ProviderState:
             shape (str): `SHAPE_JSON` or `SHAPE_RESEARCH`.
 
         Returns:
-            bool: True when the shape is supported.
+            bool: True when a client exists for that shape.
         """
-        return shape in self.shapes
+        return shape in self.clients
+
+    def client_for(self, shape):
+        """
+        Summary:
+            The client that serves a given kind of work.
+
+        Parameters:
+            shape (str): `SHAPE_JSON` or `SHAPE_RESEARCH`.
+
+        Returns:
+            The matching client, or None when this provider cannot do it.
+        """
+        return self.clients.get(shape)
 
     def cooling_down(self, now):
         """
@@ -280,7 +345,7 @@ class ProviderPool:
             if builder is None:
                 continue
             try:
-                client, display, shapes, daily_limit = builder(self.mail)
+                clients, display, daily_limit = builder(self.mail)
             except ProviderNotConfigured as exc:
                 log.info("Provider %s is not configured: %s", name, exc)
                 self.providers[name] = ProviderState(name, clock=self._clock)
@@ -292,7 +357,7 @@ class ProviderPool:
                 self.providers[name].last_error = str(exc)
                 continue
             self.providers[name] = ProviderState(
-                name, client=client, display=display, shapes=shapes,
+                name, clients=clients, display=display,
                 daily_limit=daily_limit, clock=self._clock,
             )
 
@@ -571,9 +636,10 @@ class ProviderPool:
         exhausted = None
         for state in ready:
             try:
-                return self._send(state, task, send, projected_tokens, budget_s)
+                return self._send(state, task, shape, send, projected_tokens,
+                                  budget_s)
             except ProviderRateLimited as exc:
-                self._on_rate_limit(state, task, exc)
+                self._on_rate_limit(state, task, shape, exc)
                 blocked.append((state.name, "rate limited", float(exc.retry_after)))
                 continue
             except ProviderBudgetExhausted as exc:
@@ -581,12 +647,12 @@ class ProviderPool:
                 # clear on its own, so the provider is out for the window.
                 state.cool_down(self._clock() + state.budget.window_seconds, str(exc))
                 self.record(state.name, task, "denied_day",
-                            model=getattr(state.client, "model", None))
+                            model=self._model_of(state, shape))
                 blocked.append((state.name, "spend ceiling reached", 0.0))
                 exhausted = exc
                 continue
             except ProviderNotConfigured as exc:
-                state.client = None
+                state.clients.pop(shape, None)
                 state.last_error = str(exc)
                 blocked.append((state.name, "not configured", 0.0))
                 continue
@@ -595,7 +661,22 @@ class ProviderPool:
             task, shape, send, projected_tokens, budget_s, blocked, exhausted
         )
 
-    def _send(self, state, task, send, projected_tokens, budget_s):
+    @staticmethod
+    def _model_of(state, shape):
+        """
+        Summary:
+            The model name for one provider's client of a given shape.
+
+        Parameters:
+            state (ProviderState): The provider.
+            shape (str): The client shape.
+
+        Returns:
+            str | None: The model name, or None when unknown.
+        """
+        return getattr(state.client_for(shape), "model", None)
+
+    def _send(self, state, task, shape, send, projected_tokens, budget_s):
         """Wait out this provider's pacing, then send.
 
         Summary:
@@ -604,6 +685,7 @@ class ProviderPool:
         Parameters:
             state (ProviderState): The provider to use.
             task (str): The canonical task id.
+            shape (str): Which of the provider's clients to use.
             send (Callable): Performs the call, given the client.
             projected_tokens (int): Expected cost.
             budget_s (float): Longest this call may wait.
@@ -617,20 +699,21 @@ class ProviderPool:
             A request in flight has to count, or two stages could each see the
             last slot as free.
         """
+        client = state.client_for(shape)
         now = self._clock()
         delay = state.delay(now, projected_tokens)
         if delay > 0:
             self._sleep(min(delay, budget_s))
         state.budget.book()
-        value = send(state.client)
-        tokens = getattr(state.client, "last_total_tokens", 0)
-        model = getattr(state.client, "model", None)
+        value = send(client)
+        tokens = getattr(client, "last_total_tokens", 0)
+        model = getattr(client, "model", None)
         self.record(state.name, task, "ok", model=model, tokens=tokens)
         self.attribution[task] = (state.name, model)
         state.last_error = ""
         return value
 
-    def _on_rate_limit(self, state, task, exc):
+    def _on_rate_limit(self, state, task, shape, exc):
         """
         Summary:
             Apply a provider's refusal to its cooldown and budget.
@@ -638,20 +721,21 @@ class ProviderPool:
         Parameters:
             state (ProviderState): The provider that refused.
             task (str): The canonical task id.
+            shape (str): Which client refused, for the recorded model name.
             exc (ProviderRateLimited): The refusal.
 
         Note:
             A 429 is ground truth. Whatever the local counters believed, the
             provider has said no, so its answer overrides the arithmetic - and
             a day-scoped refusal is written to the ledger so a restart cannot
-            un-exhaust it.
+            un-exhaust it. The cooldown lands on the provider, not the client,
+            so a classification limit also stops research on the same key.
         """
         now = self._clock()
         state.cool_down(now + max(exc.retry_after, MIN_COOLDOWN), str(exc))
         state.budget.deny(exc.scope, now)
         outcome = "denied_day" if exc.scope == "day" else "rate_limited"
-        self.record(state.name, task, outcome,
-                    model=getattr(state.client, "model", None))
+        self.record(state.name, task, outcome, model=self._model_of(state, shape))
         log.info("%s refused %s (%s); trying the next provider",
                  state.display, task, exc.scope)
 
@@ -691,9 +775,10 @@ class ProviderPool:
             and state.delay(self._clock(), projected_tokens) <= budget_s
         ):
             try:
-                return self._send(state, task, send, projected_tokens, budget_s)
+                return self._send(state, task, shape, send, projected_tokens,
+                                  budget_s)
             except ProviderRateLimited as exc:
-                self._on_rate_limit(state, task, exc)
+                self._on_rate_limit(state, task, shape, exc)
                 blocked.append((state.name, "rate limited", float(exc.retry_after)))
 
         if exhausted is not None:

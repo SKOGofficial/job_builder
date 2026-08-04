@@ -57,14 +57,23 @@ class FakeClient:
         return ({"summary": "ok"}, 10, 20)
 
 
-def builder(client, display, shapes=frozenset({SHAPE_JSON}), daily_limit=0):
-    """A pool builder function returning a fixed client."""
-    if client is None:
+def builder(client, display, shapes=frozenset({SHAPE_JSON}), daily_limit=0,
+            clients=None):
+    """A pool builder function returning fixed clients.
+
+    Takes either one client plus the shapes it serves, or an explicit
+    shape-to-client mapping for a provider whose halves differ - which is how
+    Gemini really works, since grounded research and JSON-mode classification
+    cannot share a request body.
+    """
+    if client is None and clients is None:
         def build(_mail):
             raise ProviderNotConfigured(f"{display} has no key")
     else:
+        mapping = clients if clients is not None else {s: client for s in shapes}
+
         def build(_mail):
-            return client, display, shapes, daily_limit
+            return mapping, display, daily_limit
     return build
 
 

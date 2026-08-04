@@ -203,22 +203,72 @@ def build_research_prompt(lead):
     )
 
 
+def _json_object(text):
+    """Find the JSON object in a reply that may be wrapped in prose.
+
+    Tolerance here is load-bearing rather than defensive. A grounded search
+    request cannot also ask for a JSON response type - the Gemini API rejects
+    the combination - so the research reply is only asked for JSON in the
+    prompt, and a model that obliges with a sentence of preamble is behaving
+    normally rather than badly.
+
+    Summary:
+        Extract a JSON object from model output, tolerating fences and prose.
+
+    Parameters:
+        text (str): The model's raw reply.
+
+    Returns:
+        dict | None: The decoded object, or None when nothing parses. Never
+            raises.
+    """
+    cleaned = (text or "").strip()
+    # Models occasionally wrap JSON in a fence despite instructions.
+    if cleaned.startswith("```"):
+        parts = cleaned.split("```")
+        if len(parts) > 1:
+            cleaned = parts[1]
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
+    cleaned = cleaned.strip()
+
+    for candidate in (cleaned, _outermost_braces(cleaned)):
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _outermost_braces(text):
+    """
+    Summary:
+        Return the span from the first `{` to the last `}`, if both exist.
+
+    Parameters:
+        text (str): The text to scan.
+
+    Returns:
+        str: The spanned substring, or an empty string when there is no pair.
+    """
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return ""
+    return text[start:end + 1]
+
+
 def parse_research(text):
     """Validate a research reply into a plain dict. Never raises."""
     if not text:
         return {}
-    # Models occasionally wrap JSON in a fence despite instructions.
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("```")[1]
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:]
-    try:
-        data = json.loads(cleaned)
-    except (TypeError, ValueError):
+    data = _json_object(text)
+    if data is None:
         log.debug("Research reply was not valid JSON")
-        return {}
-    if not isinstance(data, dict):
         return {}
 
     def _text(value):
