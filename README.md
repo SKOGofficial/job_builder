@@ -46,8 +46,8 @@ first on their own.
 - Background ingest pipeline that polls Gmail, classifies job mail, links each email to
   the role it concerns, turns job-board alerts into leads, and applies status changes.
   See "The ingest pipeline" below.
-- Company research and tailored resume/CV generation for leads, using Claude with web
-  search. See "Research and resume generation" below.
+- Company research and tailored resume/CV generation for leads, using Gemini with Google
+  Search grounding and falling back to Claude. See "Research and resume generation" below.
 - Dark and light mode with a restrained, color-blind-friendly palette.
 - Hamburger menu with:
   - Settings, including Gmail connect and disconnect
@@ -125,27 +125,35 @@ How matching works:
   to fetch it.
 - Scanning runs only when you press **Check for replies**. There is no background polling.
 
-## AI classification (Groq)
+## AI classification (Groq, Gemini)
 
-Matched replies can be labelled automatically, so you are not reading every email to
-work out whether it was a rejection or an interview invite.
+Matched replies and mirrored mail are labelled automatically, so you are not reading every
+email to work out whether it was a rejection or an interview invite.
+
+Two providers do this work, and a third does research. Which one runs for a given job is
+routing, editable in **Settings -> Task routing**.
 
 Setup:
 
-1. Create an API key at https://console.groq.com.
-2. Copy `.env.example` to `.env` and set `GROQ_API_KEY`.
-3. Optionally use **Settings -> Move key to Credential Manager** to get the key out of
-   the project folder. The credential store takes precedence over `.env` when both are set.
+1. Create an API key at https://console.groq.com, and optionally one at
+   https://aistudio.google.com/apikey.
+2. Copy `.env.example` to `.env` and set `GROQ_API_KEY`, `GEMINI_API_KEY`, or both.
+3. Optionally use **Settings -> Move key to credential manager** to get a key out of the
+   project folder. The credential store takes precedence over `.env` when both are set.
 
-No extra packages are needed. Groq's endpoint is OpenAI-compatible REST, so it uses the
-`requests`, `keyring`, and `python-dotenv` that Gmail support already installs.
+No extra packages are needed. Both endpoints are plain REST, so they use the `requests`,
+`keyring`, and `python-dotenv` that Gmail support already installs.
 
 What it does:
 
 - Each stored reply is labelled **Rejected**, **Offer**, **Interview**, **OA Received**,
   **Acknowledgement**, or **Unclear**. The last two never change a job.
-- A label at or above `GROQ_CONFIDENCE_THRESHOLD` (default 85%) **applies the job status
-  automatically**. Below it, the label only pre-fills the dropdown for you to confirm.
+- A label at or above `LLM_CONFIDENCE_THRESHOLD` (default 85%) **applies the job status
+  automatically**. Below it, the label only pre-fills the dropdown for you to confirm. The
+  threshold is a property of the classification rather than of the provider, so every model
+  is held to the same bar. `GROQ_CONFIDENCE_THRESHOLD` is still read, for existing setups.
+- Which model produced a label is recorded and shown on the Email matches page, so a bad
+  label can be traced to the model that produced it.
 - Every automatic change is reversible. The match records the status and response date it
   replaced, and **Undo** on the Email matches page restores both. This matters most for
   Rejected: applying it stamps a response date, which drops the job out of the pool that
@@ -153,25 +161,57 @@ What it does:
 - A cycle starts automatically after **Check for replies** finds something, and can be run
   on demand from the Email matches page. Only unclassified messages are sent.
 
+### Routing and failover
+
+Every model call in the app is a named task with an ordered list of providers. The first
+that is configured, is not cooling down from a rate limit, and has daily allowance left
+takes the call. Otherwise the next one does.
+
+| Task | Default order |
+|---|---|
+| Route incoming email | Groq, then Gemini |
+| Extract job alerts | Groq, then Gemini |
+| Read application updates | Groq, then Gemini |
+| Read acknowledgements | Groq, then Gemini |
+| Score lead relevance | Groq, then Gemini |
+| Classify matched replies | Groq, then Gemini |
+| Research a company and role | Gemini, then Claude |
+
+Edit these in **Settings -> Task routing**, or set `LLM_ROUTE_<TASK>` in `.env`. A task with
+no saved choice follows `.env`, so changing that file keeps working; **Reset** on a row
+deletes the saved choice rather than freezing today's default into the database.
+
+A provider is only handed work it can actually take. If none of a task's providers has
+headroom, the call falls to `LLM_DEFAULT_PROVIDER` (Groq, because a per-minute limit always
+clears while a daily one does not) and waits — but only briefly, and never long enough to
+freeze the interface. Past that the stage stops cleanly with everything it has already
+written intact, exactly as it did before, and the next cycle resumes.
+
 Rate limits:
 
-- The free tier allows 30 requests and 12,000 tokens per minute for
+- **Groq**: the free tier allows 30 requests and 12,000 tokens per minute for
   `llama-3.3-70b-versatile`. At roughly 900 tokens per classification the **token** ceiling
   binds first, so requests are paced from tokens rather than sent in a burst. Bodies are
   truncated to 2,000 characters before sending for the same reason.
-- Default pace is 12 requests/min, overridable with `GROQ_REQUESTS_PER_MINUTE`.
-- If Groq returns **429 Too Many Requests**, the cycle stops cleanly rather than retrying.
-  Everything already classified is kept, the page shows how far it got and the suggested
-  wait, and a **Resume classification** button restarts from the first unclassified message.
+- **Gemini**: the request ceiling binds first, and unlike Groq there is also a **daily**
+  cap. That is the limit a second engine actually reaches, so requests spread out as the
+  day's allowance is spent rather than running flat out until they stop — bursts pass
+  freely through the first half, then pace. Settings shows how much is left.
+- Daily usage is recorded in the database, so restarting the app cannot un-spend it.
+- Free-tier limits are per project and move. Google publishes yours in AI Studio rather
+  than in the docs; `GEMINI_REQUESTS_PER_MINUTE`, `GEMINI_TOKENS_PER_MINUTE` and
+  `GEMINI_REQUESTS_PER_DAY` start conservative and are meant to be raised.
 
 How your data is handled:
 
 - Sent per message: the sender, subject, and the first 2,000 characters of the body.
 - The email is untrusted third-party text, and so is the model's reply. The model may only
   return one of the six labels above; anything else becomes Unclear. An email that tries to
-  instruct the classifier is labelled Unclear rather than obeyed.
-- The Groq key is a real credential, unlike the Gmail Desktop client ID and secret which are
-  public per RFC 8252, so it is read from the OS credential store first.
+  instruct the classifier is labelled Unclear rather than obeyed. Both providers use the
+  same prompt and the same validation, so adding one does not weaken this.
+- Provider keys are real credentials, unlike the Gmail Desktop client ID and secret which
+  are public per RFC 8252, so they are read from the OS credential store first. They travel
+  in request headers, never in a URL, because URLs end up in logs and tracebacks.
 - On a machine with no usable credential store — a bare Linux install, a CI runner, a headless
   server — that read reports nothing and `.env` is used instead. Storing a secret still fails
   loudly there, since silently not saving a credential is worse than an error.
@@ -194,8 +234,9 @@ Stages, one module each under `pipeline/`:
    keyword, and you never learn what you missed. Every verdict is recorded, so "why
    didn't I see that email" is answerable.
 3. **Bodies** - downloaded only for what got through.
-4. **Classify** - Groq labels each message `job_alert`, `job_update`,
-   `job_acknowledgement`, or `irrelevant`. Most mail is irrelevant and the prompt says so.
+4. **Classify** - whichever model is routed to the job labels each message `job_alert`,
+   `job_update`, `job_acknowledgement`, or `irrelevant`. Most mail is irrelevant and the
+   prompt says so. The model that produced each label is recorded alongside it.
 5. **Resolve and link** - work out which role a message concerns, strongest signal first:
    the board's own job ID, then an exact identity match, then sender domain plus title
    similarity. **When several roles remain plausible it links nothing** and the message
@@ -271,18 +312,25 @@ open the list, click through, fill in the form, send.
 
 How it stays affordable:
 
-- **Groq** does the high-volume work - classifying every message, and scoring each new
-  lead against your profile. Free tier, already paced.
-- **Claude** (`claude-opus-5`, with server-side web search) does the low-volume work -
-  researching the company and the posting, then shaping the resume. Only leads that clear
-  the relevance score reach it.
+- **Groq and Gemini** do the high-volume work - classifying every message, and scoring each
+  new lead against your profile. Free tiers, paced, and one covers for the other.
+- **Gemini** researches first, using Google Search grounding. Free, and only leads that
+  clear the relevance score reach it.
+- **Claude** (`claude-opus-5`, with server-side web search) picks up research Gemini cannot
+  take - no key, daily allowance spent, or rate limited.
 
 Without the gate, a daily digest of five to ten postings is $45-150 a month, most of it
-spent on roles dismissed at a glance. With it, spend follows the roles worth pursuing.
-`RESEARCH_DAILY_OUTPUT_TOKENS` is a hard daily ceiling on top of that - a backstop against
-a parser bug turning one email into hundreds of leads, not a budget you should hit. A lead
-scored too low can still be prepared by hand from the UI or with
-`cli.py prepare --lead <id>`.
+spent on roles dismissed at a glance. With it, spend follows the roles worth pursuing, and
+with Gemini in front most of it never reaches a paid model at all.
+`RESEARCH_DAILY_OUTPUT_TOKENS` is a hard daily ceiling on Claude on top of that - a backstop
+against a parser bug turning one email into hundreds of leads, not a budget you should hit.
+When it is reached, research falls back to Gemini rather than stopping. A lead scored too
+low can still be prepared by hand from the UI or with `cli.py prepare --lead <id>`.
+
+One API constraint worth knowing, because it shapes the code: Gemini rejects a request that
+asks for Google Search grounding *and* a JSON response type together. Research needs the
+search, so its reply arrives as ordinary text and the parser digs the JSON out of it -
+tolerantly, and with the same validation and length clamps applied afterwards either way.
 
 Generation is two separate steps. Bullet selection ranks your stored experiences against
 the posting's keywords - deterministic, no model. Rendering fills a template. Markdown and

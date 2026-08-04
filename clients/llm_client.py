@@ -206,10 +206,24 @@ def requests_per_minute():
 
 
 def confidence_threshold():
+    """How confident a label must be before it changes a job's status.
+
+    A property of the classification, not of the provider - more than one model
+    produces labels now and they are all held to the same bar. Hence the
+    provider-neutral name, with the original kept working so an existing .env
+    does not silently revert to the default.
+
+    Summary:
+        Resolve the auto-apply confidence threshold.
+
+    Returns:
+        float: The threshold, clamped to at most 1.0.
+    """
     _load_env()
-    value = _positive_number(
-        os.environ.get("GROQ_CONFIDENCE_THRESHOLD"), DEFAULT_CONFIDENCE_THRESHOLD, float
-    )
+    raw = os.environ.get("LLM_CONFIDENCE_THRESHOLD")
+    if raw is None or not str(raw).strip():
+        raw = os.environ.get("GROQ_CONFIDENCE_THRESHOLD")
+    value = _positive_number(raw, DEFAULT_CONFIDENCE_THRESHOLD, float)
     return min(value, 1.0)
 
 
