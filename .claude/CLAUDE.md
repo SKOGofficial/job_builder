@@ -12,3 +12,4 @@ Please refer to the primary agent handoff instructions located in [.agents/AGENT
 - Do not modify or remove `job_applications.sqlite3`.
 - Do not introduce networked services without approval.
 - Keep code organized into single-responsibility modules under relevant directories (e.g. `pages/`), keeping `app.py` as an orchestrator.
+- For every new function or method, include a docstring or structured comment with `Parameters`, `Returns`, `Raises`, and a short `Summary` describing what the method does.
