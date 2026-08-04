@@ -549,7 +549,7 @@ class ClassificationRunner:
                 self.emit()
                 return
             self.processed += 1
-            self.save(payload["id"], result)
+            self.save(payload["id"], result, client)
             self.emit()
 
         self.state = DONE
@@ -559,10 +559,22 @@ class ClassificationRunner:
         )
         self.emit()
 
-    def save(self, match_id, result):
-        """Record the label, and apply it when it is confident enough."""
+    def save(self, match_id, result, client=None):
+        """Record the label, and apply it when it is confident enough.
+
+        Summary:
+            Store one classification, applying the status when confident.
+
+        Parameters:
+            match_id (int): The `email_matches.id` that was classified.
+            result (dict): Keys `label`, `confidence`, `reason`.
+            client: The client that produced the result, read only for its
+                model name. Optional and read with `getattr`, so every test
+                double keeps working and simply records NULL.
+        """
         self.store.record_classification(
-            match_id, result["label"], result["confidence"], result["reason"]
+            match_id, result["label"], result["confidence"], result["reason"],
+            getattr(client, "last_model", None),
         )
         if (
             result["label"] in APPLICABLE_LABELS

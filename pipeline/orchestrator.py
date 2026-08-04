@@ -14,6 +14,7 @@ calling thread and only network calls go to the executor.
 
 import logging
 
+from clients.providers.pool import LOOP_MAX_WAIT, THREAD_MAX_WAIT
 from pipeline.acknowledgements import AcknowledgementHandler
 from pipeline.alerts import AlertHandler
 from pipeline.resolver import JobResolver
@@ -61,6 +62,9 @@ class PipelineCycle:
         self.sync = MailboxSync(mail, executor=executor)
         self.bodies = BodyFetcher(mail, executor=executor)
         self.resolver = JobResolver(store, mail)
+        #: Built once on first use and kept, so cooldowns and daily counters
+        #: survive across cycles. See `_pool`.
+        self._pool_instance = None
 
         self.state = IDLE
         self.message = ""
@@ -70,26 +74,48 @@ class PipelineCycle:
     def busy(self):
         return self.state == RUNNING
 
-    def _client(self):
-        """A Groq client, or None when it is not configured.
+    def _pool(self):
+        """The provider pool, or None when no model is configured.
 
         Returning None rather than raising is deliberate: sync and filtering
         are useful on their own, and an unconfigured model should degrade the
         pipeline rather than stop it.
-        """
-        if self.client_factory is None:
-            from clients.llm_client import GroqClient, GroqNotConfigured
 
+        Summary:
+            Resolve the provider pool for this cycle.
+
+        Returns:
+            ProviderPool | None: The pool, or None when nothing is configured.
+
+        Note:
+            The pool is built once and kept, not rebuilt per cycle. Cooldowns
+            and daily counters have to outlive the cycle that earned them - a
+            pool rebuilt each pass would retry an exhausted provider every ten
+            minutes until midnight. `client_factory` is honoured for tests that
+            inject a pool or a bare client.
+        """
+        if self._pool_instance is not None:
+            return self._pool_instance
+        if self.client_factory is not None:
             try:
-                return GroqClient.from_config()
-            except GroqNotConfigured as exc:
+                self._pool_instance = self.client_factory()
+            except Exception as exc:
                 log.info("Model stages skipped: %s", exc)
                 return None
+            return self._pool_instance
+
+        from clients.providers.pool import ProviderPool
+
         try:
-            return self.client_factory()
+            pool = ProviderPool(mail=self.mail)
         except Exception as exc:
             log.info("Model stages skipped: %s", exc)
             return None
+        if not pool.configured_names():
+            log.info("Model stages skipped: no provider is configured.")
+            return None
+        self._pool_instance = pool
+        return pool
 
     def apply_filter(self):
         """Give every unfiltered message a verdict.
@@ -133,16 +159,32 @@ class PipelineCycle:
             result["filter"] = self.apply_filter()
             result["bodies"] = await self.bodies.run(self.limits["bodies"])
 
-            client = self._client()
-            if client is not None:
-                router = MessageRouter(
-                    self.mail,
-                    client_factory=lambda: client,
-                    executor=self.executor,
-                )
-                result["classified"] = await router.run(self.limits["classify"])
-                result["handled"] = self.dispatch(client)
-                result["prepared"] = self.prepare(client)
+            pool = self._pool()
+            if pool is not None:
+                pool.begin_cycle()
+                try:
+                    # The router already runs its model calls through an
+                    # executor, so it may block for the longer budget. Every
+                    # other stage runs inline on this loop and gets the short
+                    # one - passed explicitly rather than left to the pool's
+                    # thread check, since here the answer is already known.
+                    route = pool.for_task("route_email",
+                                          max_wait=THREAD_MAX_WAIT)
+                    if route is not None:
+                        router = MessageRouter(
+                            self.mail,
+                            client_factory=lambda: route,
+                            executor=self.executor,
+                        )
+                        result["classified"] = await router.run(
+                            self.limits["classify"]
+                        )
+                    else:
+                        result["classified"] = {}
+                    result["handled"] = self.dispatch(pool)
+                    result["prepared"] = self.prepare(pool)
+                finally:
+                    pool.flush()
             else:
                 result["classified"] = {}
                 result["handled"] = {}
@@ -158,22 +200,42 @@ class PipelineCycle:
         self.last_result = result
         return result
 
-    def dispatch(self, client):
+    def dispatch(self, pool):
         """Hand classified messages to their category handler.
 
         Alerts first: an acknowledgement processed before the alert that
         surfaced the role would create a job directly instead of promoting a
         lead, losing the board metadata and the canonical apply URL.
+
+        Summary:
+            Run each category handler with a client bound to its own task.
+
+        Parameters:
+            pool (ProviderPool): The pool to draw task clients from.
+
+        Returns:
+            dict: Counts per handler.
+
+        Note:
+            Every handler here runs inline on the event loop, so each client
+            gets the short sleep budget. A stage that blocked for a rate limit
+            would freeze the UI; instead the pool raises and the handler's
+            existing `except ... break` keeps what it has written and resumes
+            next cycle.
         """
         limit = self.limits["handle"]
         created, skipped, _ = AlertHandler(
-            self.store, self.mail, client).run(limit)
+            self.store, self.mail,
+            pool.for_task("extract_alert", max_wait=LOOP_MAX_WAIT)).run(limit)
 
         acknowledged = AcknowledgementHandler(
-            self.store, self.mail, self.resolver, client).run(limit)
+            self.store, self.mail, self.resolver,
+            pool.for_task("extract_acknowledgement",
+                          max_wait=LOOP_MAX_WAIT)).run(limit)
 
         updated = UpdateHandler(
-            self.store, self.mail, self.resolver, client,
+            self.store, self.mail, self.resolver,
+            pool.for_task("extract_update", max_wait=LOOP_MAX_WAIT),
             threshold=self.threshold).run(limit)
 
         return {
@@ -183,44 +245,44 @@ class PipelineCycle:
             "updates": updated,
         }
 
-    def prepare(self, client):
+    def prepare(self, pool):
         """Score new leads and build artifacts for the ones worth it.
 
-        Degrades in two independent steps. Without the research client, leads
-        still get scored and simply wait at `new`; without the Groq client this
-        is not reached at all. Neither absence stops the rest of the pipeline.
+        Degrades in two independent steps. Without a research provider, leads
+        still get scored and simply wait at `new`; without a scoring provider
+        this is not reached at all. Neither absence stops the rest of the
+        pipeline.
+
+        Summary:
+            Run the relevance gate and the artifact builder for this cycle.
+
+        Parameters:
+            pool (ProviderPool): The pool to draw task clients from.
+
+        Returns:
+            dict: The preparer's per-stage counts, or an empty dict on failure.
         """
         from pipeline.prepare import LeadPreparer
 
-        research = self._research_client()
-        preparer = LeadPreparer(self.store, self.mail, client, research,
-                                threshold=self.relevance_threshold)
+        research = pool.for_task("research", max_wait=LOOP_MAX_WAIT)
+        if self._research_factory is not None:
+            try:
+                research = self._research_factory()
+            except Exception as exc:
+                log.info("Research unavailable: %s", exc)
+                research = None
+
+        preparer = LeadPreparer(
+            self.store, self.mail,
+            pool.for_task("score_relevance", max_wait=LOOP_MAX_WAIT),
+            research,
+            threshold=self.relevance_threshold,
+        )
         try:
             return preparer.run(prepare_limit=self.limits["prepare"])
         except Exception:
             log.exception("Lead preparation stage failed")
             return {}
-
-    def _research_client(self):
-        """A Claude client with a spend limiter, or None when unconfigured."""
-        if self._research_factory is not None:
-            try:
-                return self._research_factory()
-            except Exception as exc:
-                log.info("Research unavailable: %s", exc)
-                return None
-
-        from clients.research_client import (
-            ResearchClient,
-            ResearchNotConfigured,
-            SpendLimiter,
-        )
-
-        try:
-            return ResearchClient.from_config(limiter=SpendLimiter(self.mail))
-        except ResearchNotConfigured as exc:
-            log.info("Research unavailable: %s", exc)
-            return None
 
 
 def _labels(row):
