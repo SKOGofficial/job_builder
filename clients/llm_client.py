@@ -35,10 +35,13 @@ burst. A 429 stops the cycle cleanly instead of hammering the endpoint.
 
 import asyncio
 import json
+import logging
 import os
 import time
 
 from utilities import credentials
+
+log = logging.getLogger(__name__)
 
 try:
     import requests
@@ -121,11 +124,18 @@ class GroqNotConfigured(Exception):
 
 
 class GroqRateLimited(Exception):
-    """Raised on HTTP 429 so the cycle can stop instead of retrying."""
+    """Raised on HTTP 429 so the cycle can stop instead of retrying.
 
-    def __init__(self, message, retry_after=0):
+    Carries `limits`, the rate-limit headers the response reported, because
+    `retry_after` alone does not say *which* ceiling was reached. A wait of a
+    minute and a wait until tomorrow are the same exception otherwise, and they
+    call for completely different responses.
+    """
+
+    def __init__(self, message, retry_after=0, limits=None):
         super().__init__(message)
         self.retry_after = retry_after
+        self.limits = limits or {}
 
 
 # Configuration ------------------------------------------------------------
@@ -313,6 +323,75 @@ def retry_after_seconds(response):
         return 60
 
 
+#: What Groq reports alongside a 429. Requests are limited per day and tokens
+#: per minute, so the pair says which ceiling was actually reached - the thing
+#: `retry-after` on its own leaves ambiguous.
+RATE_LIMIT_HEADERS = (
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-tokens",
+)
+
+
+def rate_limit_snapshot(response):
+    """
+    Summary:
+        Collect whichever rate-limit headers a response carries.
+
+    Parameters:
+        response: The HTTP response to read headers from.
+
+    Returns:
+        dict: Header name to value, for the headers that were present. Empty
+            when the response carries none.
+
+    Note:
+        Header lookup is case-insensitive on a real `requests` response; a
+        plain dict from a test is read as-is, so both work.
+    """
+    headers = getattr(response, "headers", None) or {}
+    snapshot = {}
+    for name in RATE_LIMIT_HEADERS:
+        value = headers.get(name)
+        if value is not None:
+            snapshot[name] = value
+    return snapshot
+
+
+def describe_rate_limit(snapshot):
+    """
+    Summary:
+        Render a rate-limit snapshot as one readable line for the log.
+
+    Parameters:
+        snapshot (dict): As returned by `rate_limit_snapshot`.
+
+    Returns:
+        str: A short summary naming what is left and when it resets, or a note
+            that the response said nothing.
+
+    Note:
+        Reports requests and tokens separately and on purpose. Seeing which of
+        the two is at zero is the whole point: a spent per-minute token budget
+        clears in seconds, while a spent daily request budget does not clear
+        until tomorrow, and pacing cannot help with the second.
+    """
+    if not snapshot:
+        return "no rate-limit headers reported"
+    parts = []
+    for kind in ("requests", "tokens"):
+        remaining = snapshot.get(f"x-ratelimit-remaining-{kind}")
+        if remaining is None:
+            continue
+        limit = snapshot.get(f"x-ratelimit-limit-{kind}", "?")
+        reset = snapshot.get(f"x-ratelimit-reset-{kind}", "?")
+        parts.append(f"{remaining}/{limit} {kind} left, resets in {reset}")
+    return "; ".join(parts) or "no rate-limit headers reported"
+
+
 # Pacing -------------------------------------------------------------------
 
 
@@ -458,8 +537,17 @@ class GroqClient:
         )
 
         if response.status_code == 429:
+            snapshot = rate_limit_snapshot(response)
+            retry_after = retry_after_seconds(response)
+            # Logged here, once, rather than by each stage: the stages report
+            # that they paused, but only this layer can see which ceiling did
+            # it. Without that, a wait of seconds and a wait of an hour look
+            # identical in the log.
+            log.warning("Groq rate limit reached (retry in about %ss): %s",
+                        retry_after, describe_rate_limit(snapshot))
             raise GroqRateLimited(
-                "Groq rate limit reached.", retry_after=retry_after_seconds(response)
+                "Groq rate limit reached.", retry_after=retry_after,
+                limits=snapshot,
             )
         if response.status_code >= 400:
             raise RuntimeError(

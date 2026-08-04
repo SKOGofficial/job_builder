@@ -304,6 +304,67 @@ class RetryAfterTests(unittest.TestCase):
         )
 
 
+class RateLimitHeaderTests(unittest.TestCase):
+    """A 429 must say which ceiling was reached, not just how long to wait.
+
+    Requests are limited per day and tokens per minute, so a retry-after of a
+    minute and one of an hour arrive as the same exception. Pacing fixes the
+    first and cannot touch the second, so the log has to tell them apart.
+    """
+
+    def _headers(self, **overrides):
+        headers = {
+            "x-ratelimit-limit-requests": "1000",
+            "x-ratelimit-remaining-requests": "994",
+            "x-ratelimit-reset-requests": "2m59s",
+            "x-ratelimit-limit-tokens": "12000",
+            "x-ratelimit-remaining-tokens": "0",
+            "x-ratelimit-reset-tokens": "7.66s",
+        }
+        headers.update(overrides)
+        return headers
+
+    def test_snapshot_keeps_only_what_was_reported(self):
+        response = FakeResponse(headers={
+            "x-ratelimit-remaining-tokens": "0", "content-type": "application/json",
+        })
+        self.assertEqual(llm.rate_limit_snapshot(response),
+                         {"x-ratelimit-remaining-tokens": "0"})
+
+    def test_description_names_both_ceilings(self):
+        described = llm.describe_rate_limit(
+            llm.rate_limit_snapshot(FakeResponse(headers=self._headers())))
+        self.assertIn("994/1000 requests left", described)
+        self.assertIn("0/12000 tokens left", described)
+        self.assertIn("7.66s", described)
+
+    def test_a_spent_daily_budget_is_distinguishable(self):
+        # The case pacing cannot help with: requests exhausted for the day.
+        described = llm.describe_rate_limit(llm.rate_limit_snapshot(
+            FakeResponse(headers=self._headers(
+                **{"x-ratelimit-remaining-requests": "0",
+                   "x-ratelimit-reset-requests": "5h21m",
+                   "x-ratelimit-remaining-tokens": "11500"}))))
+        self.assertIn("0/1000 requests left", described)
+        self.assertIn("5h21m", described)
+
+    def test_silent_response_says_so_rather_than_pretending(self):
+        self.assertEqual(llm.describe_rate_limit({}),
+                         "no rate-limit headers reported")
+
+    def test_the_exception_carries_the_snapshot(self):
+        response = FakeResponse(status_code=429, headers=self._headers())
+        client = llm.GroqClient(key="k", pacer=llm.Pacer(sleep=lambda _s: None))
+        client.poster = lambda url, **kwargs: response
+
+        with self.assertRaises(llm.GroqRateLimited) as caught:
+            client.classify({"sender": "a@b.com", "subject": "Hi", "body": "Text."})
+
+        self.assertEqual(caught.exception.limits["x-ratelimit-remaining-tokens"], "0")
+        self.assertEqual(caught.exception.limits["x-ratelimit-remaining-requests"],
+                         "994")
+
+
 class PacerTests(unittest.TestCase):
     def setUp(self):
         self.now = 0.0
