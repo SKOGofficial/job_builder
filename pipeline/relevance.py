@@ -16,10 +16,11 @@ than a wasted dollar, and `relevance_reason` is stored so the bar can be tuned
 against real data instead of guessed at.
 """
 
+import asyncio
 import json
 import logging
 
-from clients.llm_client import GroqNotConfigured
+from clients.llm_client import GroqNotConfigured, GroqRateLimited
 from utilities.mailstore import LEAD_NEW
 
 log = logging.getLogger(__name__)
@@ -82,13 +83,20 @@ def build_messages(profile_text, lead):
 
 
 class RelevanceScorer:
-    """Scores unscored leads against the stored profile."""
+    """Scores unscored leads against the stored profile.
 
-    def __init__(self, store, mail, client=None, threshold=DEFAULT_THRESHOLD):
+    Scoring is a blocking model call and goes to an executor; reading the
+    profile and storing the score stay on the calling thread, which owns the
+    sqlite connection.
+    """
+
+    def __init__(self, store, mail, client=None, threshold=DEFAULT_THRESHOLD,
+                 executor=None):
         self.store = store
         self.mail = mail
         self.client = client
         self.threshold = threshold
+        self.executor = executor or asyncio.to_thread
 
     def profile_text(self):
         """What the user said they are looking for.
@@ -103,15 +111,34 @@ class RelevanceScorer:
         ]
         return "\n\n".join(part for part in parts if part).strip()
 
-    def score_lead(self, lead):
-        """Score one lead. Returns the stored score, or None when unavailable."""
+    async def score_lead(self, lead):
+        """Score one lead. Returns the stored score, or None when unavailable.
+
+        Summary:
+            Ask the model how well one lead matches the stored profile and
+            record the score.
+
+        Parameters:
+            lead (Mapping): The lead row to score.
+
+        Returns:
+            float | None: The stored score, or None when there is no client or
+                the model returned nothing usable.
+
+        Raises:
+            GroqRateLimited: Propagated so `run` can stop the batch cleanly.
+        """
         if self.client is None:
             return None
-        result = self.client.complete_json(
-            build_messages(self.profile_text(), lead),
+        # The profile read must happen here, on the connection-owning thread,
+        # not inside the executor call below.
+        messages = build_messages(self.profile_text(), lead)
+        result = await self.executor(
+            self.client.complete_json,
+            messages,
             parse_score,
             {"score": None, "reason": "Model returned no choices."},
-            max_tokens=200,
+            200,
         )
         if result["score"] is None:
             # Leave it unscored so a later cycle retries, rather than baking in
@@ -121,17 +148,42 @@ class RelevanceScorer:
         self.mail.set_lead_relevance(lead["id"], result["score"], result["reason"])
         return result["score"]
 
-    def run(self, limit=50):
-        """Score the backlog. Returns how many were scored."""
+    async def run(self, limit=50):
+        """Score the backlog. Returns how many were scored.
+
+        Summary:
+            Score every lead still awaiting a relevance score, stopping cleanly
+            if the model's rate limit is reached.
+
+        Parameters:
+            limit (int): Most leads to score in one pass.
+
+        Returns:
+            int: How many leads were scored.
+
+        Note:
+            A rate limit ends the pass rather than failing it. Scores already
+            written are kept, and the leads not reached stay unscored, so the
+            next cycle picks them up with a fresh token budget.
+        """
         if self.client is None:
             log.info("Relevance scoring skipped: no model client")
             return 0
         scored = 0
         for lead in self.mail.leads_awaiting_relevance(limit):
             try:
-                if self.score_lead(lead) is not None:
+                if await self.score_lead(lead) is not None:
                     scored += 1
             except GroqNotConfigured:
+                break
+            except GroqRateLimited as exc:
+                # Routine, not a failure: log it as the other stages do rather
+                # than letting the generic handler below print a traceback.
+                log.info(
+                    "Relevance scoring paused by the rate limit after %d "
+                    "lead(s); retrying next cycle, in about %ss",
+                    scored, exc.retry_after,
+                )
                 break
             except Exception:
                 log.exception("Relevance scoring failed for lead %s", lead["id"])

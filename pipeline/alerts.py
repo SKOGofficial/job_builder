@@ -15,6 +15,7 @@ Two guards matter here:
   and every metric that divides by application count becomes meaningless.
 """
 
+import asyncio
 import logging
 
 from clients.llm_client import GroqRateLimited
@@ -26,14 +27,39 @@ log = logging.getLogger(__name__)
 
 
 class AlertHandler:
-    def __init__(self, store, mail, client=None):
+    """Turns alert emails into leads.
+
+    Parsing an alert means a blocking model call, and this runs on the same
+    event loop as the web UI, so that call goes to an executor. Everything
+    after it is database work and stays on the calling thread, which is the one
+    that owns the sqlite connection.
+    """
+
+    def __init__(self, store, mail, client=None, executor=None):
         self.store = store
         self.mail = mail
         self.client = client
+        self.executor = executor or asyncio.to_thread
 
-    def handle(self, message):
-        """Process one alert email. Returns (created, skipped, linked)."""
-        postings = parse_alert(dict(message), self.client)
+    async def handle(self, message):
+        """Process one alert email. Returns (created, skipped, linked).
+
+        Summary:
+            Extract every posting from one alert email and record the ones not
+            already applied to as leads.
+
+        Parameters:
+            message (Mapping): The stored message row to process.
+
+        Returns:
+            tuple[int, int, int]: Leads created, postings skipped because they
+                are already applied to, and message links written.
+
+        Raises:
+            GroqRateLimited: Propagated from parsing so `run` can stop the
+                batch cleanly rather than logging a false parse failure.
+        """
+        postings = await self.executor(parse_alert, dict(message), self.client)
         if not postings:
             log.info("No postings extracted from alert %s",
                      message["gmail_message_id"])
@@ -77,7 +103,7 @@ class AlertHandler:
                  message["gmail_message_id"], created, skipped)
         return created, skipped, linked
 
-    def run(self, limit=50):
+    async def run(self, limit=50):
         """Process every alert email that has not been linked yet.
 
         Summary:
@@ -99,7 +125,7 @@ class AlertHandler:
         totals = [0, 0, 0]
         for message in self._pending(limit):
             try:
-                created, skipped, linked = self.handle(message)
+                created, skipped, linked = await self.handle(message)
             except GroqRateLimited as exc:
                 log.info(
                     "Alert handling paused by the rate limit after %d lead(s); "

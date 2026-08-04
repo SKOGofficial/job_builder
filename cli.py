@@ -152,14 +152,16 @@ def cmd_prepare(args):
     except Exception as exc:
         print(f"Research unavailable ({exc}).")
 
+    # The preparation stage is async so the web UI's event loop is not blocked
+    # by it. The CLI has no loop to protect, so it just drives one.
     preparer = LeadPreparer(store, mail, groq, research)
     if args.lead:
-        ok = preparer.prepare_now(args.lead)
+        ok = asyncio.run(preparer.prepare_now(args.lead))
         print("Prepared." if ok else "Could not prepare that lead.")
         store.close()
         return 0 if ok else 1
 
-    print(json.dumps(preparer.run(prepare_limit=args.max), indent=2))
+    print(json.dumps(asyncio.run(preparer.run(prepare_limit=args.max)), indent=2))
     store.close()
     return 0
 

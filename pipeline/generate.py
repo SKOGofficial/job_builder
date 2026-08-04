@@ -19,6 +19,7 @@ attempted only when a Typst or LaTeX binary is actually present. A homelab that
 never installed a TeX distribution still gets a working to-apply list.
 """
 
+import asyncio
 import html
 import logging
 import os
@@ -244,14 +245,22 @@ def render_pdf(markdown_path, pdf_path):
 
 
 class ArtifactBuilder:
-    """Research a lead, build its resume and CV, mark it ready."""
+    """Research a lead, build its resume and CV, mark it ready.
+
+    This runs on the event loop the web UI uses, so the two slow parts - the
+    research call and the render, which shells out to Typst - go to an
+    executor. Database access stays on the calling thread, which owns the
+    sqlite connection, so each method reads what it needs first, offloads, then
+    writes the result back.
+    """
 
     def __init__(self, store, mail, research_client=None,
-                 output_dir=DEFAULT_OUTPUT_DIR):
+                 output_dir=DEFAULT_OUTPUT_DIR, executor=None):
         self.store = store
         self.mail = mail
         self.research_client = research_client
         self.output_dir = output_dir
+        self.executor = executor or asyncio.to_thread
 
     def profile(self):
         get = self.store.get_profile_value
@@ -263,8 +272,28 @@ class ArtifactBuilder:
             "website": get("website", ""),
         }
 
-    def research_for(self, lead):
-        """Cached research, or a fresh call. Returns a payload dict."""
+    async def research_for(self, lead):
+        """Cached research, or a fresh call. Returns a payload dict.
+
+        Summary:
+            Return the stored research payload for a lead, calling the research
+            client and caching the result when there is none.
+
+        Parameters:
+            lead (Mapping): The lead to research.
+
+        Returns:
+            dict: The research payload, empty when no client is configured.
+
+        Raises:
+            SpendCeilingReached: From the research client when the budget is
+                spent.
+            ResearchNotConfigured: From the research client when it cannot run.
+
+        Note:
+            The cache lookup and the save both touch the database and so stay
+            on the calling thread; only the client call is offloaded.
+        """
         import json
 
         existing = self.mail.research_for(lead["identity_key"])
@@ -277,7 +306,8 @@ class ArtifactBuilder:
         if self.research_client is None:
             return {}
 
-        payload, input_tokens, output_tokens = self.research_client.research(lead)
+        payload, input_tokens, output_tokens = await self.executor(
+            self.research_client.research, lead)
         self.mail.save_research(
             lead["identity_key"],
             payload.get("company_summary", ""),
@@ -288,11 +318,37 @@ class ArtifactBuilder:
         )
         return payload
 
-    def build(self, lead):
-        """Produce artifacts for one lead. Returns the paths written."""
-        research = self.research_for(lead)
-        keywords = research.get("posting_keywords") or []
-        experiences = self.mail.list_experiences()
+    async def build(self, lead):
+        """Produce artifacts for one lead. Returns the paths written.
+
+        Summary:
+            Research a lead, render its resume and CV, and record where each
+            artifact was written.
+
+        Parameters:
+            lead (Mapping): The lead to build artifacts for.
+
+        Returns:
+            dict: Artifact kind to the path of the best format written, PDF
+                where Typst is available and HTML otherwise.
+
+        Raises:
+            ValueError: When there are no stored experiences to build from.
+            SpendCeilingReached: From the research client when the budget is
+                spent.
+            ResearchNotConfigured: From the research client when it cannot run.
+
+        Note:
+            Split into read, offload, write so the slow half - rendering, and
+            the Typst subprocess in particular - never runs on the event loop.
+            Every database call is on either side of that offload, never
+            inside it.
+        """
+        research = await self.research_for(lead)
+        # Plain dicts across the thread boundary, as elsewhere: a sqlite Row
+        # would tempt the worker into touching a connection it does not own.
+        experiences = [dict(row) for row in self.mail.list_experiences()]
+        profile = self.profile()
 
         if not experiences:
             raise ValueError(
@@ -301,8 +357,36 @@ class ArtifactBuilder:
             )
 
         directory = os.path.join(self.output_dir, lead["identity_key"])
+        written = await self.executor(
+            self._render, profile, dict(lead), experiences, research, directory)
+
+        model = getattr(self.research_client, "model", None)
+        for kind, path in written.items():
+            self.mail.save_artifact(lead["identity_key"], kind, path, model)
+
+        return written
+
+    def _render(self, profile, lead, experiences, research, directory):
+        """
+        Summary:
+            Render and write every artifact for one lead.
+
+        Parameters:
+            profile (dict): The user's contact details.
+            lead (dict): The lead being applied to.
+            experiences (list): Stored experience bullets to select from.
+            research (dict): The research payload, possibly empty.
+            directory (str): Where to write the files.
+
+        Returns:
+            dict: Artifact kind to the path of the best format written.
+
+        Note:
+            Touches no database, by design - this is the half that runs in a
+            worker thread, and the sqlite connection belongs to another one.
+        """
+        keywords = research.get("posting_keywords") or []
         os.makedirs(directory, exist_ok=True)
-        profile = self.profile()
         written = {}
 
         for kind, limit, heading in (
@@ -321,10 +405,7 @@ class ArtifactBuilder:
             pdf_path = render_pdf(markdown_path,
                                   os.path.join(directory, f"{kind}.pdf"))
 
-            best = pdf_path or html_path
-            self.mail.save_artifact(lead["identity_key"], kind, best,
-                                    getattr(self.research_client, "model", None))
-            written[kind] = best
+            written[kind] = pdf_path or html_path
 
         return written
 

@@ -14,6 +14,7 @@ calling thread and only network calls go to the executor.
 
 import logging
 
+from clients.llm_client import GroqRateLimited
 from pipeline.acknowledgements import AcknowledgementHandler
 from pipeline.alerts import AlertHandler
 from pipeline.resolver import JobResolver
@@ -141,8 +142,8 @@ class PipelineCycle:
                     executor=self.executor,
                 )
                 result["classified"] = await router.run(self.limits["classify"])
-                result["handled"] = self.dispatch(client)
-                result["prepared"] = self.prepare(client)
+                result["handled"] = await self.dispatch(client)
+                result["prepared"] = await self.prepare(client)
             else:
                 result["classified"] = {}
                 result["handled"] = {}
@@ -158,23 +159,40 @@ class PipelineCycle:
         self.last_result = result
         return result
 
-    def dispatch(self, client):
+    async def dispatch(self, client):
         """Hand classified messages to their category handler.
 
         Alerts first: an acknowledgement processed before the alert that
         surfaced the role would create a job directly instead of promoting a
         lead, losing the board metadata and the canonical apply URL.
+
+        Summary:
+            Run the alert, acknowledgement, and update handlers in order.
+
+        Parameters:
+            client (GroqClient): The model client the handlers extract with.
+
+        Returns:
+            dict: Counts under `leads_created`, `leads_skipped`,
+                `acknowledgements`, and `updates`.
+
+        Note:
+            Awaited rather than called directly. Each handler makes blocking
+            model calls, and this runs on the loop that serves the web UI, so a
+            synchronous call here froze the interface for as long as the batch
+            took - minutes, once the rate limit started forcing waits.
         """
         limit = self.limits["handle"]
-        created, skipped, _ = AlertHandler(
-            self.store, self.mail, client).run(limit)
+        created, skipped, _ = await AlertHandler(
+            self.store, self.mail, client, executor=self.executor).run(limit)
 
-        acknowledged = AcknowledgementHandler(
-            self.store, self.mail, self.resolver, client).run(limit)
-
-        updated = UpdateHandler(
+        acknowledged = await AcknowledgementHandler(
             self.store, self.mail, self.resolver, client,
-            threshold=self.threshold).run(limit)
+            executor=self.executor).run(limit)
+
+        updated = await UpdateHandler(
+            self.store, self.mail, self.resolver, client,
+            threshold=self.threshold, executor=self.executor).run(limit)
 
         return {
             "leads_created": created,
@@ -183,20 +201,39 @@ class PipelineCycle:
             "updates": updated,
         }
 
-    def prepare(self, client):
+    async def prepare(self, client):
         """Score new leads and build artifacts for the ones worth it.
 
         Degrades in two independent steps. Without the research client, leads
         still get scored and simply wait at `new`; without the Groq client this
         is not reached at all. Neither absence stops the rest of the pipeline.
+
+        Summary:
+            Run the scoring and artifact-building stage.
+
+        Parameters:
+            client (GroqClient): The model client used to score leads.
+
+        Returns:
+            dict: Counts under `scored`, `prepared`, and `failed`; empty when
+                the stage could not run.
         """
         from pipeline.prepare import LeadPreparer
 
         research = self._research_client()
         preparer = LeadPreparer(self.store, self.mail, client, research,
-                                threshold=self.relevance_threshold)
+                                threshold=self.relevance_threshold,
+                                executor=self.executor)
         try:
-            return preparer.run(prepare_limit=self.limits["prepare"])
+            return await preparer.run(prepare_limit=self.limits["prepare"])
+        except GroqRateLimited as exc:
+            # Routine. Without this the stage reported a traceback and an
+            # error for what is simply "out of tokens, resume next cycle".
+            log.info(
+                "Lead preparation paused by the rate limit; retrying next "
+                "cycle, in about %ss", exc.retry_after,
+            )
+            return {}
         except Exception:
             log.exception("Lead preparation stage failed")
             return {}

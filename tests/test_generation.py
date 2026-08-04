@@ -45,6 +45,11 @@ class FakeGroq:
         return parser(self.replies.pop(0))
 
 
+async def immediate(func, *args):
+    """Executor stand-in that calls straight through, no thread involved."""
+    return func(*args)
+
+
 def make_app():
     store = JobStore(":memory:")
     return store, MailStore(store.conn)
@@ -143,7 +148,7 @@ class TestSpendLimiter(unittest.TestCase):
         self.assertEqual(SpendLimiter(mail, ceiling=1000).remaining(), 300)
 
 
-class TestRelevance(unittest.TestCase):
+class TestRelevance(unittest.IsolatedAsyncioTestCase):
     def test_parse_score_clamps(self):
         self.assertEqual(parse_score('{"score": 5, "reason": "x"}')["score"], 1.0)
         self.assertEqual(parse_score('{"score": -2, "reason": "x"}')["score"], 0.0)
@@ -152,23 +157,25 @@ class TestRelevance(unittest.TestCase):
         self.assertIsNone(parse_score("not json")["score"])
         self.assertIsNone(parse_score('{"score": "high"}')["score"])
 
-    def test_scoring_stores_score_and_reason(self):
+    async def test_scoring_stores_score_and_reason(self):
         store, mail = make_app()
         lead = add_lead(mail)
         scorer = RelevanceScorer(store, mail,
-                                 FakeGroq(['{"score": 0.82, "reason": "python backend"}']))
-        self.assertEqual(scorer.score_lead(lead), 0.82)
+                                 FakeGroq(['{"score": 0.82, "reason": "python backend"}']),
+                                 executor=immediate)
+        self.assertEqual(await scorer.score_lead(lead), 0.82)
 
         refreshed = mail.lead(lead["id"])
         self.assertAlmostEqual(refreshed["relevance_score"], 0.82)
         self.assertEqual(refreshed["relevance_reason"], "python backend")
 
-    def test_unscorable_lead_is_left_for_a_retry(self):
+    async def test_unscorable_lead_is_left_for_a_retry(self):
         # Baking in a wrong score would suppress the lead forever.
         store, mail = make_app()
         lead = add_lead(mail)
-        scorer = RelevanceScorer(store, mail, FakeGroq(["not json"]))
-        self.assertIsNone(scorer.score_lead(lead))
+        scorer = RelevanceScorer(store, mail, FakeGroq(["not json"]),
+                                 executor=immediate)
+        self.assertIsNone(await scorer.score_lead(lead))
         self.assertIsNone(mail.lead(lead["id"])["relevance_score"])
 
     def test_gate_selects_only_leads_above_the_bar(self):
@@ -182,10 +189,10 @@ class TestRelevance(unittest.TestCase):
         selected = [row["title"] for row in scorer.worth_preparing()]
         self.assertEqual(selected, ["Backend Engineer"])
 
-    def test_no_client_scores_nothing_rather_than_failing(self):
+    async def test_no_client_scores_nothing_rather_than_failing(self):
         store, mail = make_app()
         add_lead(mail)
-        self.assertEqual(RelevanceScorer(store, mail, None).run(), 0)
+        self.assertEqual(await RelevanceScorer(store, mail, None).run(), 0)
 
 
 class TestBulletSelection(unittest.TestCase):
@@ -250,7 +257,7 @@ class TestRendering(unittest.TestCase):
         self.assertIn("Experience", text)
 
 
-class TestArtifactBuilder(unittest.TestCase):
+class TestArtifactBuilder(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.store, self.mail = make_app()
         add_experiences(self.mail)
@@ -267,26 +274,26 @@ class TestArtifactBuilder(unittest.TestCase):
         return ResearchClient(key="x", model="claude-opus-5",
                               caller=lambda prompt: (payload, 100, 200))
 
-    def test_builds_resume_and_cv(self):
+    async def test_builds_resume_and_cv(self):
         builder = ArtifactBuilder(self.store, self.mail, self._client(),
-                                  output_dir=self.directory)
-        written = builder.build(self.lead)
+                                  output_dir=self.directory, executor=immediate)
+        written = await builder.build(self.lead)
         self.assertIn("resume", written)
         self.assertIn("cv", written)
         for path in written.values():
             self.assertTrue(os.path.exists(path), path)
 
-    def test_artifacts_are_keyed_on_identity(self):
+    async def test_artifacts_are_keyed_on_identity(self):
         # Not on job_id: a lead has none until promotion, and keying on the
         # identity means nothing moves when it is promoted.
         builder = ArtifactBuilder(self.store, self.mail, self._client(),
-                                  output_dir=self.directory)
-        builder.build(self.lead)
+                                  output_dir=self.directory, executor=immediate)
+        await builder.build(self.lead)
         rows = self.mail.artifacts_for(self.lead["identity_key"])
         self.assertEqual({row["kind"] for row in rows}, {"resume", "cv"})
         self.assertIn(self.lead["identity_key"], rows[0]["path"])
 
-    def test_research_is_cached_not_repeated(self):
+    async def test_research_is_cached_not_repeated(self):
         calls = []
 
         def caller(prompt):
@@ -295,22 +302,22 @@ class TestArtifactBuilder(unittest.TestCase):
 
         client = ResearchClient(key="x", caller=caller)
         builder = ArtifactBuilder(self.store, self.mail, client,
-                                  output_dir=self.directory)
-        builder.build(self.lead)
-        builder.build(self.lead)
+                                  output_dir=self.directory, executor=immediate)
+        await builder.build(self.lead)
+        await builder.build(self.lead)
         self.assertEqual(len(calls), 1, "second build must reuse stored research")
 
-    def test_no_experiences_is_a_clear_error(self):
+    async def test_no_experiences_is_a_clear_error(self):
         store, mail = make_app()
         lead = add_lead(mail)
         builder = ArtifactBuilder(store, mail, self._client(),
-                                  output_dir=self.directory)
+                                  output_dir=self.directory, executor=immediate)
         with self.assertRaises(ValueError) as caught:
-            builder.build(lead)
+            await builder.build(lead)
         self.assertIn("experience", str(caught.exception).lower())
 
 
-class TestLeadPreparer(unittest.TestCase):
+class TestLeadPreparer(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.store, self.mail = make_app()
         add_experiences(self.mail)
@@ -320,53 +327,53 @@ class TestLeadPreparer(unittest.TestCase):
         payload = json.dumps({"posting_keywords": ["python"]})
         return ResearchClient(key="x", caller=lambda p: (payload, 10, 20))
 
-    def test_scores_then_prepares(self):
+    async def test_scores_then_prepares(self):
         add_lead(self.mail)
         preparer = LeadPreparer(
             self.store, self.mail,
             FakeGroq(['{"score": 0.9, "reason": "great fit"}']),
-            self._research(), output_dir=self.directory)
-        result = preparer.run()
+            self._research(), output_dir=self.directory, executor=immediate)
+        result = await preparer.run()
         self.assertEqual(result["scored"], 1)
         self.assertEqual(result["prepared"], 1)
 
         leads = self.mail.list_leads()
         self.assertEqual(leads[0]["status"], LEAD_READY)
 
-    def test_low_scoring_lead_is_not_prepared(self):
+    async def test_low_scoring_lead_is_not_prepared(self):
         add_lead(self.mail)
         preparer = LeadPreparer(
             self.store, self.mail,
             FakeGroq(['{"score": 0.05, "reason": "wrong field"}']),
-            self._research(), output_dir=self.directory)
-        result = preparer.run()
+            self._research(), output_dir=self.directory, executor=immediate)
+        result = await preparer.run()
         self.assertEqual(result["prepared"], 0)
         self.assertEqual(self.mail.list_leads()[0]["status"], LEAD_NEW)
 
-    def test_failed_generation_never_reaches_ready(self):
+    async def test_failed_generation_never_reaches_ready(self):
         # A ready lead whose resume link is dead is worse than no lead.
         store, mail = make_app()  # no experiences -> build raises
         add_lead(mail)
         preparer = LeadPreparer(
             store, mail, FakeGroq(['{"score": 0.9, "reason": "fit"}']),
-            self._research(), output_dir=self.directory)
-        result = preparer.run()
+            self._research(), output_dir=self.directory, executor=immediate)
+        result = await preparer.run()
 
         self.assertEqual(result["failed"], 1)
         lead = mail.list_leads()[0]
         self.assertNotEqual(lead["status"], LEAD_READY)
         self.assertTrue(lead["prepare_error"])
 
-    def test_prepare_now_bypasses_the_gate(self):
+    async def test_prepare_now_bypasses_the_gate(self):
         # The escape hatch for a threshold set slightly wrong.
         lead = add_lead(self.mail)
         self.mail.set_lead_relevance(lead["id"], 0.01, "scored too low")
         preparer = LeadPreparer(self.store, self.mail, None, self._research(),
-                                output_dir=self.directory)
-        self.assertTrue(preparer.prepare_now(lead["id"]))
+                                output_dir=self.directory, executor=immediate)
+        self.assertTrue(await preparer.prepare_now(lead["id"]))
         self.assertEqual(self.mail.lead(lead["id"])["status"], LEAD_READY)
 
-    def test_budget_exhaustion_stops_cleanly(self):
+    async def test_budget_exhaustion_stops_cleanly(self):
         add_lead(self.mail, "Backend Engineer", "Stripe")
         add_lead(self.mail, "Platform Engineer", "Stripe")
         self.mail.save_research("SPENT", "s", {}, input_tokens=1,
@@ -377,8 +384,8 @@ class TestLeadPreparer(unittest.TestCase):
             self.store, self.mail,
             FakeGroq(['{"score": 0.9, "reason": "fit"}',
                       '{"score": 0.9, "reason": "fit"}']),
-            research, output_dir=self.directory)
-        result = preparer.run()
+            research, output_dir=self.directory, executor=immediate)
+        result = await preparer.run()
 
         self.assertEqual(result["prepared"], 0)
         self.assertEqual(result["failed"], 0, "budget stop is not a lead failure")
