@@ -56,6 +56,14 @@ LEAD_OPEN_STATUSES = (LEAD_READY, LEAD_PREPARING, LEAD_NEW)
 
 
 def _now():
+    """
+    Summary:
+        Current local time as a second-precision ISO-8601 string, the format
+        every timestamp column in these tables stores.
+
+    Returns:
+        str: The timestamp, for example ``2026-08-03T16:47:09``.
+    """
     return datetime.now().isoformat(timespec="seconds")
 
 
@@ -65,6 +73,22 @@ def parse_received(raw):
     Gmail hands back whatever the sender wrote, which includes malformed dates
     and exotic timezones. A message with an unparseable date is still worth
     keeping, so this degrades to None rather than raising and losing the row.
+
+    Summary:
+        Convert an RFC 2822 Date header into a sortable Unix timestamp.
+
+    Parameters:
+        raw (str | None): The raw Date header as the sender wrote it. Empty or
+            None is accepted.
+
+    Returns:
+        int | None: Seconds since the epoch, or None when the header is
+            missing, unparseable, or outside the range the platform can
+            represent.
+
+    Note:
+        Every failure path returns None instead of raising. A message with an
+        unreadable date still belongs in the mirror; it just sorts last.
     """
     if not raw:
         return None
@@ -84,11 +108,41 @@ class MailStore:
     """Pipeline-side persistence. Shares `JobStore`'s connection."""
 
     def __init__(self, conn):
+        """
+        Summary:
+            Wrap an existing SQLite connection with the pipeline-side tables.
+
+        Parameters:
+            conn (sqlite3.Connection): The connection `JobStore` already owns.
+                Shared rather than opened separately so an operation spanning
+                both stores - promoting a lead into a job - stays atomic.
+
+        Note:
+            The schema is not created here. `JobStore.init_db` owns migrations
+            for both halves.
+        """
         self.conn = conn
 
     # --- messages ----------------------------------------------------------
 
     def has_message(self, gmail_message_id):
+        """
+        Summary:
+            Report whether a Gmail message is already in the mirror.
+
+        Parameters:
+            gmail_message_id (str): The Gmail message ID to check.
+
+        Returns:
+            bool: True when the message has been stored.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Single-message form. Use `known_message_ids` when checking a whole
+            sync page, which is one query instead of one per message.
+        """
         row = self.conn.execute(
             "SELECT 1 FROM messages WHERE gmail_message_id = ?", (gmail_message_id,)
         ).fetchone()
@@ -99,6 +153,24 @@ class MailStore:
 
         Bulk form so a sync pass can skip everything it has seen in one query
         rather than one round trip per message.
+
+        Summary:
+            Return which of the given Gmail message IDs are already stored.
+
+        Parameters:
+            candidate_ids (Iterable[str]): IDs to test. Consumed once, so a
+                generator is fine.
+
+        Returns:
+            set[str]: The subset already present. Empty when `candidate_ids`
+                is empty or none are known.
+
+        Raises:
+            sqlite3.Error: If a query fails.
+
+        Note:
+            Queried in chunks of 500 because SQLite caps host parameters at
+            999 on older builds, and a sync page can exceed that.
         """
         ids = list(candidate_ids)
         if not ids:
@@ -121,6 +193,29 @@ class MailStore:
         Bodies are a separate call (`store_body`) made only after the rough
         filter has passed the message, so a dropped message costs one metadata
         fetch and nothing more.
+
+        Summary:
+            Insert a message's headers into the mirror, ignoring one already
+            stored.
+
+        Parameters:
+            header (dict): Header fields from Gmail. `id` is required;
+                `thread_id`, `sender`, `subject`, `date`, `labels`,
+                `list_unsubscribe`, and `snippet` are optional and default to
+                empty. `labels` is stored as a JSON array.
+
+        Returns:
+            bool: True when a new row was inserted, False when the message was
+                already mirrored.
+
+        Raises:
+            KeyError: If `header` has no `id`.
+            sqlite3.Error: If the insert fails.
+
+        Note:
+            Does not commit - the sync pass batches many of these into one
+            transaction. An unparseable Date is stored as-is with a NULL
+            `received_ts`; see `parse_received`.
         """
         received = header.get("date")
         cursor = self.conn.execute(
@@ -147,13 +242,49 @@ class MailStore:
         return cursor.rowcount > 0
 
     def set_filter_verdict(self, gmail_message_id, verdict):
+        """
+        Summary:
+            Record what the rough filter decided about a message.
+
+        Parameters:
+            gmail_message_id (str): The message being marked.
+            verdict (str): `VERDICT_PASSED` to send it on for a body fetch, or
+                a rule name identifying why it was dropped. The rule names are
+                what `filter_stats` counts.
+
+        Raises:
+            sqlite3.Error: If the update fails.
+
+        Note:
+            Does not commit. An unknown message ID updates nothing and does
+            not raise.
+        """
         self.conn.execute(
             "UPDATE messages SET filter_verdict = ? WHERE gmail_message_id = ?",
             (verdict, gmail_message_id),
         )
 
     def messages_awaiting_body(self, limit=50):
-        """Passed the rough filter, body not downloaded yet."""
+        """Passed the rough filter, body not downloaded yet.
+
+        Summary:
+            List messages that need their body fetched.
+
+        Parameters:
+            limit (int): Maximum rows to return. Defaults to 50, sized for one
+                fetch batch.
+
+        Returns:
+            list[sqlite3.Row]: Messages with a passing filter verdict and no
+                stored body, newest first.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Newest first here, unlike `messages_awaiting_classification`.
+            Recent mail is the mail worth acting on quickly.
+        """
         return self.conn.execute(
             """
             SELECT * FROM messages
@@ -165,6 +296,23 @@ class MailStore:
         ).fetchall()
 
     def store_body(self, gmail_message_id, body, snippet=None):
+        """
+        Summary:
+            Attach fetched body text to a mirrored message.
+
+        Parameters:
+            gmail_message_id (str): The message to update.
+            body (str): The extracted plain-text body.
+            snippet (str | None): Refreshed snippet. None keeps the existing
+                one rather than clearing it.
+
+        Raises:
+            sqlite3.Error: If the update fails.
+
+        Note:
+            Does not commit. Setting `body_fetched_at` is what removes the row
+            from `messages_awaiting_body`.
+        """
         self.conn.execute(
             """
             UPDATE messages
@@ -181,6 +329,24 @@ class MailStore:
 
         Ordered oldest first so a resumed backfill makes forward progress
         through the backlog rather than re-walking the newest mail.
+
+        Summary:
+            List messages that have a body but no category yet.
+
+        Parameters:
+            limit (int | None): Maximum rows to return. None means no limit.
+
+        Returns:
+            list[sqlite3.Row]: Unclassified messages with non-empty body text,
+                oldest first.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Messages whose body is empty are excluded rather than skipped
+            later - there is nothing for the model to read, so sending them
+            would spend quota for a guaranteed non-answer.
         """
         sql = """
             SELECT * FROM messages
@@ -194,6 +360,17 @@ class MailStore:
         return self.conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
 
     def count_awaiting_classification(self):
+        """
+        Summary:
+            Count the messages waiting to be classified.
+
+        Returns:
+            int: The size of the classification backlog, shown as a badge in
+                Settings.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         return self.conn.execute(
             """
             SELECT COUNT(*) AS n FROM messages
@@ -202,6 +379,25 @@ class MailStore:
         ).fetchone()["n"]
 
     def record_category(self, gmail_message_id, category, confidence, reason):
+        """
+        Summary:
+            Store the category the model assigned to a message.
+
+        Parameters:
+            gmail_message_id (str): The message that was classified.
+            category (str): One of `CATEGORIES` - alert, update,
+                acknowledgement, or irrelevant.
+            confidence (float): Model confidence, 0.0 to 1.0.
+            reason (str): The model's short justification.
+
+        Raises:
+            sqlite3.Error: If the update fails.
+
+        Note:
+            Does not commit. Stamping `classified_at` is what removes the row
+            from `messages_awaiting_classification`, so a cycle interrupted by
+            a rate limit resumes rather than repeating.
+        """
         self.conn.execute(
             """
             UPDATE messages
@@ -213,11 +409,39 @@ class MailStore:
         )
 
     def message(self, gmail_message_id):
+        """
+        Summary:
+            Fetch one mirrored message by its Gmail ID.
+
+        Parameters:
+            gmail_message_id (str): The message to fetch.
+
+        Returns:
+            sqlite3.Row | None: The full message row, or None when not
+                mirrored.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         return self.conn.execute(
             "SELECT * FROM messages WHERE gmail_message_id = ?", (gmail_message_id,)
         ).fetchone()
 
     def messages_by_category(self, category, limit=100):
+        """
+        Summary:
+            List mirrored messages carrying a given category.
+
+        Parameters:
+            category (str): One of `CATEGORIES`.
+            limit (int): Maximum rows to return. Defaults to 100.
+
+        Returns:
+            list[sqlite3.Row]: Matching messages, newest first.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         return self.conn.execute(
             """
             SELECT * FROM messages WHERE category = ?
@@ -234,6 +458,17 @@ class MailStore:
         Worth surfacing: if the denylist rule stops growing, the "not job
         related" button is not discoverable enough, and the LLM is being paid
         to reject the same newsletters every day.
+
+        Summary:
+            Count mirrored messages grouped by rough-filter verdict.
+
+        Returns:
+            dict[str, int]: Counts keyed by verdict, largest first. Messages
+                the filter has not reached yet are counted under
+                `unfiltered`.
+
+        Raises:
+            sqlite3.Error: If the query fails.
         """
         rows = self.conn.execute(
             """
@@ -244,6 +479,22 @@ class MailStore:
         return {row["verdict"]: row["count"] for row in rows}
 
     def category_stats(self):
+        """
+        Summary:
+            Count mirrored messages grouped by assigned category.
+
+        Returns:
+            dict[str, int]: Counts keyed by category, largest first. Messages
+                with no category yet are counted under `unclassified`.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            A large `irrelevant` count is expected, not a fault. The rough
+            filter deliberately passes doubtful mail through for the model to
+            reject.
+        """
         rows = self.conn.execute(
             """
             SELECT COALESCE(category, 'unclassified') AS category, COUNT(*) AS count
@@ -264,6 +515,27 @@ class MailStore:
 
         Returns the number of bodies cleared. Callers should VACUUM afterwards
         or the file never shrinks.
+
+        Summary:
+            Clear stored bodies for irrelevant, unlinked mail older than the
+            retention window.
+
+        Parameters:
+            older_than_days (int): Retention window in days. Defaults to 30.
+                A message with no parseable date is treated as old enough.
+
+        Returns:
+            int: How many bodies were cleared.
+
+        Raises:
+            sqlite3.Error: If the update or the commit fails.
+
+        Note:
+            Commits. Only `irrelevant` bodies are eligible, and a message
+            linked to any identity is never pruned however old - those are the
+            per-role timeline the user reads. Clearing a body does not make
+            the message eligible for re-fetch, because `body_fetched_at` and
+            the category are both kept.
         """
         cutoff = int((datetime.now() - timedelta(days=older_than_days)).timestamp())
         cursor = self.conn.execute(
@@ -284,7 +556,33 @@ class MailStore:
 
     def link_message(self, gmail_message_id, identity_key, link_type,
                      confidence=None, resolved_by=None):
-        """Attach a message to a job identity. Idempotent."""
+        """Attach a message to a job identity. Idempotent.
+
+        Summary:
+            Link a mirrored message to a job identity.
+
+        Parameters:
+            gmail_message_id (str): The message to attach.
+            identity_key (str): The identity to attach it to. Deliberately not
+                a `jobs.id` or `job_leads.id` - a lead promoted to a real
+                application keeps its identity, so the link survives with no
+                re-linking pass.
+            link_type (str): What the message is to the job, for example the
+                acknowledgement or the rejection.
+            confidence (float | None): Resolver confidence, when automatic.
+            resolved_by (str | None): What made the link - a resolver stage
+                name, or a marker for a manual link from the review queue.
+
+        Returns:
+            bool: True when the link was created, False when it already
+                existed. Re-running the resolver is therefore free.
+
+        Raises:
+            sqlite3.Error: If the insert fails.
+
+        Note:
+            Does not commit.
+        """
         cursor = self.conn.execute(
             """
             INSERT OR IGNORE INTO message_links (
@@ -298,7 +596,26 @@ class MailStore:
         return cursor.rowcount > 0
 
     def unlink_message(self, gmail_message_id, identity_key):
-        """Undo a link. Needed because an auto-link can be wrong."""
+        """Undo a link. Needed because an auto-link can be wrong.
+
+        Summary:
+            Remove the link between a message and a job identity.
+
+        Parameters:
+            gmail_message_id (str): The linked message.
+            identity_key (str): The identity to detach it from.
+
+        Returns:
+            bool: True when a link was removed, False when there was none.
+
+        Raises:
+            sqlite3.Error: If the delete or the commit fails.
+
+        Note:
+            Commits. Unlinking returns the message to `unlinked_messages`, and
+            also makes it eligible for body pruning again if it is
+            `irrelevant` and old enough.
+        """
         cursor = self.conn.execute(
             "DELETE FROM message_links WHERE gmail_message_id = ? AND identity_key = ?",
             (gmail_message_id, identity_key),
@@ -307,6 +624,21 @@ class MailStore:
         return cursor.rowcount > 0
 
     def links_for_message(self, gmail_message_id):
+        """
+        Summary:
+            List every identity a message is attached to.
+
+        Parameters:
+            gmail_message_id (str): The message to inspect.
+
+        Returns:
+            list[sqlite3.Row]: Link rows. Usually zero or one, but a digest
+                naming several roles can legitimately link to several
+                identities.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         return self.conn.execute(
             "SELECT * FROM message_links WHERE gmail_message_id = ?", (gmail_message_id,)
         ).fetchall()
@@ -316,6 +648,26 @@ class MailStore:
 
         This is what the job detail page renders: acknowledgement, then OA
         invite, then rejection, in the order they arrived.
+
+        Summary:
+            Return every message linked to an identity, oldest first.
+
+        Parameters:
+            identity_key (str): The job identity whose timeline is wanted.
+
+        Returns:
+            list[sqlite3.Row]: Message rows joined to their link, each
+                carrying `link_type`, `confidence`, and `resolved_by`
+                alongside the message columns. Ties on timestamp break on
+                message ID so the order is stable between renders.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            A message whose body was pruned still appears here with its
+            headers, but linked messages are exempt from pruning, so in
+            practice this only affects rows linked after a prune.
         """
         return self.conn.execute(
             """
@@ -333,6 +685,23 @@ class MailStore:
 
         The review queue. Without it these messages are classified, stored, and
         attached to nothing - which looks exactly like the pipeline working.
+
+        Summary:
+            List job-related messages that are attached to no identity.
+
+        Parameters:
+            limit (int): Maximum rows to return. Defaults to 100.
+
+        Returns:
+            list[sqlite3.Row]: Messages in a job category with no link, newest
+                first.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            `irrelevant` messages are excluded - they are supposed to be
+            unlinked, so including them would bury the real queue.
         """
         marks = ", ".join("?" for _ in JOB_CATEGORIES)
         return self.conn.execute(
@@ -347,6 +716,16 @@ class MailStore:
         ).fetchall()
 
     def count_unlinked(self):
+        """
+        Summary:
+            Count job-related messages the resolver could not place.
+
+        Returns:
+            int: The size of the review queue, shown as a navigation badge.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         marks = ", ".join("?" for _ in JOB_CATEGORIES)
         return self.conn.execute(
             f"""
@@ -366,6 +745,32 @@ class MailStore:
         boards over three days produces one row. A repeat sighting refreshes
         the apply URL (the older one may have expired) but never resets status
         or relevance - that would resurrect a lead the user dismissed.
+
+        Summary:
+            Create a lead, or refresh the source URLs of one that already
+            exists.
+
+        Parameters:
+            lead (dict): The lead fields. `identity_key` and `title` are
+                required; `identity_scheme`, `company`, `location`,
+                `apply_url`, `tracking_url`, `board`, `board_job_id`,
+                `source_message_id`, and `status` are optional. `status`
+                defaults to `LEAD_NEW`.
+
+        Returns:
+            bool: True when a new lead was created, False when an existing one
+                was refreshed.
+
+        Raises:
+            KeyError: If `identity_key` or `title` is absent.
+            sqlite3.Error: If the insert or update fails.
+
+        Note:
+            Does not commit. On the refresh path only the two URLs and
+            `updated_at` are touched, and each is written with COALESCE so a
+            None never erases a stored value. Status and relevance are never
+            reset - doing so would resurrect a dismissed lead every time the
+            posting was re-advertised.
         """
         now = _now()
         cursor = self.conn.execute(
@@ -408,17 +813,61 @@ class MailStore:
         return cursor.rowcount > 0
 
     def lead_by_identity(self, identity_key):
+        """
+        Summary:
+            Fetch a lead by its job identity.
+
+        Parameters:
+            identity_key (str): The identity to look up. Unique in this table.
+
+        Returns:
+            sqlite3.Row | None: The lead, or None when the identity has no
+                lead.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         return self.conn.execute(
             "SELECT * FROM job_leads WHERE identity_key = ?", (identity_key,)
         ).fetchone()
 
     def lead(self, lead_id):
+        """
+        Summary:
+            Fetch a lead by its row ID.
+
+        Parameters:
+            lead_id (int): The `job_leads.id` primary key.
+
+        Returns:
+            sqlite3.Row | None: The lead, or None when the ID is unknown.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         return self.conn.execute(
             "SELECT * FROM job_leads WHERE id = ?", (lead_id,)
         ).fetchone()
 
     def list_leads(self, statuses=LEAD_OPEN_STATUSES):
-        """The to-apply list. Ready rows first, then newest."""
+        """The to-apply list. Ready rows first, then newest.
+
+        Summary:
+            List leads, ordered so the ones the user can act on come first.
+
+        Parameters:
+            statuses (tuple[str, ...] | None): Statuses to include. Defaults
+                to `LEAD_OPEN_STATUSES`. Pass None for every lead regardless
+                of status, which is what the "show dismissed" view uses.
+
+        Returns:
+            list[sqlite3.Row]: Matching leads. Filtered results are ordered
+                `ready` first, then by relevance score descending, then
+                newest. The unfiltered branch is newest-first only.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         if statuses is None:
             return self.conn.execute(
                 "SELECT * FROM job_leads ORDER BY created_at DESC"
@@ -436,6 +885,26 @@ class MailStore:
         ).fetchall()
 
     def set_lead_status(self, lead_id, status, error=None):
+        """
+        Summary:
+            Move a lead to a new status, optionally recording why preparation
+            failed.
+
+        Parameters:
+            lead_id (int): The `job_leads.id` to update.
+            status (str): One of `LEAD_STATUSES`.
+            error (str | None): Failure detail to show on the lead. Passing
+                None clears any previous error, so a successful retry does not
+                leave a stale message behind.
+
+        Raises:
+            sqlite3.Error: If the update or the commit fails.
+
+        Note:
+            Commits. `prepare_error` is written unconditionally rather than
+            with COALESCE, which is what makes the clear-on-success behaviour
+            work.
+        """
         self.conn.execute(
             "UPDATE job_leads SET status = ?, prepare_error = ?, updated_at = ? WHERE id = ?",
             (status, error, _now(), lead_id),
@@ -443,6 +912,25 @@ class MailStore:
         self.conn.commit()
 
     def set_lead_relevance(self, lead_id, score, reason):
+        """
+        Summary:
+            Record how well a lead matches the user's profile.
+
+        Parameters:
+            lead_id (int): The `job_leads.id` to score.
+            score (float): The relevance score. Compared against the
+                preparation threshold by `leads_awaiting_preparation`, not
+                here.
+            reason (str): The model's justification, shown on the lead.
+
+        Raises:
+            sqlite3.Error: If the update or the commit fails.
+
+        Note:
+            Commits. Setting a score is what removes the lead from
+            `leads_awaiting_relevance` and makes it a candidate for the
+            expensive research pass.
+        """
         self.conn.execute(
             """
             UPDATE job_leads
@@ -454,6 +942,20 @@ class MailStore:
         self.conn.commit()
 
     def leads_awaiting_relevance(self, limit=50):
+        """
+        Summary:
+            List new leads that have not been scored for relevance yet.
+
+        Parameters:
+            limit (int): Maximum rows to return. Defaults to 50.
+
+        Returns:
+            list[sqlite3.Row]: Unscored leads still in `new`, oldest first so
+                a backlog drains in arrival order.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         return self.conn.execute(
             """
             SELECT * FROM job_leads
@@ -468,6 +970,26 @@ class MailStore:
 
         The gate that keeps Opus spend proportional: only leads the cheap model
         thinks are worth pursuing reach the expensive research pass.
+
+        Summary:
+            List scored leads at or above the threshold that still need
+            preparing.
+
+        Parameters:
+            threshold (float): Minimum relevance score to qualify. This is the
+                spend gate.
+            limit (int): Maximum rows to return. Defaults to 10, deliberately
+                small - each of these becomes an expensive model call.
+
+        Returns:
+            list[sqlite3.Row]: Qualifying leads, best score first, then oldest.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Removing the threshold or raising the limit turns a parser bug
+            into a large bill. Both are cost controls, not tuning knobs.
         """
         return self.conn.execute(
             """
@@ -483,6 +1005,30 @@ class MailStore:
 
     def save_research(self, identity_key, summary, payload, model=None,
                       input_tokens=None, output_tokens=None):
+        """
+        Summary:
+            Store company research for a job identity, replacing any earlier
+            result.
+
+        Parameters:
+            identity_key (str): The identity the research is about. Unique, so
+                re-researching overwrites rather than accumulating.
+            summary (str): The human-readable summary shown on the lead.
+            payload (Any | None): Structured findings, JSON-encoded before
+                storage. None is stored as NULL.
+            model (str | None): Which model produced it, for later attribution.
+            input_tokens (int | None): Input tokens consumed.
+            output_tokens (int | None): Output tokens consumed.
+
+        Raises:
+            sqlite3.Error: If the upsert or the commit fails.
+            TypeError: If `payload` is not JSON-serialisable.
+
+        Note:
+            Commits. The token counts are what `research_spend_since` totals
+            for the daily ceiling, so omitting them makes that spend
+            invisible.
+        """
         self.conn.execute(
             """
             INSERT INTO job_research (
@@ -504,12 +1050,48 @@ class MailStore:
         self.conn.commit()
 
     def research_for(self, identity_key):
+        """
+        Summary:
+            Fetch stored research for a job identity.
+
+        Parameters:
+            identity_key (str): The identity to look up.
+
+        Returns:
+            sqlite3.Row | None: The research row, or None when the identity
+                has not been researched. `payload` is still a JSON string; the
+                caller decodes it.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         return self.conn.execute(
             "SELECT * FROM job_research WHERE identity_key = ?", (identity_key,)
         ).fetchone()
 
     def research_spend_since(self, since_iso):
-        """Token spend since a timestamp, for the daily ceiling in 6.5."""
+        """Token spend since a timestamp, for the daily ceiling in 6.5.
+
+        Summary:
+            Total research token spend and call count since a timestamp.
+
+        Parameters:
+            since_iso (str): Inclusive lower bound as an ISO-8601 timestamp,
+                matching the format `_now` writes.
+
+        Returns:
+            dict: Keys `input_tokens`, `output_tokens`, and `calls`. Token
+                totals are 0 rather than None when nothing matches, so the
+                caller can compare against the ceiling without a null check.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Counts only what reached `save_research`. A call that failed
+            before its result was stored is invisible here, so the ceiling is
+            a floor on real spend rather than an exact figure.
+        """
         row = self.conn.execute(
             """
             SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -524,6 +1106,27 @@ class MailStore:
     # --- artifacts ---------------------------------------------------------
 
     def save_artifact(self, identity_key, kind, path, model=None):
+        """
+        Summary:
+            Record a generated file for a job identity, replacing any earlier
+            one of the same kind.
+
+        Parameters:
+            identity_key (str): The identity the artifact was generated for.
+            kind (str): What it is, for example a resume or a cover letter.
+                Unique together with `identity_key`, so regenerating replaces.
+            path (str): Filesystem path to the file. Only the path is stored;
+                the file itself lives under `generated/`, which is gitignored
+                because it contains personal detail.
+            model (str | None): Which model produced it.
+
+        Raises:
+            sqlite3.Error: If the upsert or the commit fails.
+
+        Note:
+            Commits. Nothing verifies the file exists, so a row can outlive a
+            deleted file.
+        """
         self.conn.execute(
             """
             INSERT INTO job_artifacts (identity_key, kind, path, model, generated_at)
@@ -538,6 +1141,20 @@ class MailStore:
         self.conn.commit()
 
     def artifacts_for(self, identity_key):
+        """
+        Summary:
+            List the generated files recorded for a job identity.
+
+        Parameters:
+            identity_key (str): The identity to look up.
+
+        Returns:
+            list[sqlite3.Row]: Artifact rows ordered by kind, so the same
+                document always appears in the same place in the UI.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         return self.conn.execute(
             "SELECT * FROM job_artifacts WHERE identity_key = ? ORDER BY kind",
             (identity_key,),
@@ -546,6 +1163,28 @@ class MailStore:
     # --- experiences -------------------------------------------------------
 
     def add_experience(self, entry):
+        """
+        Summary:
+            Add one experience bullet to the pool the resume generator draws
+            from.
+
+        Parameters:
+            entry (dict): The bullet. `bullet` is required; `kind`
+                (defaults to "work"), `organisation`, `role`, `start_date`,
+                `end_date`, `tags`, `impact`, and `sort_order` (defaults to 0)
+                are optional.
+
+        Returns:
+            int: The new row's ID.
+
+        Raises:
+            KeyError: If `entry` has no `bullet`.
+            sqlite3.Error: If the insert or the commit fails.
+
+        Note:
+            Commits. Always inserts - there is no dedupe, so calling twice
+            with the same text stores it twice.
+        """
         cursor = self.conn.execute(
             """
             INSERT INTO experiences (
@@ -571,6 +1210,23 @@ class MailStore:
         return cursor.lastrowid
 
     def list_experiences(self, kind=None):
+        """
+        Summary:
+            List experience bullets in the order they should appear on a
+            resume.
+
+        Parameters:
+            kind (str | None): Restrict to one kind, for example "work". None
+                or empty returns every kind.
+
+        Returns:
+            list[sqlite3.Row]: Bullets ordered by explicit `sort_order`, then
+                most recent `end_date`, then ID. A NULL `end_date` sorts as
+                "9999" so current roles come first.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         if kind:
             return self.conn.execute(
                 """
@@ -584,13 +1240,51 @@ class MailStore:
         ).fetchall()
 
     def delete_experience(self, experience_id):
+        """
+        Summary:
+            Permanently remove an experience bullet.
+
+        Parameters:
+            experience_id (int): The `experiences.id` to delete.
+
+        Raises:
+            sqlite3.Error: If the delete or the commit fails.
+
+        Note:
+            Commits, and there is no undo. An unknown ID deletes nothing and
+            does not raise. Already-generated resumes are unaffected; they are
+            files on disk, not references to this row.
+        """
         self.conn.execute("DELETE FROM experiences WHERE id = ?", (experience_id,))
         self.conn.commit()
 
     # --- sender denylist ---------------------------------------------------
 
     def deny_sender(self, domain, reason=None):
-        """Mark a domain as never job related. Feeds rough-filter rule 3."""
+        """Mark a domain as never job related. Feeds rough-filter rule 3.
+
+        Summary:
+            Add a sender domain to the denylist so its mail is dropped before
+            any model sees it.
+
+        Parameters:
+            domain (str | None): The domain to deny. Trimmed and lowercased
+                before storage, so casing and stray whitespace do not create
+                duplicates.
+            reason (str | None): Why it was denied, for later review.
+
+        Returns:
+            bool: True when a usable domain was supplied, False when it was
+                empty or None. False means nothing was stored.
+
+        Raises:
+            sqlite3.Error: If the insert or the commit fails.
+
+        Note:
+            Commits. Re-denying an existing domain is ignored and still
+            returns True. This is the cheapest filter stage - every domain
+            added here is mail the LLM is no longer paid to reject.
+        """
         domain = (domain or "").strip().lower()
         if not domain:
             return False
@@ -602,12 +1296,40 @@ class MailStore:
         return True
 
     def allow_sender(self, domain):
+        """
+        Summary:
+            Remove a domain from the denylist so its mail is filtered normally
+            again.
+
+        Parameters:
+            domain (str | None): The domain to allow. Trimmed and lowercased
+                to match how `deny_sender` stored it.
+
+        Raises:
+            sqlite3.Error: If the delete or the commit fails.
+
+        Note:
+            Commits. A domain that was never denied deletes nothing and does
+            not raise. Mail already dropped is not reconsidered - this only
+            affects messages arriving from now on.
+        """
         self.conn.execute(
             "DELETE FROM sender_denylist WHERE domain = ?", ((domain or "").strip().lower(),)
         )
         self.conn.commit()
 
     def denied_domains(self):
+        """
+        Summary:
+            Return every denied sender domain.
+
+        Returns:
+            set[str]: The denied domains, lowercased. A set so the rough
+                filter can test membership per message.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
         return {
             row["domain"]
             for row in self.conn.execute("SELECT domain FROM sender_denylist")
@@ -622,12 +1344,48 @@ class MailStore:
     CURSOR_PREFIX = "cursor:"
 
     def get_cursor(self, name, default=None):
+        """
+        Summary:
+            Read a sync cursor, falling back to a default when unset.
+
+        Parameters:
+            name (str): Cursor name without the prefix, for example the Gmail
+                history position. `CURSOR_PREFIX` is added here.
+            default (Any): Returned when the cursor has never been written.
+
+        Returns:
+            str | Any: The stored value as a string, or `default`.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Always returns a string when set, because `set_cursor` stringifies
+            on the way in. Numeric cursors need converting by the caller.
+        """
         row = self.conn.execute(
             "SELECT value FROM profile WHERE key = ?", (self.CURSOR_PREFIX + name,)
         ).fetchone()
         return row["value"] if row else default
 
     def set_cursor(self, name, value):
+        """
+        Summary:
+            Write a sync cursor, overwriting any previous value.
+
+        Parameters:
+            name (str): Cursor name without the prefix.
+            value (Any): The position to store. Stringified unless None, which
+                is stored as NULL to mean "no position".
+
+        Raises:
+            sqlite3.Error: If the upsert or the commit fails.
+
+        Note:
+            Commits, because losing a cursor means re-walking mail that was
+            already processed. Cursors live in the `profile` key/value table
+            under `CURSOR_PREFIX` rather than in a table of their own.
+        """
         self.conn.execute(
             """
             INSERT INTO profile (key, value) VALUES (?, ?)
@@ -638,4 +1396,18 @@ class MailStore:
         self.conn.commit()
 
     def commit(self):
+        """
+        Summary:
+            Commit the shared connection.
+
+        Raises:
+            sqlite3.Error: If the commit fails.
+
+        Note:
+            Exists because several methods here deliberately do not commit -
+            `upsert_message`, `set_filter_verdict`, `store_body`,
+            `record_category`, `link_message`, and `upsert_lead`. A pipeline
+            stage batches many of those and calls this once. Forgetting it
+            loses the batch.
+        """
         self.conn.commit()
