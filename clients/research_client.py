@@ -27,6 +27,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 
+from clients.providers.base import ProviderBudgetExhausted, ProviderNotConfigured
 from utilities import credentials
 
 log = logging.getLogger(__name__)
@@ -62,12 +63,17 @@ MISSING_PACKAGES_HINT = (
 )
 
 
-class ResearchNotConfigured(Exception):
-    """Raised when no usable Anthropic API key is available."""
-
-
-class SpendCeilingReached(Exception):
-    """Raised when the daily research budget is exhausted."""
+# Aliases onto the provider-neutral exceptions - see the note in
+# `clients/llm_client.py`. `ResearchNotConfigured` becoming the same class as
+# `GroqNotConfigured` is intended: every site that catches either one means
+# "this model cannot run, degrade rather than stop".
+#
+# `SpendCeilingReached` stays a *separate* class from `ProviderRateLimited`.
+# `pipeline/prepare.py` reads it as "stop the whole stage" while a rate limit
+# means "stop this pass", and collapsing them would spend the day's remaining
+# leads rediscovering the ceiling one at a time.
+ResearchNotConfigured = ProviderNotConfigured
+SpendCeilingReached = ProviderBudgetExhausted
 
 
 def _load_env():

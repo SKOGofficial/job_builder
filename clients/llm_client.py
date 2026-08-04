@@ -31,13 +31,28 @@ Rate limits: the free tier allows 30 requests and 12,000 tokens per minute for
 llama-3.3-70b-versatile. At roughly 900 tokens per classification the token
 ceiling binds first, so requests are paced from tokens rather than fired in a
 burst. A 429 stops the cycle cleanly instead of hammering the endpoint.
+
+Pacing and the exception vocabulary now live in `clients/providers/base.py`,
+because none of it was ever Groq-specific. They are re-exported here under
+their original names so the six pipeline modules that catch `GroqRateLimited`,
+and the tests that reach for `llm_client.Pacer`, keep working untouched.
 """
 
 import asyncio
 import json
 import os
-import time
 
+from clients.providers.base import (
+    CHARS_PER_TOKEN,
+    ESTIMATED_TOKENS_PER_CALL,
+    TOKENS_PER_MINUTE,
+    Pacer,
+    ProviderBudgetExhausted,
+    ProviderNotConfigured,
+    ProviderRateLimited,
+    estimate_tokens,
+    retry_after_seconds,
+)
 from utilities import credentials
 
 try:
@@ -66,17 +81,10 @@ DEFAULT_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_REQUESTS_PER_MINUTE = 12
 DEFAULT_CONFIDENCE_THRESHOLD = 0.85
 
-#: Free tier ceiling for the default model.
-TOKENS_PER_MINUTE = 12000
-#: Fallback projection for a caller that paces without describing its request.
-#: `complete_json` measures the real request instead - see `estimate_tokens`.
-#: Left as the `Pacer.wait` default so a bare pacer still books something.
-ESTIMATED_TOKENS_PER_CALL = 900
+#: Display name used when this provider refuses a request. Reaches the user
+#: through `ProviderRateLimited.provider`.
+DISPLAY_NAME = "Groq"
 
-#: Bytes per token for English prose, the usual rough ratio. Applied to the
-#: JSON-serialised request, whose quoting and escaping inflate the count a
-#: little - which errs toward over-booking, the safe direction.
-CHARS_PER_TOKEN = 4
 #: Body text is truncated before it is sent. Untruncated bodies run to 20,000
 #: characters, which alone would exceed the per-minute token ceiling.
 MODEL_BODY_CHARS = 2000
@@ -116,16 +124,21 @@ Reply with JSON only, in this exact shape:
 "reason": "<one short sentence>"}"""
 
 
-class GroqNotConfigured(Exception):
-    """Raised when no usable API key is available."""
-
-
-class GroqRateLimited(Exception):
-    """Raised on HTTP 429 so the cycle can stop instead of retrying."""
-
-    def __init__(self, message, retry_after=0):
-        super().__init__(message)
-        self.retry_after = retry_after
+# These are aliases, not subclasses, and the difference is load-bearing.
+#
+# `except GroqRateLimited` appears in six pipeline modules and is what stops a
+# batch cleanly on a 429. Once a second provider exists, every one of those
+# sites must stop for *its* rate limit too. A subclass would do the opposite:
+# `except GroqRateLimited` would not catch `ProviderRateLimited`, and a Gemini
+# 429 would escape into the bare `except Exception` below it, logged as an
+# unexplained failure. Aliasing makes all six provider-aware with no edit.
+#
+# The cost, stated plainly: `GroqNotConfigured` and `ResearchNotConfigured` are
+# now the same class, so a site catching one also catches the other. Both mean
+# "this model cannot run, degrade rather than stop", which is what those sites
+# already do.
+GroqNotConfigured = ProviderNotConfigured
+GroqRateLimited = ProviderRateLimited
 
 
 # Configuration ------------------------------------------------------------
@@ -271,122 +284,6 @@ def parse_classification(content):
     return {"label": label.strip(), "confidence": confidence, "reason": reason}
 
 
-def estimate_tokens(messages, max_tokens):
-    """Project what one request will actually cost the rolling token window.
-
-    A flat per-call estimate is what caused the free-tier 429s this replaces.
-    Classification sends 2,000 body characters and asks for 200 back - around
-    1,100 tokens, close to the old flat 900. Alert extraction sends 6,000
-    characters and asks for 1,500 back, which is nearer 3,400. Booking that at
-    900 let four calls drain a 12,000-token minute while the pacer believed it
-    had room for thirteen.
-
-    Measuring the request removes the guess and, more usefully, removes the
-    need for every new call site to remember to pass a number.
-
-    Summary:
-        Estimate the token cost of a chat request from its serialised messages
-        and its output ceiling.
-
-    Parameters:
-        messages (list[dict]): The chat messages about to be sent.
-        max_tokens (int): The requested output ceiling.
-
-    Returns:
-        int: Projected total tokens, input plus a worst-case output.
-
-    Note:
-        Deliberately errs high. JSON quoting inflates the character count, and
-        `max_tokens` is a ceiling replies rarely reach, so the projection is
-        conservative - which is the safe direction for a rate limit.
-    """
-    serialized = json.dumps(messages, ensure_ascii=False)
-    return len(serialized) // CHARS_PER_TOKEN + max_tokens
-
-
-def retry_after_seconds(response):
-    """Read retry-after, falling back to a minute when it is absent."""
-    raw = (getattr(response, "headers", None) or {}).get("retry-after")
-    try:
-        return max(0, int(float(raw)))
-    except (TypeError, ValueError):
-        return 60
-
-
-# Pacing -------------------------------------------------------------------
-
-
-class Pacer:
-    """Spaces requests so neither the request nor the token ceiling is reached.
-
-    Both limits are enforced: a minimum gap between calls, and a rolling
-    sixty-second window of tokens actually spent, reported by each response.
-    sleep and clock are injectable so tests can drive this without waiting.
-    """
-
-    def __init__(
-        self,
-        per_minute=DEFAULT_REQUESTS_PER_MINUTE,
-        tokens_per_minute=TOKENS_PER_MINUTE,
-        sleep=time.sleep,
-        clock=time.monotonic,
-    ):
-        self.min_interval = 60.0 / max(1, per_minute)
-        self.tokens_per_minute = tokens_per_minute
-        self._sleep = sleep
-        self._clock = clock
-        self._last_call = None
-        self._spent = []
-
-    def wait(self, projected_tokens=ESTIMATED_TOKENS_PER_CALL):
-        now = self._clock()
-        if self._last_call is not None:
-            gap = self.min_interval - (now - self._last_call)
-            if gap > 0:
-                self._sleep(gap)
-                now = self._clock()
-        delay = self.token_delay(now, projected_tokens)
-        if delay > 0:
-            self._sleep(delay)
-            now = self._clock()
-        self._last_call = now
-
-    def token_delay(self, now, projected_tokens):
-        """
-        Summary:
-            How long to wait before a request of this size fits inside the
-            rolling sixty-second token window.
-
-        Parameters:
-            now (float): Current monotonic time, from the injected clock.
-            projected_tokens (int): What the pending request is expected to
-                cost. See `estimate_tokens`.
-
-        Returns:
-            float: Seconds to sleep. 0.0 when the request fits now.
-
-        Note:
-            Returns 0.0 when nothing has been spent yet, even if the request
-            alone exceeds the whole per-minute budget. Waiting cannot make room
-            that no earlier call is occupying, so blocking would stall forever;
-            better to send it and let the API answer. This mattered less when
-            every call was booked at a flat 900 tokens - now that projections
-            are measured, they can in principle exceed the ceiling.
-        """
-        self._spent = [(at, n) for at, n in self._spent if now - at < 60.0]
-        used = sum(n for _at, n in self._spent)
-        if used + projected_tokens <= self.tokens_per_minute:
-            return 0.0
-        if not self._spent:
-            return 0.0
-        oldest = min(at for at, _n in self._spent)
-        return max(0.0, 60.0 - (now - oldest))
-
-    def record(self, tokens):
-        if tokens:
-            self._spent.append((self._clock(), tokens))
-
-
 # Client -------------------------------------------------------------------
 
 
@@ -398,6 +295,26 @@ class GroqClient:
         self.pacer = pacer or Pacer(per_minute)
         # Injectable so tests never reach the network.
         self.poster = poster or (requests.post if requests else None)
+        #: Total tokens the last response reported. Read by the provider pool
+        #: to reconcile its optimistic booking against what was really spent.
+        self.last_total_tokens = 0
+
+    @property
+    def last_model(self):
+        """The model that served the most recent call.
+
+        Constant for a single-provider client, and only interesting because
+        the pool's task-bound clients answer the same question with a value
+        that changes on failover. Recorded alongside each classification so a
+        label can be traced back to the model that produced it.
+
+        Summary:
+            Name the model behind the most recent completion.
+
+        Returns:
+            str: The configured model name.
+        """
+        return self.model
 
     @classmethod
     def from_config(cls):
@@ -459,7 +376,9 @@ class GroqClient:
 
         if response.status_code == 429:
             raise GroqRateLimited(
-                "Groq rate limit reached.", retry_after=retry_after_seconds(response)
+                "Groq rate limit reached.",
+                retry_after=retry_after_seconds(response),
+                provider=DISPLAY_NAME,
             )
         if response.status_code >= 400:
             raise RuntimeError(
@@ -468,7 +387,8 @@ class GroqClient:
             )
 
         payload = response.json()
-        self.pacer.record((payload.get("usage") or {}).get("total_tokens", 0))
+        self.last_total_tokens = (payload.get("usage") or {}).get("total_tokens", 0)
+        self.pacer.record(self.last_total_tokens)
         choices = payload.get("choices") or []
         if not choices:
             return fallback
@@ -613,8 +533,12 @@ class ClassificationRunner:
             except GroqRateLimited as exc:
                 self.state = RATE_LIMITED
                 self.retry_after = exc.retry_after
+                # Named rather than hard-coded, because with a provider pool
+                # the model that refused is not necessarily the one configured
+                # here. Test doubles raise without a name, hence the fallback.
                 self.message = (
-                    f"Groq rate limit reached after {self.processed} of {self.total}. "
+                    f"{exc.provider or DISPLAY_NAME} rate limit reached after "
+                    f"{self.processed} of {self.total}. "
                     f"Try again in about {self.retry_after}s."
                 )
                 self.emit()
