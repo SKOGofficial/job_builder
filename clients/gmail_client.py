@@ -85,11 +85,13 @@ class GmailNotConnected(Exception):
 
 
 def client_config():
+    # the if statement finds the .env file in the project directory and loads it into the enviornemnt. 
     if load_dotenv:
         env_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
         )
         load_dotenv(dotenv_path=env_path)
+    # load the client_ID and client_secrete from the envionrment into memory. If they are not set, raise an exception.
     client_id = os.environ.get("GMAIL_CLIENT_ID", "").strip() if os.environ else ""
     client_secret = os.environ.get("GMAIL_CLIENT_SECRET", "").strip() if os.environ else ""
     if not client_id or not client_secret:
@@ -111,6 +113,7 @@ def stored_refresh_token():
 
 
 def is_connected():
+    # checks whether the client has configured gmail, and if so it returns whether the refresh token is stored in the keyring.
     try:
         client_config()
     except GmailNotConfigured:

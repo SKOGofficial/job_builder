@@ -792,5 +792,100 @@ class AiColumnMigrationTests(unittest.TestCase):
         self.assertIsNone(row["ai_status"])
 
 
+class TokenEstimationTests(unittest.TestCase):
+    """Projecting a request's real cost instead of a flat per-call figure.
+
+    The flat 900-token projection is what produced free-tier 429s on a real
+    mailbox. Alert extraction actually costs around 3,400 tokens, so four calls
+    drained a 12,000-token minute while the pacer believed it had room for
+    thirteen.
+    """
+
+    def test_longer_prompt_projects_more(self):
+        short = [{"role": "user", "content": "hi"}]
+        long_one = [{"role": "user", "content": "x" * 8000}]
+        self.assertLess(llm.estimate_tokens(short, 200),
+                        llm.estimate_tokens(long_one, 200))
+
+    def test_output_ceiling_is_included(self):
+        messages = [{"role": "user", "content": "hi"}]
+        self.assertEqual(
+            llm.estimate_tokens(messages, 1500) - llm.estimate_tokens(messages, 200),
+            1300,
+        )
+
+    def test_alert_extraction_projects_far_above_the_old_flat_figure(self):
+        # The regression this change exists for.
+        messages = [
+            {"role": "system", "content": "s" * 1500},
+            {"role": "user", "content": "b" * 6000},
+        ]
+        projected = llm.estimate_tokens(messages, 1500)
+        self.assertGreater(projected, 3000)
+        self.assertGreater(projected, llm.ESTIMATED_TOKENS_PER_CALL * 3)
+
+    def test_classification_stays_near_the_old_figure(self):
+        # The old default was not wrong for classification, only for the big
+        # calls. Guards against over-correcting and throttling the common path.
+        messages = [
+            {"role": "system", "content": "s" * 1900},
+            {"role": "user", "content": "b" * 2000},
+        ]
+        self.assertLess(llm.estimate_tokens(messages, 200), 2000)
+
+
+class PacerBooksRealCostTests(unittest.TestCase):
+    def setUp(self):
+        self.slept = []
+        self.now = 0.0
+
+    def clock(self):
+        return self.now
+
+    def pacer(self, per_minute=60, tokens_per_minute=12000):
+        return llm.Pacer(
+            per_minute=per_minute,
+            tokens_per_minute=tokens_per_minute,
+            sleep=self.slept.append,
+            clock=self.clock,
+        )
+
+    def test_complete_json_books_a_measured_projection(self):
+        pacer = self.pacer()
+        seen = []
+        pacer.wait = lambda projected_tokens=None: seen.append(projected_tokens)
+
+        client = llm.GroqClient(key="k", pacer=pacer)
+        client.poster = lambda url, **kwargs: FakeResponse(
+            payload={"choices": [{"message": {"content": '{"label": "Rejected", '
+                                                          '"confidence": 0.9, '
+                                                          '"reason": "r"}'}}],
+                     "usage": {"total_tokens": 3400}})
+        client.complete_json(
+            [{"role": "user", "content": "x" * 6000}],
+            llm.parse_classification, llm.unclear(), max_tokens=1500,
+        )
+
+        self.assertEqual(len(seen), 1)
+        self.assertGreater(seen[0], 2000,
+                           "must book the real cost, not the flat default")
+
+    def test_big_calls_throttle_sooner_than_small_ones(self):
+        # Four 3,400-token calls exceed a 12,000-token minute. That is the
+        # ceiling the pacer previously could not see coming.
+        pacer = self.pacer()
+        for _ in range(3):
+            pacer.record(3400)
+        self.assertGreater(pacer.token_delay(1.0, 3400), 0,
+                           "a fourth big call must wait")
+        self.assertEqual(pacer.token_delay(1.0, 900), 0.0,
+                         "a small call still fits in what is left")
+
+    def test_oversized_single_call_does_not_hang(self):
+        # Nothing spent yet, so waiting cannot free room no earlier call holds.
+        # Previously this raised ValueError from min() over an empty list.
+        self.assertEqual(self.pacer().token_delay(1.0, 999999), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

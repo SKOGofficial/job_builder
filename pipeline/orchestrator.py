@@ -45,7 +45,12 @@ class PipelineCycle:
             "sync": 500,
             "bodies": 60,
             "classify": 60,
-            "handle": 50,
+            # Alert extraction is the most expensive model call in the
+            # pipeline - roughly 3,400 tokens against a 12,000/minute ceiling,
+            # so about three per minute. At 50 a cycle spent a quarter of an
+            # hour on alerts alone. 15 keeps each handler's share of a cycle
+            # bounded to a few minutes.
+            "handle": 15,
             # Deliberately small: each prepared lead is a real spend and a slow
             # call, so a burst of new leads is spread across cycles rather than
             # fired at once.

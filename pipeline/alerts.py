@@ -17,6 +17,7 @@ Two guards matter here:
 
 import logging
 
+from clients.llm_client import GroqRateLimited
 from pipeline.parsers import parse_alert
 from utilities.identity import identity_key, identity_scheme
 from utilities.mailstore import CATEGORY_ALERT
@@ -77,10 +78,35 @@ class AlertHandler:
         return created, skipped, linked
 
     def run(self, limit=50):
-        """Process every alert email that has not been linked yet."""
+        """Process every alert email that has not been linked yet.
+
+        Summary:
+            Turn each unhandled alert email into leads, stopping cleanly if the
+            model's rate limit is reached.
+
+        Parameters:
+            limit (int): Most alert emails to process in one pass.
+
+        Returns:
+            tuple[int, int, int]: Leads created, postings skipped because they
+                are already applied to, and message links written.
+
+        Note:
+            A rate limit ends the pass rather than failing it. Everything
+            already written is kept, and the emails not reached stay unlinked,
+            so the next cycle picks them up with a fresh token budget.
+        """
         totals = [0, 0, 0]
         for message in self._pending(limit):
-            created, skipped, linked = self.handle(message)
+            try:
+                created, skipped, linked = self.handle(message)
+            except GroqRateLimited as exc:
+                log.info(
+                    "Alert handling paused by the rate limit after %d lead(s); "
+                    "the remaining alerts retry next cycle, in about %ss",
+                    totals[0], exc.retry_after,
+                )
+                break
             totals[0] += created
             totals[1] += skipped
             totals[2] += linked

@@ -20,6 +20,7 @@ scans check.
 
 import logging
 
+from clients.llm_client import GroqRateLimited
 from pipeline.extract import STATUS_UNCLEAR, extract_update
 from utilities.mailstore import CATEGORY_UPDATE
 
@@ -115,9 +116,32 @@ class UpdateHandler:
         return True
 
     def run(self, limit=50):
+        """
+        Summary:
+            Apply each unhandled update email to its job, stopping cleanly if
+            the model's rate limit is reached.
+
+        Parameters:
+            limit (int): Most update emails to process in one pass.
+
+        Returns:
+            dict: Counts under `processed`, `applied`, and `unresolved`.
+
+        Note:
+            A rate limit ends the pass rather than failing the whole cycle.
+            Unreached emails stay unlinked and are retried next cycle.
+        """
         processed = applied = unresolved = 0
         for message in self._pending(limit):
-            outcome = self.handle(message)
+            try:
+                outcome = self.handle(message)
+            except GroqRateLimited as exc:
+                log.info(
+                    "Update handling paused by the rate limit after %d "
+                    "message(s); retrying next cycle, in about %ss",
+                    processed, exc.retry_after,
+                )
+                break
             processed += 1
             applied += int(outcome["status_applied"])
             unresolved += int(not outcome["identity_key"])
