@@ -108,7 +108,18 @@ SCHEME_TITLE_COMPANY_LOCATION = "tcl"
 
 
 def _collapse(text):
-    """Lowercase, strip punctuation to spaces, collapse runs of whitespace."""
+    """Lowercase, strip punctuation to spaces, collapse runs of whitespace.
+
+    Summary:
+        Normalize whitespace and punctuation in a piece of text for comparison.
+
+    Parameters:
+        text (str | None): The text to normalize. None is treated as empty.
+
+    Returns:
+        str: Lowercased text with punctuation replaced by spaces and runs of
+            whitespace collapsed to single spaces.
+    """
     text = re.sub(r"[^\w\s-]", " ", (text or "").lower())
     return " ".join(text.split())
 
@@ -119,6 +130,16 @@ def normalize_title(title):
     Collapses spelling ("Sr." -> "senior", "SWE" -> "software engineer") and
     strips board noise (requisition IDs, "(m/f/d)", "(Remote)"). Deliberately
     keeps seniority and level: "Engineer II" and "Engineer III" must not agree.
+
+    Summary:
+        Normalize a job title for identity comparison.
+
+    Parameters:
+        title (str | None): The raw title. None is treated as empty.
+
+    Returns:
+        str: The normalized title, space-joined. Empty when `title` reduces
+            to nothing after noise stripping.
     """
     text = TITLE_NOISE.sub(" ", title or "")
     text = _collapse(text)
@@ -144,6 +165,16 @@ def company_slug(company):
     Moved from `clients/gmail_client.py`. Joining rather than space-separating
     is deliberate: it lets the Gmail matcher test the slug against a sender
     domain, where "acme corp" appears as "acmecorp".
+
+    Summary:
+        Reduce a company name to a lowercase token used for matching.
+
+    Parameters:
+        company (str | None): The raw company name. None is treated as empty.
+
+    Returns:
+        str: The slug - lowercased words with legal suffixes (Inc, LLC, and
+            similar) and punctuation removed, then joined with no separator.
     """
     cleaned = re.sub(r"[^\w\s-]", " ", (company or "").lower())
     words = [w for w in cleaned.split() if w and w not in COMPANY_SUFFIXES]
@@ -151,7 +182,17 @@ def company_slug(company):
 
 
 def normalize_company(company):
-    """Company form used inside an identity key. Alias of `company_slug`."""
+    """Company form used inside an identity key. Alias of `company_slug`.
+
+    Summary:
+        Normalize a company name for identity key construction.
+
+    Parameters:
+        company (str | None): The raw company name.
+
+    Returns:
+        str: The normalized company token. See `company_slug`.
+    """
     return company_slug(company)
 
 
@@ -165,6 +206,19 @@ def normalize_location(location):
     A hybrid posting keeps both parts, so "San Francisco, CA (Remote)" becomes
     "san francisco ca|remote" - it matches neither a pure office posting nor a
     pure remote one, which is correct. They are different arrangements.
+
+    Summary:
+        Normalize a location for identity comparison.
+
+    Parameters:
+        location (str | None): The raw location string. None is treated as
+            empty.
+
+    Returns:
+        str: The normalized location. Spelled-out US state names and known
+            country/region aliases are collapsed to their short forms, and a
+            detected remote marker is appended as a trailing `|remote`
+            segment. Empty when `location` reduces to nothing.
     """
     raw = location or ""
     is_remote = bool(REMOTE_MARKERS.search(raw))
@@ -187,7 +241,18 @@ def normalize_location(location):
 
 
 def identity_scheme(location):
-    """Which key scheme applies for this location value."""
+    """Which key scheme applies for this location value.
+
+    Summary:
+        Determine which identity scheme a location value would produce.
+
+    Parameters:
+        location (str | None): The location to test.
+
+    Returns:
+        str: `SCHEME_TITLE_COMPANY_LOCATION` when `location` normalizes to
+            something, otherwise `SCHEME_TITLE_COMPANY`.
+    """
     return SCHEME_TITLE_COMPANY_LOCATION if normalize_location(location) else SCHEME_TITLE_COMPANY
 
 
@@ -200,6 +265,19 @@ def identity_key(title, company, location=None):
     Location is folded in only when it normalizes to something. A key computed
     without it is a *different* key, not a wildcard - use `candidate_keys` when
     looking a job up rather than assuming one form.
+
+    Summary:
+        Derive the stable identity key for a role.
+
+    Parameters:
+        title (str | None): The job title.
+        company (str | None): The company name.
+        location (str | None): The location, if known. Folded into the key
+            only when it normalizes to something.
+
+    Returns:
+        str: The first 12 hex characters of the SHA-256 digest of the
+            normalized fields, uppercased.
     """
     normalized_location = normalize_location(location)
     fields = [normalize_title(title), normalize_company(company)]
@@ -216,6 +294,20 @@ def candidate_keys(title, company, location=None):
     location-qualified key first and the bare title+company key second, so a
     row stored before locations existed - every row in a pre-migration
     database - is still reachable.
+
+    Summary:
+        List identity keys to try, most to least specific, when resolving a
+        role to an existing row.
+
+    Parameters:
+        title (str | None): The job title.
+        company (str | None): The company name.
+        location (str | None): The location, if known.
+
+    Returns:
+        list[str]: One or two keys. The location-qualified key first when a
+            location is known and it differs from the bare key, then the bare
+            title+company key.
     """
     keys = []
     if normalize_location(location):

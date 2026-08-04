@@ -36,10 +36,41 @@ log = logging.getLogger(__name__)
 
 
 def current_version(conn):
+    """
+    Summary:
+        Read the schema version SQLite has stored in the file header.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to query.
+
+    Returns:
+        int: The `PRAGMA user_version` value. 0 for a database that has never
+            been stamped.
+
+    Raises:
+        sqlite3.Error: If the pragma cannot be read.
+    """
     return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
 def set_version(conn, version):
+    """
+    Summary:
+        Stamp the schema version into the database file header.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to update.
+        version (int): The version to stamp. Coerced with `int()` before
+            interpolation.
+
+    Raises:
+        sqlite3.Error: If the pragma cannot be set.
+
+    Note:
+        `PRAGMA` does not accept bound parameters, hence the f-string.
+        `version` must only ever come from `MIGRATIONS` or `SCHEMA_VERSION`,
+        never from user input.
+    """
     # PRAGMA does not accept bound parameters, hence the f-string. `version` is
     # an int from our own MIGRATIONS table, never user input.
     conn.execute(f"PRAGMA user_version = {int(version)}")
@@ -51,6 +82,26 @@ def backup_before_migrating(db_path):
     Uses the sqlite backup API rather than a file copy, so it is safe even if
     another connection is mid-write. In-memory databases have nothing to back
     up and are skipped - that is the test path.
+
+    Summary:
+        Copy the database file aside before a structural migration runs.
+
+    Parameters:
+        db_path (str | None): Path to the live database. An in-memory
+            database, an empty path, or a path that does not yet exist skips
+            the backup.
+
+    Returns:
+        str | None: The backup file's path, or None when there was nothing to
+            back up.
+
+    Raises:
+        sqlite3.Error: If the backup connection or the copy fails.
+        OSError: If the `backups/` directory cannot be created.
+
+    Note:
+        Uses the SQLite backup API rather than a plain file copy, so it is
+        consistent even if another connection is mid-write.
     """
     if not db_path or db_path == ":memory:" or not os.path.exists(db_path):
         return None
@@ -83,6 +134,29 @@ def rebuild_table(conn, table, create_sql, columns):
 
     `columns` are copied across by name; anything in the new shape but not in
     the list gets its default.
+
+    Summary:
+        Rebuild a table into a new shape, keeping the listed columns' data.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to operate on.
+        table (str): The table to rebuild.
+        create_sql (str): A `CREATE TABLE IF NOT EXISTS {table} (...)`
+            statement for the new shape. The table name is substituted with a
+            temporary one internally.
+        columns (list[str]): Column names present in both the old and new
+            shape, copied across by name in the order given.
+
+    Raises:
+        sqlite3.Error: If any step fails. Runs inside the caller's
+            transaction, so a failure here leaves the original table intact
+            rather than partially rebuilt.
+
+    Note:
+        SQLite cannot drop a NOT NULL constraint or otherwise restructure a
+        table in place; this create-copy-drop-rename sequence is the only way.
+        A column in `create_sql` but absent from `columns` gets its schema
+        default rather than a copied value.
     """
     temporary = f"{table}__migrating"
     conn.executescript(create_sql.replace(f"TABLE IF NOT EXISTS {table}",
@@ -132,7 +206,27 @@ JOBS_V0_COLUMNS = [
 
 
 def migrate_v1(conn):
-    """Widen `jobs` for the identity model and backfill `identity_key`."""
+    """Widen `jobs` for the identity model and backfill `identity_key`.
+
+    Summary:
+        Migrate a pre-v1 `jobs` table to the identity-key schema.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to migrate. Runs inside the
+            caller's transaction.
+
+    Returns:
+        list[tuple[int, int, str]]: Collisions found while backfilling. See
+            `backfill_identity_keys`.
+
+    Raises:
+        sqlite3.Error: If the rebuild or the backfill fails.
+
+    Note:
+        A database created fresh by `schema.py` already has the new columns
+        and is left untouched - the rebuild only runs when `identity_key` is
+        absent.
+    """
     existing = column_names(conn, "jobs")
 
     # Only rebuild if this is genuinely a pre-v1 table. A database created
@@ -156,6 +250,26 @@ def backfill_identity_keys(conn):
     Duplicates are expected here - the same role logged twice from two boards
     now collides on one key. They are reported, not merged: a wrong merge
     destroys application history and the user cannot see that it happened.
+
+    Summary:
+        Compute and store an identity key for every job row that lacks one.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to update.
+
+    Returns:
+        list[tuple[int, int, str]]: One `(first_job_id, second_job_id,
+            identity_key)` triple per collision detected, in the order found.
+            Empty when every row got a distinct key.
+
+    Raises:
+        sqlite3.Error: If a read or write fails.
+
+    Note:
+        Never merges a collision - only logs it, at warning level, pointing at
+        `/duplicates` for manual review. A legacy row with no location gets
+        the title+company scheme; `candidate_keys` is what makes it still
+        reachable once locations exist elsewhere.
     """
     rows = conn.execute(
         "SELECT id, position_title, company, location FROM jobs WHERE identity_key IS NULL"
@@ -194,6 +308,20 @@ def migrate_v2(conn):
     Existing rows keep NULL. They were already filtered under the old
     behaviour; re-filtering them would mean re-fetching headers for the whole
     mirror to gain nothing - the classifier has already seen them.
+
+    Summary:
+        Add the `list_unsubscribe` column to `messages` on a pre-v2 database.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to migrate.
+
+    Raises:
+        sqlite3.Error: If the column check or the `ALTER TABLE` fails.
+
+    Note:
+        Additive only. No existing row is re-fetched or reprocessed to
+        backfill the new column; it stays NULL for anything mirrored before
+        this migration ran.
     """
     if "list_unsubscribe" not in column_names(conn, "messages"):
         conn.execute("ALTER TABLE messages ADD COLUMN list_unsubscribe TEXT")
@@ -206,6 +334,20 @@ MIGRATIONS = [
 
 
 def pending_migrations(conn):
+    """
+    Summary:
+        List migrations newer than the database's recorded version.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to check.
+
+    Returns:
+        list[tuple[int, Callable]]: `(version, function)` pairs still to run,
+            in ascending version order. Empty when the database is current.
+
+    Raises:
+        sqlite3.Error: Propagated from `current_version`.
+    """
     version = current_version(conn)
     return [(v, fn) for v, fn in MIGRATIONS if v > version]
 
@@ -216,6 +358,29 @@ def apply_migrations(conn, db_path=None):
     Each runs in its own transaction, so a failure halfway through a sequence
     leaves the database at the last version that fully succeeded rather than in
     a half-migrated state.
+
+    Summary:
+        Run every pending migration in order, stamping the version after each
+        one succeeds.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to migrate.
+        db_path (str | None): The database file path, passed through to
+            `backup_before_migrating`.
+
+    Returns:
+        list[int]: The versions that were successfully applied, in order.
+            Empty when nothing was pending.
+
+    Raises:
+        Exception: Whatever the failing migration function raised, after
+            logging which version failed and which version the database was
+            left at. Re-raised rather than swallowed so the caller cannot
+            mistake a failed migration for success.
+
+    Note:
+        A backup is taken once, before the first migration in the batch, not
+        once per migration.
     """
     pending = pending_migrations(conn)
     if not pending:
@@ -244,6 +409,22 @@ def ensure_email_match_columns(conn):
     recorded a version. `CREATE TABLE IF NOT EXISTS` leaves an existing table
     alone, so a database made before message bodies were stored keeps the old
     column set until it is widened here.
+
+    Summary:
+        Add any `email_matches` columns a pre-version-gate database is missing.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to migrate. A missing
+            `email_matches` table is a no-op, since a fresh database gets the
+            full column set from `schema.py` instead.
+
+    Raises:
+        sqlite3.Error: If a column check or `ALTER TABLE` fails.
+
+    Note:
+        Runs on every call to `initialise`, not just once, because it has no
+        version to gate on. Each column is only added when absent, so
+        repeated calls are cheap no-ops once the schema has caught up.
     """
     if not table_exists(conn, "email_matches"):
         return
@@ -271,6 +452,28 @@ def initialise(conn, db_path=None):
     `SCHEMA_VERSION` directly - it never runs migration code. An existing one
     gets the missing tables added, then the migrations reshape what is already
     there.
+
+    Summary:
+        Bring a database connection's schema up to the current version,
+        migrating in place if needed.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to initialise.
+        db_path (str | None): The database file path, used for the
+            pre-migration backup when a migration is structural.
+
+    Returns:
+        list[int]: Migration versions applied. Empty for a fresh database or
+            one already current.
+
+    Raises:
+        sqlite3.Error: If table creation, a migration, or index creation
+            fails.
+
+    Note:
+        Commits at the end. Indexes are created last on purpose - a migration
+        that rebuilds a table drops its indexes with it, so rebuilding them
+        earlier would be wasted work.
     """
     fresh = not table_exists(conn, "jobs")
     create_tables(conn)

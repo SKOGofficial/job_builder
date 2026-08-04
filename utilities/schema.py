@@ -223,6 +223,15 @@ def create_tables(conn):
     Safe to run on an existing database: it adds what is missing and leaves
     what is there alone. It does *not* reshape an existing table - that is what
     the migrations are for.
+
+    Summary:
+        Run `SCHEMA_SQL` against a connection to create any missing tables.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to create tables on.
+
+    Raises:
+        sqlite3.Error: If the script fails.
     """
     conn.executescript(SCHEMA_SQL)
 
@@ -233,17 +242,56 @@ def create_indexes(conn):
     Kept separate from `create_tables` and always run *after* migrations: an
     index names columns, and on a not-yet-migrated database those columns do
     not exist yet. Running the two together fails on `idx_jobs_identity`.
+
+    Summary:
+        Run `INDEX_SQL` against a connection to create any missing indexes.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to create indexes on.
+
+    Raises:
+        sqlite3.Error: If the script fails - for example, if called before
+            migrations on a database still missing an indexed column.
     """
     conn.executescript(INDEX_SQL)
 
 
 def create_schema(conn):
-    """Tables and indexes together. For fresh databases and tests only."""
+    """Tables and indexes together. For fresh databases and tests only.
+
+    Summary:
+        Create both tables and indexes in one call.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to build the schema on.
+
+    Raises:
+        sqlite3.Error: Propagated from `create_tables` or `create_indexes`.
+
+    Note:
+        Only correct for a genuinely fresh database. An existing one must go
+        through `utilities/migrations.py`, which runs indexes after
+        migrations rather than immediately after tables.
+    """
     create_tables(conn)
     create_indexes(conn)
 
 
 def table_exists(conn, name):
+    """
+    Summary:
+        Report whether a table exists in the database.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to check.
+        name (str): The table name.
+
+    Returns:
+        bool: True when the table exists.
+
+    Raises:
+        sqlite3.Error: If the query fails.
+    """
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
     ).fetchone()
@@ -251,4 +299,22 @@ def table_exists(conn, name):
 
 
 def column_names(conn, table):
+    """
+    Summary:
+        List the column names a table currently has.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to inspect.
+        table (str): The table name. Interpolated directly, since `PRAGMA`
+            does not accept bound parameters - callers must only pass a
+            trusted, known table name.
+
+    Returns:
+        set[str]: The table's column names. Empty for a nonexistent table
+            rather than an error, since `PRAGMA table_info` on an unknown
+            table simply returns no rows.
+
+    Raises:
+        sqlite3.Error: If the pragma query fails.
+    """
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
