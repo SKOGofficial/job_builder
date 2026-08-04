@@ -14,6 +14,25 @@ Help the user log and manage all job applications locally. The app should reduce
 - Keep generated or changed files ASCII unless the existing file clearly requires otherwise.
 - Keep the app usable as a local desktop tool launched with `python app.py`.
 
+## Documentation Requirement For New Functions And Methods
+
+- Every function or method an agent adds must include a docstring or structured comment with:
+  - `Summary`: one short sentence describing what the function does. Always present.
+  - `Parameters`: each parameter name, type, and purpose.
+  - `Returns`: what the function returns and what that value means.
+  - `Raises`: any exceptions the function may raise and why.
+- **Omit a section that would be empty.** A function that takes no arguments has no
+  `Parameters` block, one that returns nothing has no `Returns` block, and one that raises
+  nothing has no `Raises` block. Never write `Parameters: None.` - the absence of the section
+  is the statement. Only `Summary` is unconditional.
+- Where a docstring already carries prose explaining *why* the code is the way it is, keep that
+  prose as the opening line or paragraph and add the structured fields beneath it. The prose is
+  the more valuable half; do not replace it with fields.
+- An optional `Note` section may follow the required ones, for a hazard or non-obvious
+  consequence a caller needs to know - for example that a write drops a row out of a pool
+  another stage reads.
+- Apply this requirement to all new code, including helpers, managers, UI callbacks, async workers, and pipeline stages.
+
 ## Approvals On Record
 
 - **2026-07-29** - user approved networked email access (Gmail, read-only).
@@ -97,7 +116,7 @@ Load-bearing, and easy to break by accident:
   thread. The scheduler is an asyncio task on that same loop, which is why it is safe.
 - Only blocking network calls go to `asyncio.to_thread`, and workers receive plain dicts,
   never sqlite `Row` objects.
-- A background *thread* that touches the store would violate this. Do not add one.
+- A background _thread_ that touches the store would violate this. Do not add one.
 
 ## Priority Work
 
