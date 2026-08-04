@@ -17,6 +17,30 @@ from utilities.theme import STATUSES
 from web.shell import card, page_shell, page_timer
 from web.state import get_state
 
+
+def _column(row, name, default=None):
+    """Read a column that may predate the current schema.
+
+    A row fetched through a cached statement can come back without a column
+    added by a later migration, so this degrades instead of raising - the same
+    guard `pipeline/orchestrator.py` uses for `list_unsubscribe`.
+
+    Summary:
+        Read a possibly-absent column off a row.
+
+    Parameters:
+        row (sqlite3.Row): The row to read.
+        name (str): The column name.
+        default: Returned when the column is absent or empty.
+
+    Returns:
+        The column value, or `default`.
+    """
+    try:
+        return row[name] or default
+    except (IndexError, KeyError):
+        return default
+
 NO_BODY_HINT = (
     "No message text stored for this match. Matches recorded before message bodies "
     "were saved show nothing here; run Check for replies again to fetch it."
@@ -206,6 +230,13 @@ def email_matches_page():
                     f'color:#fff;padding:2px 8px;border-radius:9999px;font-size:11px;'
                     f'font-weight:600">AI: {label} · {(match["ai_confidence"] or 0):.0%}</span>'
                 )
+                model = _column(match, "ai_model")
+                if model:
+                    # Which model said so. With more than one provider and a
+                    # shared confidence threshold, this is the only way to tell
+                    # afterwards whether a bad label came from the primary or
+                    # the fallback.
+                    ui.label(f"via {model}").classes("text-xs opacity-60")
                 if match["ai_applied"]:
                     previous = match["ai_previous_status"] or "unset"
                     ui.label(f"Applied automatically, replacing {previous}.").classes(

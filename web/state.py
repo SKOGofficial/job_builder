@@ -55,6 +55,33 @@ class AppState:
         # for tests and the CLI, which do not want a scheduler.
         self.pipeline = None
         self.scheduler = None
+        self._pool = None
+
+    @property
+    def pool(self):
+        """The model providers, built once and shared.
+
+        One pool for the process, for the same reason the scanner and the
+        classifier are: a cooldown earned at 14:00 has to still be in force at
+        14:10. It is also what lets Settings show the pipeline's real remaining
+        budget rather than a fresh pool's optimistic zero.
+
+        Summary:
+            Return the process-wide provider pool, creating it on first use.
+
+        Returns:
+            ProviderPool: The shared pool.
+
+        Note:
+            Built lazily and imported inside the property so this module stays
+            importable without the provider dependencies, which is what the
+            page tests rely on.
+        """
+        if self._pool is None:
+            from clients.providers.pool import ProviderPool
+
+            self._pool = ProviderPool(mail=self.mail)
+        return self._pool
 
     @property
     def dark(self):

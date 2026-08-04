@@ -81,8 +81,12 @@ def build_pipeline(state=None):
     """
     state = state or get_state()
     if state.pipeline is None:
+        # The pipeline draws from the same pool Settings displays, so the
+        # budget and cooldowns shown are the ones actually in force.
         state.pipeline = PipelineCycle(
-            state.store, state.mail, threshold=confidence_threshold()
+            state.store, state.mail,
+            client_factory=lambda: state.pool,
+            threshold=confidence_threshold(),
         )
     if state.scheduler is None:
         state.scheduler = PipelineScheduler(state.pipeline, poll_interval())

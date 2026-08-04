@@ -137,6 +137,26 @@ BUILDERS = {
     "anthropic": _build_anthropic,
 }
 
+#: What each provider *could* do, independent of whether it is configured.
+#: Needed because an unconfigured provider has no clients to infer from, and
+#: Settings must still offer it - with its state in the label - rather than
+#: omit it, or the missing key becomes undiscoverable.
+PROVIDER_SHAPES = {
+    "groq": frozenset({SHAPE_JSON}),
+    "gemini": frozenset({SHAPE_JSON, SHAPE_RESEARCH}),
+    "anthropic": frozenset({SHAPE_RESEARCH}),
+}
+
+#: What to call each provider in the UI. Declared here as well as returned by
+#: the builders, because a provider with no key never reaches its builder's
+#: return statement - and "Anthropic" appearing where a configured one says
+#: "Claude" reads as two different things rather than one unconfigured one.
+PROVIDER_DISPLAY = {
+    "groq": "Groq",
+    "gemini": "Gemini",
+    "anthropic": "Claude",
+}
+
 
 class ProviderState:
     """One provider's clients, and everything known about its current capacity.
@@ -149,10 +169,17 @@ class ProviderState:
     """
 
     def __init__(self, name, clients=None, display="", daily_limit=0,
-                 clock=time.monotonic):
+                 declared_shapes=None, clock=time.monotonic):
         self.name = name
-        self.display = display or name.title()
+        self.display = display or PROVIDER_DISPLAY.get(name) or name.title()
         self.clients = dict(clients or {})
+        #: What this provider could serve if configured. Falls back to what it
+        #: actually built, so a test double needs only pass clients.
+        self.declared_shapes = frozenset(
+            declared_shapes
+            if declared_shapes is not None
+            else PROVIDER_SHAPES.get(name, frozenset(self.clients))
+        )
         self.budget = Budget(daily_limit=daily_limit, clock=clock)
         self.cooldown_until = 0.0
         self.last_error = ""
@@ -282,15 +309,20 @@ class ProviderState:
             now (float): Current monotonic time.
 
         Returns:
-            dict: Keys `name`, `display`, `configured`, `model`, `cooling`,
-                `cooldown_seconds`, `last_error`, plus the budget's `used`,
-                `limit` and `remaining`.
+            dict: Keys `name`, `display`, `configured`, `model`, `shapes`,
+                `cooling`, `cooldown_seconds`, `last_error`, plus the budget's
+                `used`, `limit` and `remaining`.
         """
         state = {
             "name": self.name,
             "display": self.display,
             "configured": self.configured(),
             "model": getattr(self.client, "model", None),
+            # What this provider can be routed to. The Settings dropdowns
+            # filter on it, so Groq is never offered for research. Declared
+            # rather than built, so an unconfigured provider is still offered
+            # with a "no key" label instead of quietly disappearing.
+            "shapes": self.declared_shapes,
             "cooling": self.cooling_down(now),
             "cooldown_seconds": max(0, int(self.cooldown_until - now)),
             "last_error": self.last_error,

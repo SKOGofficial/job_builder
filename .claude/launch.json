@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "job-builder",
+      "runtimeExecutable": "C:\\Users\\SKOGo\\Desktop\\To_Move\\CODE\\job_builder\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": ["app.py", "--headless", "--port", "8099"],
+      "port": 8099
+    }
+  ]
+}
