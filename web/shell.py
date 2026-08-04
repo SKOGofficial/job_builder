@@ -4,12 +4,15 @@ Every page opens with `page_shell(...)`, which draws the header and drawer and
 then hands back a container for the page body.
 """
 
+import logging
 from contextlib import contextmanager
 
 from nicegui import context, ui
 
 from utilities.theme import PRIMARY_COLOR
 from web.state import get_state
+
+log = logging.getLogger(__name__)
 
 #: Quasar buttons default to the primary colour, which is the same blue the
 #: header is painted with. Left alone, the nav reads as blue-on-blue and is
@@ -19,19 +22,23 @@ HEADER_BUTTON = "flat dense no-caps color=white"
 HEADER_BUTTON_ACTIVE = "unelevated dense no-caps color=white text-color=primary"
 HEADER_ICON = "flat round dense color=white"
 
-#: Top tabs, mirroring the ones the Tkinter shell used.
+#: Top tabs. The two lists the app is built around - what you have applied to
+#: and what you have not - both live here rather than behind the drawer.
 NAV_TABS = [
     ("All jobs", "/"),
+    ("To apply", "/leads"),
     ("Add application", "/add"),
     ("Dashboard", "/dashboard"),
 ]
 
 #: Everything else, reached from the drawer.
 DRAWER_ENTRIES = [
+    ("Review queue", "/review", "rule"),
     ("Email matches", "/email-matches", "mark_email_unread"),
+    ("Experiences", "/experiences", "format_list_bulleted"),
     ("Settings", "/settings", "settings"),
     ("Profile", "/profile", "person"),
-    ("Resume & Experiences", "/resume", "description"),
+    ("Resume notes", "/resume", "description"),
 ]
 
 
@@ -51,6 +58,24 @@ def page_timer(interval, callback):
     # on_disconnect passes client as argument; timer.cancel() takes no args
     context.client.on_disconnect(lambda _: timer.cancel())
     return timer
+
+
+def pending_counts(state):
+    """Badge numbers for the drawer: work actually waiting on the user.
+
+    Never raises. A count is decoration, and a page that fails to render
+    because a badge query blew up would be a poor trade.
+    """
+    counts = {}
+    try:
+        counts["/review"] = state.mail.count_unlinked()
+    except Exception:
+        log.debug("Unlinked count failed", exc_info=True)
+    try:
+        counts["/email-matches"] = len(state.store.pending_email_matches())
+    except Exception:
+        log.debug("Pending match count failed", exc_info=True)
+    return counts
 
 
 @contextmanager
@@ -86,11 +111,18 @@ def page_shell(title, subtitle="", active=""):
     # Quasar collapses it to an overlay on narrow screens on its own.
     with ui.left_drawer(value=True).classes("p-4 gap-2").props("bordered") as drawer:
         ui.label("Menu").classes("text-base font-semibold mb-2")
+        counts = pending_counts(state)
         for label, target, icon in DRAWER_ENTRIES:
-            ui.button(label, icon=icon, on_click=lambda t=target: ui.navigate.to(t)).props(
+            button = ui.button(
+                label, icon=icon, on_click=lambda t=target: ui.navigate.to(t)
+            ).props(
                 "flat align=left no-caps"
                 + (" color=primary" if target == active else " color=inherit")
             ).classes("w-full")
+            waiting = counts.get(target)
+            if waiting:
+                with button:
+                    ui.badge(str(waiting)).props("color=red floating")
         ui.separator().classes("my-2")
         ui.label(
             "These sections store local profile context and the Gmail and AI automations."

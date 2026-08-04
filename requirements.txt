@@ -9,6 +9,12 @@ google-api-python-client
 google-auth
 google-auth-oauthlib
 
+# Research and resume generation. Claude does the low-volume, high-value half
+# of the work (company research with server-side web search, then tailoring),
+# while Groq below does the high-volume classification. The app runs without
+# this installed - research is skipped and leads simply wait unprepared.
+anthropic
+
 # Shared: Groq talks over plain REST, so no provider SDK is needed.
 python-dotenv
 keyring

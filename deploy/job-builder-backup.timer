@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily backup of the Job Board Tracker database
+
+[Timer]
+OnCalendar=daily
+# Spread the load and survive a machine that was asleep at the scheduled time.
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

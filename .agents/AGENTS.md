@@ -14,6 +14,30 @@ Help the user log and manage all job applications locally. The app should reduce
 - Keep generated or changed files ASCII unless the existing file clearly requires otherwise.
 - Keep the app usable as a local desktop tool launched with `python app.py`.
 
+## Approvals On Record
+
+- **2026-07-29** - user approved networked email access (Gmail, read-only).
+- **2026-08-02** - user approved running as a long-running service on an Ubuntu home
+  server, polling Gmail on a schedule and mirroring mail locally. This supersedes the
+  desktop-only reading of the constraint above: `python app.py` must still work as a
+  desktop tool, but `--headless` plus a systemd unit is now a supported deployment.
+- **2026-08-02** - user approved a second model provider (Anthropic) for company research
+  and resume generation, alongside the existing Groq classification.
+
+## Cost And Safety Rules Specific To This Repo
+
+- **The app has no authentication.** `host="127.0.0.1"` is the entire access control model.
+  Never change the default bind without saying plainly what it exposes.
+- **Never auto-merge two jobs** that collapse onto one `identity_key`. Report them. A wrong
+  merge destroys application history and the user cannot see that it happened.
+- **Never let the resolver guess** between several plausible roles. Link nothing and queue
+  it for review.
+- **Every automatic status write must be reversible**, capturing the previous status and
+  response date first. Applying `Rejected` stamps a response date, which drops the job out
+  of the pool future scans check.
+- **Keep the expensive model behind the relevance gate and the daily spend ceiling.**
+  Removing either turns a parser bug into a large bill.
+
 ## Code Organisation Preference
 
 The user wants code organised by section and purpose, split into relevant directories rather
@@ -43,13 +67,37 @@ modules back into one file.
   workers, and one module per page under `web/pages/`. Profile and Resume share
   `web/pages/text_storage.py`. Pages are rebuilt per request, so anything that must survive
   navigation belongs on `AppState`.
-- `clients/` holds external client integrations, neither of which imports a UI framework:
-  `gmail_client.py` (OAuth, Gmail API calls, and the async `GmailScanner`) and `llm_client.py`
-  (Groq config, prompting, pacing, and the async `ClassificationRunner`). Both publish progress
-  to subscribers and take an injectable executor for blocking calls.
-- The SQLite schema is created in `JobStore.init_db`, including the `email_matches` table.
-- `tests/` holds the suites: `test_gmail_matching.py`, `test_llm_classification.py` (both
-  unittest), and `test_web_pages.py` (pytest, NiceGUI user simulation). `pytest` runs all three.
+- `clients/` holds external client integrations, none of which imports a UI framework:
+  `gmail_client.py` (OAuth, Gmail API calls, History-API sync, and the async `GmailScanner`),
+  `llm_client.py` (Groq config, prompting, pacing, `complete_json`, and the async
+  `ClassificationRunner`), and `research_client.py` (Claude with server-side web search, plus
+  the `SpendLimiter`). All take an injectable caller/executor so tests never reach the network.
+- `pipeline/` holds the mailbox ingest pipeline, one module per stage: `sync`, `rough_filter`,
+  `router`, `resolver`, `extract`, `alerts`, `updates`, `acknowledgements`, `relevance`,
+  `generate`, `prepare`, `orchestrator`, `scheduler`, plus board parsers under
+  `pipeline/parsers/` registered in its `__init__.py`. Nothing here imports a UI framework, so
+  the whole pipeline runs from `cli.py` as well as the app.
+- Schema lives in `utilities/schema.py` (current shape, `SCHEMA_VERSION`) and
+  `utilities/migrations.py` (`PRAGMA user_version` gate, upgrade steps, pre-migration backup).
+  `JobStore.init_db` delegates to them. `utilities/identity.py` owns the (title, company,
+  location) identity model; `utilities/mailstore.py` owns pipeline persistence and shares
+  `JobStore`'s connection.
+- `deploy/` holds the systemd unit, backup script, and backup timer. `cli.py` is the
+  UI-free entry point for backfills, stats, and maintenance.
+- `tests/` holds the suites. `test_gmail_matching.py`, `test_llm_classification.py`,
+  `test_identity.py`, `test_migrations.py`, `test_rough_filter.py`, `test_resolver.py`,
+  `test_lifecycle.py`, `test_ingest.py`, and `test_generation.py` are unittest;
+  `test_web_pages.py` is pytest with NiceGUI user simulation. `pytest` runs all of them.
+
+## Concurrency Contract
+
+Load-bearing, and easy to break by accident:
+
+- Database access stays on the thread that opened the sqlite connection - the event loop
+  thread. The scheduler is an asyncio task on that same loop, which is why it is safe.
+- Only blocking network calls go to `asyncio.to_thread`, and workers receive plain dicts,
+  never sqlite `Row` objects.
+- A background *thread* that touches the store would violate this. Do not add one.
 
 ## Priority Work
 
@@ -75,3 +123,9 @@ modules back into one file.
 - Dashboard charts are distinct and readable.
 - Documentation reflects the new state.
 - `.agents/PROJECT_LOG.md` has a concise entry for the work completed.
+
+## Git and CI management
+
+- When working on a new feature always create a branch from main to start working on the feature
+- Throughout the feature life-cycle, make intermitent commits for each phase of the feature
+- If a program fails a CI automaitcally analyse the failure/error message and work on fixing the bug.

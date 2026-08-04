@@ -115,3 +115,64 @@ Verification:
 Verification:
 
 - Documentation-only change. No app code or database data was modified.
+
+## 2026-08-02 - Mailbox ingest pipeline and job identity rework
+
+Implements `.agents/EMAIL_PIPELINE_PLAN.md`. Branch `feature/email-ingest-pipeline`.
+
+Identity model:
+
+- Job identity moved from posting URL to a normalized (title, company, location) hash in
+  `utilities/identity.py`. Normalization collapses spelling only - "Sr." to "senior",
+  "Google LLC" to "Google" - and deliberately keeps seniority and level, because
+  over-merging destroys one role's history invisibly while under-merging is only untidy.
+- `job_id` stays the stable handle `email_matches` references; `identity_key` carries the
+  identity. New `job_sources` table records many board URLs per role, with each board's
+  own job ID.
+- Real migrations added: `utilities/schema.py` (current shape) and `utilities/migrations.py`
+  (`PRAGMA user_version` gate, table rebuild for the nullable `posting_url`, pre-migration
+  backup). The v1 backfill reports identity collisions rather than merging them.
+
+Pipeline (`pipeline/`, one module per stage):
+
+- Gmail sync over the History API with a bounded full-sync fallback when the cursor expires.
+- Rough filter that drops only what is confidently not job related, recording a verdict per
+  message so drops are auditable. Deliberately permissive; the model does the real triage.
+- Groq router labelling each message alert / update / acknowledgement / irrelevant.
+- Resolver placing a message against a role, strongest signal first, refusing to guess when
+  several roles remain plausible - those go to a review queue.
+- Handlers: alerts become leads, acknowledgements promote leads into applications (dates
+  taken from the email, not today), updates apply reversible status changes.
+- Links point at `identity_key`, so a promoted lead keeps every email already attached.
+- In-process asyncio scheduler, retention pass, and `cli.py` for backfills and maintenance.
+
+Research and generation:
+
+- `clients/research_client.py` uses Claude Opus 5 with server-side web search, gated by a
+  Groq relevance score and capped by a daily output-token ceiling.
+- `pipeline/generate.py` does deterministic bullet selection then template rendering
+  (Markdown and HTML always; PDF via Typst when available). Artifacts keyed on
+  `identity_key` so they survive promotion.
+
+Server readiness:
+
+- `--headless`, `--host`, `--no-poll` flags; logging to stderr for the journal; WAL and
+  busy timeout on the connection; pinned OAuth redirect port so consent can be tunnelled;
+  opt-in file backend for secrets where no keyring exists; `deploy/` systemd unit, backup
+  script using `VACUUM INTO`, and backup timer.
+
+Verification:
+
+- 267 tests pass (`python -m unittest discover -s tests -t .`), up from 155. New suites:
+  identity normalization, migrations against a frozen pre-migration schema, rough filter,
+  resolver ambiguity, end-to-end lifecycle, ingest, and generation.
+- No changes to `job_applications.sqlite3`. Migrations were exercised only against
+  temporary databases, and take a backup before any structural change.
+
+Known gaps:
+
+- No UI yet for the to-apply list, the per-role email timeline, or the unlinked review
+  queue. The store methods are in place (`messages_for_identity`, `unlinked_messages`,
+  `list_leads`); the pages are frontend work.
+- Duplicate identities from the v1 backfill are reported but there is no merge flow.
+- Only LinkedIn and Indeed have deterministic parsers; other boards use the model fallback.

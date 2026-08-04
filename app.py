@@ -13,6 +13,7 @@ move it off 8080.
 """
 
 import argparse
+import logging
 import os
 
 import clients.gmail_client as _gmail_client_mod
@@ -59,6 +60,10 @@ __all__ = [
 
 DEFAULT_PORT = 8080
 
+#: Loopback, and this is the app's entire access control model - there is no
+#: login page. Anything else exposes the mailbox mirror to that network.
+DEFAULT_HOST = "127.0.0.1"
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Job Board Tracker")
@@ -66,6 +71,28 @@ def parse_args(argv=None):
         "--browser",
         action="store_true",
         help="open in a normal browser tab instead of a native window",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help=(
+            "serve without a window or browser, for running as a service. "
+            "Reach it over an SSH tunnel or Tailscale."
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help=(
+            "interface to bind (default 127.0.0.1). The app has no "
+            "authentication, so binding anything else exposes your mailbox "
+            "mirror to that network."
+        ),
+    )
+    parser.add_argument(
+        "--no-poll",
+        action="store_true",
+        help="do not start the background Gmail poller",
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="port to serve on")
     return parser.parse_args(argv)
@@ -80,20 +107,55 @@ def native_available():
     return True
 
 
+def configure_logging():
+    """Send logs to stderr so systemd's journal captures them.
+
+    The scanner and classifier surface errors into a UI string, which vanishes
+    when no page is open. On a server that is most of the time, so anything
+    worth diagnosing at 3am has to reach the journal instead.
+    """
+    logging.basicConfig(
+        level=os.environ.get("JOB_BUILDER_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
+
+
 def main(argv=None):
     args = parse_args(argv)
+    configure_logging()
+
     # Imported here rather than at module scope so `import app` stays cheap for
     # tests and scripts that only want JobStore.
     from nicegui import ui
 
     import web.pages  # noqa: F401  (registers every route)
+    from web.startup import register_background_tasks
 
-    native = not args.browser and native_available()
-    if not args.browser and not native:
-        print(
-            "pywebview is not installed, so this will open in your browser instead.\n"
-            "For a native window: pip install pywebview"
+    if args.headless:
+        native = False
+        show = False
+    else:
+        native = not args.browser and native_available()
+        show = not native
+        if not args.browser and not native:
+            print(
+                "pywebview is not installed, so this will open in your browser instead.\n"
+                "For a native window: pip install pywebview"
+            )
+
+    if args.host != DEFAULT_HOST:
+        # Worth being loud about. There is no login page: whoever can reach the
+        # port can read every stored email body and the whole application
+        # history.
+        logging.getLogger(__name__).warning(
+            "Binding %s instead of %s. This app has NO authentication - anyone "
+            "who can reach this address can read your mailbox mirror. Prefer "
+            "loopback plus an SSH tunnel or Tailscale.",
+            args.host, DEFAULT_HOST,
         )
+
+    if not args.no_poll:
+        register_background_tasks()
 
     ui.run(
         title="Job Board Tracker",
@@ -101,9 +163,8 @@ def main(argv=None):
         port=args.port,
         native=native,
         reload=False,
-        show=not native,
-        # Local-only tool: binding to loopback keeps it off the network.
-        host="127.0.0.1",
+        show=show,
+        host=args.host,
         storage_secret=os.environ.get("NICEGUI_STORAGE_SECRET", "job-board-tracker-local"),
     )
 

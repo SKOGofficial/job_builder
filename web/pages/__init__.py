@@ -8,7 +8,10 @@ from web.pages import (  # noqa: F401  (imported for the @ui.page side effect)
     add_application,
     dashboard,
     email_matches,
+    experiences,
     jobs,
+    leads,
+    review,
     settings,
     text_storage,
 )
@@ -17,7 +20,10 @@ __all__ = [
     "jobs",
     "add_application",
     "dashboard",
+    "leads",
+    "review",
     "email_matches",
+    "experiences",
     "settings",
     "text_storage",
 ]

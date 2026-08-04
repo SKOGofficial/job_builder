@@ -15,6 +15,7 @@ from nicegui import ui
 import utilities.store as store_module
 from clients import llm_client
 from utilities import credentials
+from utilities.identity import identity_key
 from utilities.store import JobStore
 from web.state import AppState, set_state
 
@@ -161,9 +162,12 @@ def use_stub_classifier(state, results):
         ("/add", "Add a job application"),
         ("/dashboard", "Application dashboard"),
         ("/email-matches", "Email matches"),
+        ("/leads", "To apply"),
+        ("/review", "Review queue"),
+        ("/experiences", "Experiences"),
         ("/settings", "Settings"),
         ("/profile", "Profile"),
-        ("/resume", "Resume & Experiences"),
+        ("/resume", "Resume notes"),
     ],
 )
 async def test_every_route_renders(user, state, route, heading):
@@ -384,10 +388,12 @@ async def test_top_nav_reaches_its_pages(user, state):
 
 async def test_drawer_reaches_its_pages(user, state):
     for label, heading in [
+        ("Review queue", "could not attach to an application"),
         ("Email matches", "Suggested replies matched"),
+        ("Experiences", "Individual resume bullets"),
         ("Settings", "AI classification (Groq)"),
         ("Profile", "Store contact details"),
-        ("Resume & Experiences", "Store experience bullets"),
+        ("Resume notes", "Free-text resume and CV context"),
     ]:
         await user.open("/")
         user.find(label).click()
@@ -431,6 +437,214 @@ async def test_settings_offers_resume_after_a_rate_limit(user, state, store):
     user.find("Classify 2 message(s)").click()
     await user.should_see("Groq rate limit reached")
     await user.should_see("Resume classification")
+
+
+# Leads ---------------------------------------------------------------------
+
+
+def add_lead(state, title="Backend Engineer", company="Acme", status="ready", score=0.9):
+    key = identity_key(title, company, "Remote")
+    state.mail.upsert_lead({
+        "identity_key": key,
+        "title": title,
+        "company": company,
+        "location": "Remote",
+        "apply_url": "https://example.com/jobs/1",
+        "board": "linkedin",
+        "board_job_id": "1",
+        "status": status,
+    })
+    lead = state.mail.lead_by_identity(key)
+    if score is not None:
+        state.mail.set_lead_relevance(lead["id"], score, "Matches your target roles.")
+    state.mail.commit()
+    return state.mail.lead_by_identity(key)
+
+
+async def test_leads_page_lists_open_leads(user, state):
+    add_lead(state)
+    await user.open("/leads")
+    await user.should_see("Backend Engineer")
+    await user.should_see("Relevance 90%")
+    await user.should_see("Matches your target roles.")
+
+
+async def test_empty_leads_page_explains_itself(user, state):
+    await user.open("/leads")
+    await user.should_see("No leads here yet")
+
+
+async def test_promoting_a_lead_creates_an_application(user, state, store):
+    add_lead(state)
+    await user.open("/leads")
+    user.find("I applied to this").click()
+    await user.should_see("Moved to applications")
+
+    jobs = store.list_jobs()
+    assert [row["position_title"] for row in jobs] == ["Backend Engineer"]
+    assert jobs[0]["status"] == "Applied"
+    # The identity carries across, which is what keeps linked mail attached.
+    assert jobs[0]["identity_key"] == identity_key("Backend Engineer", "Acme", "Remote")
+
+
+async def test_dismissing_a_lead_removes_it_from_the_open_list(user, state):
+    add_lead(state)
+    await user.open("/leads")
+    user.find("Not interested").click()
+    await user.should_see("Lead dismissed")
+    assert state.mail.list_leads() == []
+
+
+# Review queue --------------------------------------------------------------
+
+
+def add_message(state, message_id="msg-1", sender="careers@acme.com",
+                category="job_update", subject="About your application"):
+    state.mail.upsert_message({
+        "id": message_id,
+        "thread_id": "t-1",
+        "sender": sender,
+        "subject": subject,
+        "date": "Tue, 28 Jul 2026 10:00:00 -0400",
+        "snippet": "We wanted to follow up.",
+        "labels": [],
+    })
+    state.mail.store_body(message_id, "We wanted to follow up on your application.")
+    state.mail.record_category(message_id, category, 0.9, "Mentions an application.")
+    state.mail.commit()
+
+
+async def test_review_queue_lists_unplaced_messages(user, state):
+    add_message(state)
+    await user.open("/review")
+    await user.should_see("About your application")
+    await user.should_see("Application update")
+
+
+async def test_empty_review_queue_explains_itself(user, state):
+    await user.open("/review")
+    await user.should_see("Nothing waiting")
+
+
+async def test_marking_a_sender_not_job_related_blocks_the_domain(user, state):
+    add_message(state)
+    await user.open("/review")
+    user.find("Not job related").click()
+    await user.should_see("dropped before classification")
+    assert "acme.com" in state.mail.denied_domains()
+
+
+async def test_linked_message_appears_on_the_job_timeline(user, state, store):
+    # The timeline lives in a dialog behind a table row click, and table rows
+    # are props rather than elements, so there is nothing to click in the
+    # simulation. Rendering the component directly is the closest honest test.
+    from web.pages.jobs import timeline
+
+    add_job(store, company="Acme", index=1, title="Engineer")
+    job = store.list_jobs()[0]
+    add_message(state)
+    state.mail.link_message("msg-1", job["identity_key"], "update",
+                            resolved_by="manual")
+    state.mail.commit()
+
+    await user.open("/")
+    with user:
+        timeline(state.mail, job["identity_key"])
+    await user.should_see("Email timeline")
+    await user.should_see("About your application")
+    await user.should_see("linked by you")
+
+
+async def test_timeline_labels_the_pipelines_own_link_types(user, state, store):
+    # The pipeline stores the classifier's category as the link type, so the
+    # timeline has to label `job_update`, not just `update`.
+    from web.pages.jobs import timeline
+
+    add_job(store, company="Acme", index=1, title="Engineer")
+    job = store.list_jobs()[0]
+    add_message(state)
+    state.mail.link_message("msg-1", job["identity_key"], "job_update",
+                            resolved_by="alert_parser")
+    state.mail.commit()
+
+    await user.open("/")
+    with user:
+        timeline(state.mail, job["identity_key"])
+    await user.should_see("Update")
+    await user.should_not_see("job_update")
+
+
+async def test_linking_from_the_review_queue_reaches_the_timeline(user, state, store):
+    from web.pages.jobs import timeline
+
+    add_job(store, company="Acme", index=1, title="Engineer")
+    job = store.list_jobs()[0]
+    add_message(state)
+
+    await user.open("/review")
+    user.find("About your application").click()
+    await user.should_see("Choose an application")
+
+    # The picker is keyed on identity, which is what a link points at.
+    select = next(iter(user.find(kind=ui.select).elements))
+    with user:
+        select.set_value(job["identity_key"])
+    user.find("Link").click()
+    await user.should_see("appears on that job's timeline")
+
+    await user.open("/")
+    with user:
+        timeline(state.mail, job["identity_key"])
+    await user.should_see("About your application")
+    await user.should_see("linked by you")
+
+
+async def test_timeline_is_empty_without_links(user, state, store):
+    from web.pages.jobs import timeline
+
+    add_job(store, company="Acme", index=1, title="Engineer")
+    job = store.list_jobs()[0]
+
+    await user.open("/")
+    with user:
+        timeline(state.mail, job["identity_key"])
+    await user.should_see("No emails linked to this role yet")
+
+
+# Experiences ---------------------------------------------------------------
+
+
+async def test_experiences_round_trip(user, state):
+    state.mail.add_experience({
+        "kind": "work",
+        "organisation": "Acme",
+        "role": "Engineer",
+        "bullet": "Built the ingest pipeline.",
+        "tags": "python, sqlite",
+    })
+    await user.open("/experiences")
+    await user.should_see("Built the ingest pipeline.")
+    await user.should_see("python")
+
+
+async def test_empty_experiences_page_explains_itself(user, state):
+    await user.open("/experiences")
+    await user.should_see("No experiences stored yet")
+
+
+# Pipeline settings ---------------------------------------------------------
+
+
+async def test_settings_shows_the_pipeline_card(user, state):
+    await user.open("/settings")
+    await user.should_see("Mailbox ingest")
+    await user.should_see("Blocked senders")
+
+
+async def test_blocked_domains_are_listed_and_removable(user, state):
+    state.mail.deny_sender("newsletter.example.com")
+    await user.open("/settings")
+    await user.should_see("newsletter.example.com")
 
 
 async def test_dark_mode_choice_is_stored(user, state, store):

@@ -1,13 +1,29 @@
-"""SQLite persistence and the pure helpers that derive Job IDs.
+"""SQLite persistence for applications, and the helpers that derive Job IDs.
 
-This module holds no Tkinter code so it can be imported and tested headlessly.
+This module holds no UI code so it can be imported and tested headlessly.
+
+Two identity schemes coexist here. `url_hash` is the original: a hash of the
+normalized posting URL. `identity_key` (see `utilities/identity.py`) is the
+current one, derived from title/company/location, because different boards
+hand out different URLs for the same role. Rows created before the rework keep
+their URL-derived `job_id` as a stable handle - `email_matches` references it -
+while `identity_key` carries the actual identity.
+
+The mailbox mirror, leads, and generated artifacts live in
+`utilities/mailstore.py` and share this connection.
 """
 
 import hashlib
+import logging
 import os
 import sqlite3
 from datetime import date, datetime, timedelta
 from urllib.parse import urlparse, urlunparse
+
+from utilities.identity import candidate_keys, identity_key, identity_scheme
+from utilities.migrations import initialise
+
+log = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "job_applications.sqlite3")
@@ -39,96 +55,47 @@ class JobStore:
         # Resolved at call time rather than as a default argument value. A
         # default would bind DB_PATH at import, so tests that reassign it would
         # silently keep using the real database.
-        self.conn = sqlite3.connect(db_path or DB_PATH)
+        self.db_path = db_path or DB_PATH
+        self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
+        self.configure_connection()
         self.init_db()
 
-    def init_db(self):
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_id TEXT NOT NULL UNIQUE,
-                url_hash TEXT NOT NULL,
-                posting_url TEXT NOT NULL,
-                position_title TEXT NOT NULL,
-                company TEXT,
-                job_type TEXT NOT NULL,
-                requires_oa INTEGER NOT NULL DEFAULT 0,
-                completed_oa INTEGER NOT NULL DEFAULT 0,
-                received_references INTEGER NOT NULL DEFAULT 0,
-                payment_amount TEXT,
-                payment_period TEXT,
-                status TEXT NOT NULL,
-                application_date TEXT NOT NULL,
-                response_date TEXT,
-                notes TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
+    def configure_connection(self):
+        """Pragmas for a process that stays up.
 
-            CREATE TABLE IF NOT EXISTS profile (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS email_matches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_id TEXT NOT NULL,
-                gmail_message_id TEXT NOT NULL,
-                sender TEXT,
-                subject TEXT,
-                received_date TEXT,
-                snippet TEXT,
-                body_text TEXT,
-                ai_status TEXT,
-                ai_confidence REAL,
-                ai_reason TEXT,
-                ai_classified_at TEXT,
-                ai_applied INTEGER NOT NULL DEFAULT 0,
-                ai_previous_status TEXT,
-                ai_previous_response_date TEXT,
-                reviewed INTEGER NOT NULL DEFAULT 0,
-                dismissed INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                UNIQUE(job_id, gmail_message_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_jobs_url_hash ON jobs(url_hash);
-            CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-            CREATE INDEX IF NOT EXISTS idx_jobs_application_date ON jobs(application_date);
-            CREATE INDEX IF NOT EXISTS idx_email_matches_job_id ON email_matches(job_id);
-            """
-        )
-        self.migrate()
-        self.conn.commit()
-
-    def migrate(self):
-        """Add columns that later versions introduced.
-
-        CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a database
-        made before message bodies were stored keeps the old column set until it
-        is widened here. Adding a column is additive and keeps existing rows.
+        WAL lets the maintenance CLI and the backup timer read while the app
+        writes; without it either one blocks the poller. `busy_timeout` turns
+        the remaining contention into a short wait instead of an immediate
+        "database is locked". Both are no-ops on an in-memory test database.
         """
-        existing = {
-            row["name"] for row in self.conn.execute("PRAGMA table_info(email_matches)")
-        }
-        added = [
-            ("snippet", "TEXT"),
-            ("body_text", "TEXT"),
-            ("ai_status", "TEXT"),
-            ("ai_confidence", "REAL"),
-            ("ai_reason", "TEXT"),
-            ("ai_classified_at", "TEXT"),
-            ("ai_applied", "INTEGER NOT NULL DEFAULT 0"),
-            ("ai_previous_status", "TEXT"),
-            ("ai_previous_response_date", "TEXT"),
-        ]
-        for column, declaration in added:
-            if column not in existing:
-                self.conn.execute(
-                    f"ALTER TABLE email_matches ADD COLUMN {column} {declaration}"
-                )
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+
+    def init_db(self):
+        """Create or upgrade the schema.
+
+        Delegates to `utilities/migrations.py`, which stamps a fresh database
+        at the current version and runs the versioned upgrades on an existing
+        one. Backups before a structural change happen there.
+        """
+        return initialise(self.conn, self.db_path)
+
+    def close(self):
+        """Release the connection. Long-running processes never call this;
+        tests do, to keep ResourceWarnings out of the output."""
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
 
     # Job records -----------------------------------------------------------
 
@@ -147,41 +114,162 @@ class JobStore:
             return base
         return f"{base}-{len(rows) + 1}"
 
+    def next_identity_job_id(self, key):
+        """Job ID for a row that has no posting URL to hash.
+
+        Applies the same `-2` correlation suffix as `next_job_id` so a second
+        genuinely-distinct posting under one identity can still be stored.
+        """
+        rows = self.conn.execute(
+            "SELECT job_id FROM jobs WHERE job_id = ? OR job_id LIKE ?", (key, f"{key}-%")
+        ).fetchall()
+        return key if not rows else f"{key}-{len(rows) + 1}"
+
     def create_job(self, data):
+        """Insert an application.
+
+        `data` keeps the shape the add-application form has always sent, so the
+        UI needs no change. Three keys are optional and default sensibly:
+        `location` (new with the identity model), and `posting_url` (a job
+        created from an acknowledgement email may never have had one).
+        """
         now = datetime.now().isoformat(timespec="seconds")
-        job_id = self.next_job_id(data["posting_url"])
+        posting_url = (data.get("posting_url") or "").strip()
+        location = (data.get("location") or "").strip()
+        key = identity_key(data["position_title"], data.get("company"), location)
+
+        if posting_url:
+            job_id = self.next_job_id(posting_url)
+            stored_hash = url_hash(posting_url)
+            stored_url = normalize_url(posting_url)
+        else:
+            job_id = self.next_identity_job_id(key)
+            stored_hash = None
+            stored_url = None
+
         self.conn.execute(
             """
             INSERT INTO jobs (
-                job_id, url_hash, posting_url, position_title, company, job_type,
+                job_id, identity_key, identity_scheme, url_hash, posting_url,
+                position_title, company, location, job_type,
                 requires_oa, completed_oa, received_references, payment_amount,
                 payment_period, status, application_date, response_date, notes,
                 created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
-                url_hash(data["posting_url"]),
-                normalize_url(data["posting_url"]),
+                key,
+                identity_scheme(location),
+                stored_hash,
+                stored_url,
                 data["position_title"],
-                data["company"],
+                data.get("company"),
+                location or None,
                 data["job_type"],
-                int(data["requires_oa"]),
-                int(data["completed_oa"]),
-                int(data["received_references"]),
-                data["payment_amount"],
-                data["payment_period"],
+                int(data.get("requires_oa") or 0),
+                int(data.get("completed_oa") or 0),
+                int(data.get("received_references") or 0),
+                data.get("payment_amount"),
+                data.get("payment_period"),
                 data["status"],
                 data["application_date"],
-                data["response_date"],
-                data["notes"],
+                data.get("response_date"),
+                data.get("notes"),
                 now,
                 now,
             ),
         )
+        if posting_url:
+            self.add_job_source(job_id, stored_url, data.get("board"),
+                                data.get("board_job_id"))
         self.conn.commit()
         return job_id
+
+    # Identity lookup -------------------------------------------------------
+
+    def job_by_identity(self, key):
+        return self.conn.execute(
+            "SELECT * FROM jobs WHERE identity_key = ? ORDER BY id LIMIT 1", (key,)
+        ).fetchone()
+
+    def find_job(self, title, company, location=None):
+        """Resolve a job from a role description.
+
+        Tries the location-qualified key first, then the bare title+company
+        key, so rows written before locations existed are still reachable. See
+        `identity.candidate_keys`.
+        """
+        for key in candidate_keys(title, company, location):
+            row = self.job_by_identity(key)
+            if row is not None:
+                return row
+        return None
+
+    def duplicate_identity_groups(self):
+        """Jobs sharing one identity key, for the merge review page.
+
+        Populated mainly by the v1 backfill, where the same role logged from
+        two boards under two URLs collapses onto one key. Never merged
+        automatically - a wrong merge destroys application history invisibly.
+        """
+        return self.conn.execute(
+            """
+            SELECT identity_key, COUNT(*) AS count,
+                   GROUP_CONCAT(job_id) AS job_ids
+            FROM jobs
+            WHERE identity_key IS NOT NULL
+            GROUP BY identity_key
+            HAVING COUNT(*) > 1
+            ORDER BY count DESC
+            """
+        ).fetchall()
+
+    # Job sources -----------------------------------------------------------
+
+    def add_job_source(self, job_id, url, board=None, board_job_id=None):
+        """Record one board's URL for a job.
+
+        A repeat of the same URL *enriches* rather than no-ops. `create_job`
+        stores the URL before anything has parsed a board out of it, so the
+        alert parser almost always arrives second with the useful half - and a
+        plain INSERT OR IGNORE would throw that away, leaving
+        `job_by_board_reference` permanently unable to find the row.
+
+        Existing values are never overwritten with NULL.
+        """
+        self.conn.execute(
+            """
+            INSERT INTO job_sources (job_id, url, board, board_job_id, first_seen)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(job_id, url) DO UPDATE SET
+                board = COALESCE(excluded.board, board),
+                board_job_id = COALESCE(excluded.board_job_id, board_job_id)
+            """,
+            (job_id, url, board, board_job_id,
+             datetime.now().isoformat(timespec="seconds")),
+        )
+        self.conn.commit()
+
+    def job_sources(self, job_id):
+        return self.conn.execute(
+            "SELECT * FROM job_sources WHERE job_id = ? ORDER BY first_seen", (job_id,)
+        ).fetchall()
+
+    def job_by_board_reference(self, board, board_job_id):
+        """Strongest resolution signal: the board's own ID for the posting."""
+        if not board or not board_job_id:
+            return None
+        return self.conn.execute(
+            """
+            SELECT j.* FROM jobs j
+            JOIN job_sources s ON s.job_id = j.job_id
+            WHERE s.board = ? AND s.board_job_id = ?
+            LIMIT 1
+            """,
+            (board, board_job_id),
+        ).fetchone()
 
     def update_status(self, row_id, status):
         now = datetime.now().isoformat(timespec="seconds")
