@@ -1,0 +1,3 @@
+notes:
+the email matches pages is getting emails from job alerts and somehow matching them to some sort of classification when they should be in the leads section
+at some point the code just stops providing the backend for the server: something is going on. 

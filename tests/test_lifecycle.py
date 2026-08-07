@@ -13,6 +13,8 @@ No network: the model client is a scripted fake, the same way
 `tests/test_llm_classification.py` injects its HTTP call.
 """
 
+import asyncio
+import time
 import unittest
 
 from clients.llm_client import GroqRateLimited
@@ -71,6 +73,11 @@ class FakeClient:
         return parser(self.replies.pop(0))
 
 
+async def immediate(func, *args):
+    """Executor stand-in that calls straight through, no thread involved."""
+    return func(*args)
+
+
 def make_app():
     store = JobStore(":memory:")
     mail = MailStore(store.conn)
@@ -90,34 +97,34 @@ def add_message(mail, message_id, sender, subject, body, category,
     return mail.message(message_id)
 
 
-class TestAlertToLeads(unittest.TestCase):
-    def test_digest_becomes_several_leads(self):
+class TestAlertToLeads(unittest.IsolatedAsyncioTestCase):
+    async def test_digest_becomes_several_leads(self):
         store, mail, _ = make_app()
         message = add_message(mail, "alert-1", "jobs-noreply@linkedin.com",
                               "2 new jobs", LINKEDIN_ALERT, CATEGORY_ALERT)
 
-        created, skipped, linked = AlertHandler(store, mail).handle(message)
+        created, skipped, linked = await AlertHandler(store, mail, executor=immediate).handle(message)
         self.assertEqual(created, 2)
         self.assertEqual(skipped, 0)
 
         titles = sorted(row["title"] for row in mail.list_leads())
         self.assertEqual(titles, ["Product Designer", "Senior Backend Engineer"])
 
-    def test_one_email_links_to_many_identities(self):
+    async def test_one_email_links_to_many_identities(self):
         # The reason message_links is a link table and not a column.
         store, mail, _ = make_app()
         message = add_message(mail, "alert-1", "jobs-noreply@linkedin.com",
                               "2 new jobs", LINKEDIN_ALERT, CATEGORY_ALERT)
-        AlertHandler(store, mail).handle(message)
+        await AlertHandler(store, mail, executor=immediate).handle(message)
         self.assertEqual(len(mail.links_for_message("alert-1")), 2)
 
-    def test_apply_url_is_canonical_not_tracking(self):
+    async def test_apply_url_is_canonical_not_tracking(self):
         # A tracking wrapper can expire or be single-use; a dead link defeats
         # the entire click-through flow.
         store, mail, _ = make_app()
         message = add_message(mail, "alert-1", "jobs-noreply@linkedin.com",
                               "2 new jobs", LINKEDIN_ALERT, CATEGORY_ALERT)
-        AlertHandler(store, mail).handle(message)
+        await AlertHandler(store, mail, executor=immediate).handle(message)
 
         lead = mail.lead_by_identity(
             identity_key("Senior Backend Engineer", "Stripe",
@@ -128,20 +135,20 @@ class TestAlertToLeads(unittest.TestCase):
         self.assertIn("trackingId", lead["tracking_url"])
         self.assertEqual(lead["board_job_id"], "4123456789")
 
-    def test_repeat_digest_does_not_duplicate(self):
+    async def test_repeat_digest_does_not_duplicate(self):
         store, mail, _ = make_app()
         first = add_message(mail, "alert-1", "jobs-noreply@linkedin.com",
                             "2 new jobs", LINKEDIN_ALERT, CATEGORY_ALERT)
         second = add_message(mail, "alert-2", "jobs-noreply@linkedin.com",
                              "2 new jobs", LINKEDIN_ALERT, CATEGORY_ALERT)
-        handler = AlertHandler(store, mail)
-        handler.handle(first)
-        created, _, _ = handler.handle(second)
+        handler = AlertHandler(store, mail, executor=immediate)
+        await handler.handle(first)
+        created, _, _ = await handler.handle(second)
 
         self.assertEqual(created, 0, "same posting must not become a second lead")
         self.assertEqual(len(mail.list_leads()), 2)
 
-    def test_already_applied_role_is_not_resurrected(self):
+    async def test_already_applied_role_is_not_resurrected(self):
         # Boards keep recommending roles you have already applied to. A list
         # that resurrects finished work stops being trusted.
         store, mail, _ = make_app()
@@ -154,24 +161,24 @@ class TestAlertToLeads(unittest.TestCase):
         message = add_message(mail, "alert-1", "jobs-noreply@linkedin.com",
                               "2 new jobs", LINKEDIN_ALERT, CATEGORY_ALERT)
 
-        created, skipped, _ = AlertHandler(store, mail).handle(message)
+        created, skipped, _ = await AlertHandler(store, mail, executor=immediate).handle(message)
         self.assertEqual(created, 1)
         self.assertEqual(skipped, 1)
         self.assertEqual([r["title"] for r in mail.list_leads()],
                          ["Product Designer"])
 
 
-class TestAcknowledgementPromotes(unittest.TestCase):
-    def setUp(self):
+class TestAcknowledgementPromotes(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
         self.store, self.mail, self.resolver = make_app()
         alert = add_message(self.mail, "alert-1", "jobs-noreply@linkedin.com",
                             "2 new jobs", LINKEDIN_ALERT, CATEGORY_ALERT,
                             date_header="Mon, 02 Feb 2026 09:00:00 -0800")
-        AlertHandler(self.store, self.mail).handle(alert)
+        await AlertHandler(self.store, self.mail, executor=immediate).handle(alert)
         self.key = identity_key("Senior Backend Engineer", "Stripe",
                                 "San Francisco, CA (Remote)")
 
-    def test_alert_email_survives_promotion(self):
+    async def test_alert_email_survives_promotion(self):
         # THE test. The alert that surfaced the role must still be on the
         # job's timeline after the role becomes an application.
         ack = add_message(
@@ -184,15 +191,15 @@ class TestAcknowledgementPromotes(unittest.TestCase):
                             '"location": "San Francisco, CA (Remote)", '
                             '"confidence": 0.95, "reason": "receipt"}'])
 
-        result = AcknowledgementHandler(
-            self.store, self.mail, self.resolver, client).handle(ack)
+        result = await AcknowledgementHandler(
+            self.store, self.mail, self.resolver, client, executor=immediate).handle(ack)
 
         self.assertEqual(result["action"], "promoted")
         timeline = self.mail.messages_for_identity(self.key)
         self.assertEqual([row["gmail_message_id"] for row in timeline],
                          ["alert-1", "ack-1"])
 
-    def test_lead_leaves_the_to_apply_list(self):
+    async def test_lead_leaves_the_to_apply_list(self):
         ack = add_message(
             self.mail, "ack-1", "no-reply@stripe.com", "Thanks for applying",
             "We received your application.", CATEGORY_ACKNOWLEDGEMENT,
@@ -201,13 +208,13 @@ class TestAcknowledgementPromotes(unittest.TestCase):
                             '"company": "Stripe", '
                             '"location": "San Francisco, CA (Remote)", '
                             '"confidence": 0.95, "reason": "receipt"}'])
-        AcknowledgementHandler(self.store, self.mail, self.resolver, client).handle(ack)
+        await AcknowledgementHandler(self.store, self.mail, self.resolver, client, executor=immediate).handle(ack)
 
         open_titles = [row["title"] for row in self.mail.list_leads()]
         self.assertNotIn("Senior Backend Engineer", open_titles)
         self.assertEqual(self.mail.lead_by_identity(self.key)["status"], LEAD_APPLIED)
 
-    def test_job_keeps_the_leads_clean_fields(self):
+    async def test_job_keeps_the_leads_clean_fields(self):
         # The acknowledgement often says something looser than the board did.
         ack = add_message(
             self.mail, "ack-1", "no-reply@stripe.com", "Thanks for applying",
@@ -216,7 +223,7 @@ class TestAcknowledgementPromotes(unittest.TestCase):
             date_header="Tue, 03 Feb 2026 10:00:00 -0800")
         client = FakeClient(['{"title": "Engineering team", "company": "Stripe", '
                             '"location": null, "confidence": 0.6, "reason": "vague"}'])
-        AcknowledgementHandler(self.store, self.mail, self.resolver, client).handle(ack)
+        await AcknowledgementHandler(self.store, self.mail, self.resolver, client, executor=immediate).handle(ack)
 
         job = self.store.job_by_identity(self.key)
         self.assertIsNotNone(job, "should resolve to the lead, not the vague title")
@@ -226,7 +233,7 @@ class TestAcknowledgementPromotes(unittest.TestCase):
         sources = self.store.job_sources(job["job_id"])
         self.assertEqual(sources[0]["board_job_id"], "4123456789")
 
-    def test_application_date_comes_from_the_email(self):
+    async def test_application_date_comes_from_the_email(self):
         # A backfill processing three-week-old mail must not stamp today.
         ack = add_message(
             self.mail, "ack-1", "no-reply@stripe.com", "Thanks for applying",
@@ -236,12 +243,12 @@ class TestAcknowledgementPromotes(unittest.TestCase):
                             '"company": "Stripe", '
                             '"location": "San Francisco, CA (Remote)", '
                             '"confidence": 0.95, "reason": "receipt"}'])
-        AcknowledgementHandler(self.store, self.mail, self.resolver, client).handle(ack)
+        await AcknowledgementHandler(self.store, self.mail, self.resolver, client, executor=immediate).handle(ack)
 
         job = self.store.job_by_identity(self.key)
         self.assertEqual(job["application_date"], "2026-01-06")
 
-    def test_unknown_role_is_created_from_the_receipt(self):
+    async def test_unknown_role_is_created_from_the_receipt(self):
         # No lead, no job - but an acknowledgement is evidence the application
         # really happened, so the job is created.
         ack = add_message(
@@ -251,8 +258,8 @@ class TestAcknowledgementPromotes(unittest.TestCase):
                             '"location": "Remote", "confidence": 0.9, '
                             '"reason": "receipt"}'])
 
-        result = AcknowledgementHandler(
-            self.store, self.mail, self.resolver, client).handle(ack)
+        result = await AcknowledgementHandler(
+            self.store, self.mail, self.resolver, client, executor=immediate).handle(ack)
         self.assertEqual(result["action"], "created")
 
         job = self.store.find_job("Data Engineer", "NewCorp", "Remote")
@@ -260,27 +267,28 @@ class TestAcknowledgementPromotes(unittest.TestCase):
         self.assertEqual(job["status"], "Applied")
 
 
-class TestUpdatesAfterPromotion(unittest.TestCase):
-    def setUp(self):
+class TestUpdatesAfterPromotion(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
         self.store, self.mail, self.resolver = make_app()
         alert = add_message(self.mail, "alert-1", "jobs-noreply@linkedin.com",
                             "2 new jobs", LINKEDIN_ALERT, CATEGORY_ALERT,
                             date_header="Mon, 02 Feb 2026 09:00:00 -0800")
-        AlertHandler(self.store, self.mail).handle(alert)
+        await AlertHandler(self.store, self.mail, executor=immediate).handle(alert)
         ack = add_message(self.mail, "ack-1", "no-reply@stripe.com",
                           "Thanks for applying", "We received it.",
                           CATEGORY_ACKNOWLEDGEMENT,
                           date_header="Tue, 03 Feb 2026 10:00:00 -0800")
-        AcknowledgementHandler(
+        await AcknowledgementHandler(
             self.store, self.mail, self.resolver,
             FakeClient(['{"title": "Senior Backend Engineer", "company": "Stripe", '
                         '"location": "San Francisco, CA (Remote)", '
                         '"confidence": 0.95, "reason": "receipt"}']),
+            executor=immediate,
         ).handle(ack)
         self.key = identity_key("Senior Backend Engineer", "Stripe",
                                 "San Francisco, CA (Remote)")
 
-    def test_confident_rejection_applies_and_appears_on_the_timeline(self):
+    async def test_confident_rejection_applies_and_appears_on_the_timeline(self):
         update = add_message(self.mail, "upd-1", "no-reply@stripe.com",
                              "Update on your application",
                              "We will not be moving forward.", CATEGORY_UPDATE,
@@ -291,8 +299,8 @@ class TestUpdatesAfterPromotion(unittest.TestCase):
                             '"status": "Rejected", "confidence": 0.97, '
                             '"reason": "explicit rejection"}'])
 
-        outcome = UpdateHandler(self.store, self.mail, self.resolver,
-                                client).handle(update)
+        outcome = await UpdateHandler(self.store, self.mail, self.resolver,
+                                client, executor=immediate).handle(update)
         self.assertTrue(outcome["status_applied"])
         self.assertEqual(self.store.job_by_identity(self.key)["status"], "Rejected")
 
@@ -300,7 +308,7 @@ class TestUpdatesAfterPromotion(unittest.TestCase):
                     self.mail.messages_for_identity(self.key)]
         self.assertEqual(timeline, ["alert-1", "ack-1", "upd-1"])
 
-    def test_low_confidence_links_without_applying(self):
+    async def test_low_confidence_links_without_applying(self):
         # Placing an email and understanding it are independent decisions.
         update = add_message(self.mail, "upd-2", "no-reply@stripe.com",
                              "A quick note", "Some ambiguous text.",
@@ -312,13 +320,13 @@ class TestUpdatesAfterPromotion(unittest.TestCase):
                             '"status": "Interview", "confidence": 0.4, '
                             '"reason": "unsure"}'])
 
-        outcome = UpdateHandler(self.store, self.mail, self.resolver,
-                                client).handle(update)
+        outcome = await UpdateHandler(self.store, self.mail, self.resolver,
+                                client, executor=immediate).handle(update)
         self.assertTrue(outcome["linked"], "should still show on the timeline")
         self.assertFalse(outcome["status_applied"])
         self.assertEqual(self.store.job_by_identity(self.key)["status"], "Applied")
 
-    def test_status_write_is_reversible(self):
+    async def test_status_write_is_reversible(self):
         update = add_message(self.mail, "upd-3", "no-reply@stripe.com",
                              "Update", "We will not be moving forward.",
                              CATEGORY_UPDATE,
@@ -328,8 +336,9 @@ class TestUpdatesAfterPromotion(unittest.TestCase):
                             '"location": "San Francisco, CA (Remote)", '
                             '"status": "Rejected", "confidence": 0.97, '
                             '"reason": "rejection"}'])
-        handler = UpdateHandler(self.store, self.mail, self.resolver, client)
-        handler.handle(update)
+        handler = UpdateHandler(self.store, self.mail, self.resolver, client,
+                                executor=immediate)
+        await handler.handle(update)
 
         job = self.store.job_by_identity(self.key)
         self.assertEqual(job["status"], "Rejected")
@@ -352,7 +361,7 @@ class RateLimitedClient:
         raise GroqRateLimited("rate limited", retry_after=self.retry_after)
 
 
-class TestRateLimitStopsBatchesCleanly(unittest.TestCase):
+class TestRateLimitStopsBatchesCleanly(unittest.IsolatedAsyncioTestCase):
     """A 429 must pause a batch, not fail it and not crash the cycle.
 
     Before this, a rate limit during alert extraction was swallowed by a
@@ -371,53 +380,112 @@ class TestRateLimitStopsBatchesCleanly(unittest.TestCase):
                            "5 new jobs", "<a href='https://x.test/1'>Job</a>",
                            CATEGORY_ALERT)
 
-    def test_alert_run_stops_instead_of_walking_the_whole_batch(self):
+    async def test_alert_run_stops_instead_of_walking_the_whole_batch(self):
         for index in range(3):
             self._alert(f"alert-{index}")
-        handler = AlertHandler(self.store, self.mail, self.client)
+        handler = AlertHandler(self.store, self.mail, self.client,
+                               executor=immediate)
 
-        created, _skipped, _linked = handler.run(limit=10)
+        created, _skipped, _linked = await handler.run(limit=10)
 
         self.assertEqual(created, 0)
         self.assertEqual(self.client.calls, 1,
                          "must stop after the first 429, not retry each message")
 
-    def test_alert_messages_stay_unlinked_so_they_retry(self):
+    async def test_alert_messages_stay_unlinked_so_they_retry(self):
         self._alert()
-        AlertHandler(self.store, self.mail, self.client).run(limit=10)
+        await AlertHandler(self.store, self.mail, self.client, executor=immediate).run(limit=10)
         # Unlinked is what makes the next cycle pick it up again.
         self.assertEqual(
             [row["gmail_message_id"] for row in self.mail.unlinked_messages()],
             ["alert-1"],
         )
 
-    def test_update_run_stops_without_raising(self):
+    async def test_update_run_stops_without_raising(self):
         add_message(self.mail, "upd-1", "no-reply@stripe.com", "Update",
                     "Some text.", CATEGORY_UPDATE)
-        result = UpdateHandler(self.store, self.mail, self.resolver,
-                               self.client).run(limit=10)
+        result = await UpdateHandler(self.store, self.mail, self.resolver,
+                               self.client, executor=immediate).run(limit=10)
         self.assertEqual(result["processed"], 0)
 
-    def test_acknowledgement_run_stops_without_raising(self):
+    async def test_acknowledgement_run_stops_without_raising(self):
         add_message(self.mail, "ack-1", "no-reply@stripe.com", "Thanks",
                     "We received it.", CATEGORY_ACKNOWLEDGEMENT)
-        counts = AcknowledgementHandler(self.store, self.mail, self.resolver,
-                                        self.client).run(limit=10)
+        counts = await AcknowledgementHandler(self.store, self.mail, self.resolver,
+                                        self.client, executor=immediate).run(limit=10)
         self.assertEqual(sum(counts.values()), 0)
 
-    def test_work_done_before_the_limit_is_kept(self):
+    async def test_work_done_before_the_limit_is_kept(self):
         # A limit part-way through a batch must not discard earlier results.
         good = FakeClient(['{"postings": [{"title": "Data Engineer", '
                            '"company": "Acme", "location": null, "url": null}]}'])
         self._alert("alert-a")
-        created, _s, _l = AlertHandler(self.store, self.mail, good).handle(
+        created, _s, _l = await AlertHandler(self.store, self.mail, good, executor=immediate).handle(
             self.mail.message("alert-a"))
         self.assertEqual(created, 1)
 
         self._alert("alert-b")
-        AlertHandler(self.store, self.mail, self.client).run(limit=10)
+        await AlertHandler(self.store, self.mail, self.client, executor=immediate).run(limit=10)
         self.assertEqual(len(self.mail.list_leads()), 1,
                          "the lead created before the limit must survive")
+
+
+class SlowClient:
+    """Stands in for a paced client: every call blocks the calling thread.
+
+    `Pacer.wait` uses `time.sleep`, and a rate limit makes it sleep for up to a
+    minute, so this is what a real client does under a 429.
+    """
+
+    def __init__(self, delay=0.2):
+        self.delay = delay
+        self.calls = 0
+
+    def complete_json(self, messages, parser, fallback, max_tokens=200):
+        self.calls += 1
+        time.sleep(self.delay)
+        return fallback
+
+
+class TestHandlersDoNotBlockTheEventLoop(unittest.IsolatedAsyncioTestCase):
+    """The web UI shares this event loop, so a handler must never hold it.
+
+    The scheduler runs as an asyncio task on the same loop that serves the
+    pages. When the handlers made their blocking model calls inline, a rate
+    limit froze that loop for minutes at a time and the browser dropped the
+    websocket - the "backend disconnected from the frontend" symptom. Offloading
+    the model call is what fixes it, and this is what proves it stays fixed.
+    """
+
+    async def test_the_loop_keeps_running_during_a_batch(self):
+        store, mail, _resolver = make_app()
+        for index in range(3):
+            add_message(mail, f"alert-{index}", "jobs-noreply@unknownboard.io",
+                        "5 new jobs", "<a href='https://x.test/1'>Job</a>",
+                        CATEGORY_ALERT)
+
+        ticks = 0
+
+        async def heartbeat():
+            """Stands in for the UI's timers and the websocket ping."""
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        beat = asyncio.create_task(heartbeat())
+        try:
+            # The real executor, not the immediate stand-in: the point of the
+            # test is that the blocking call happens off this thread.
+            await AlertHandler(store, mail, SlowClient()).run(limit=10)
+        finally:
+            beat.cancel()
+
+        self.assertGreater(
+            ticks, 0,
+            "the event loop was blocked for the whole batch, so the UI would "
+            "have stopped responding",
+        )
 
 
 class TestApplicationDateParsing(unittest.TestCase):

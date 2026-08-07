@@ -28,29 +28,41 @@ class LeadPreparer:
     """Scores new leads, then prepares the ones worth preparing."""
 
     def __init__(self, store, mail, groq_client=None, research_client=None,
-                 threshold=None, output_dir=None):
+                 threshold=None, output_dir=None, executor=None):
         self.store = store
         self.mail = mail
         self.scorer = RelevanceScorer(store, mail, groq_client,
+                                      executor=executor,
                                       **({"threshold": threshold} if threshold
                                          is not None else {}))
         builder_kwargs = {"output_dir": output_dir} if output_dir else {}
         self.builder = ArtifactBuilder(store, mail, research_client,
-                                       **builder_kwargs)
+                                       executor=executor, **builder_kwargs)
 
-    def run(self, score_limit=50, prepare_limit=5):
+    async def run(self, score_limit=50, prepare_limit=5):
         """One preparation pass.
 
         `prepare_limit` is small on purpose. Each prepared lead is a real spend
         and a slow call; a cycle does a few and the scheduler comes back, which
         keeps a burst of fifty new leads from turning into fifty simultaneous
         Opus requests.
+
+        Summary:
+            Score the backlog, then build artifacts for the leads that cleared
+            the bar.
+
+        Parameters:
+            score_limit (int): Most leads to score in this pass.
+            prepare_limit (int): Most leads to prepare in this pass.
+
+        Returns:
+            dict: Counts under `scored`, `prepared`, and `failed`.
         """
-        scored = self.scorer.run(score_limit)
+        scored = await self.scorer.run(score_limit)
         prepared = failed = 0
 
         for lead in self.scorer.worth_preparing(prepare_limit):
-            outcome = self.prepare(lead)
+            outcome = await self.prepare(lead)
             if outcome is True:
                 prepared += 1
             elif outcome is False:
@@ -62,15 +74,27 @@ class LeadPreparer:
 
         return {"scored": scored, "prepared": prepared, "failed": failed}
 
-    def prepare(self, lead):
+    async def prepare(self, lead):
         """Build artifacts for one lead.
 
         Returns True on success, False on a failure specific to this lead, and
         None when the whole stage should stop (no budget, not configured).
+
+        Summary:
+            Move one lead through `preparing` to `ready`, recording the reason
+            on the lead when it cannot be prepared.
+
+        Parameters:
+            lead (Mapping): The lead row to prepare.
+
+        Returns:
+            bool | None: True when the lead is ready, False on a failure
+                specific to this lead, and None when the whole stage should
+                stop.
         """
         self.mail.set_lead_status(lead["id"], LEAD_PREPARING)
         try:
-            written = self.builder.build(lead)
+            written = await self.builder.build(lead)
         except SpendCeilingReached as exc:
             log.warning("Stopping preparation: %s", exc)
             self.mail.set_lead_status(lead["id"], lead["status"], str(exc))
@@ -91,13 +115,23 @@ class LeadPreparer:
                  lead["company"], ", ".join(sorted(written)))
         return True
 
-    def prepare_now(self, lead_id):
+    async def prepare_now(self, lead_id):
         """Prepare one lead on demand, bypassing the relevance gate.
 
         The escape hatch for a lead the scorer rated too low. Without it, a
         threshold set slightly wrong makes a role permanently unreachable.
+
+        Summary:
+            Prepare one lead by id regardless of its relevance score.
+
+        Parameters:
+            lead_id (int): The lead to prepare.
+
+        Returns:
+            bool: True when the lead reached `ready`, False when it does not
+                exist or could not be prepared.
         """
         lead = self.mail.lead(lead_id)
         if lead is None:
             return False
-        return self.prepare(lead) is True
+        return await self.prepare(lead) is True

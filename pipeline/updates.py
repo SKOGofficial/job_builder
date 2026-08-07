@@ -18,6 +18,7 @@ applying it stamps a response date, which drops the job out of the pool future
 scans check.
 """
 
+import asyncio
 import logging
 
 from clients.llm_client import GroqRateLimited
@@ -28,25 +29,50 @@ log = logging.getLogger(__name__)
 
 
 class UpdateHandler:
-    def __init__(self, store, mail, resolver, client=None, threshold=0.85):
+    """Applies status changes carried by update emails.
+
+    Extraction is a blocking model call and goes to an executor; resolving and
+    writing the status stay on the calling thread, which owns the sqlite
+    connection.
+    """
+
+    def __init__(self, store, mail, resolver, client=None, threshold=0.85,
+                 executor=None):
         self.store = store
         self.mail = mail
         self.resolver = resolver
         self.client = client
         self.threshold = threshold
+        self.executor = executor or asyncio.to_thread
 
-    def handle(self, message):
+    async def handle(self, message):
         """Process one update email.
 
         Returns a dict describing what happened, for logging and the activity
         feed: `linked`, `status_applied`, `status`, `identity_key`.
+
+        Summary:
+            Extract the status an update email reports, resolve it to a job,
+            and apply it when both the model and the resolver are confident.
+
+        Parameters:
+            message (Mapping): The stored message row to process.
+
+        Returns:
+            dict: Under `linked`, `status_applied`, `status`, `identity_key`,
+                and `ambiguous`.
+
+        Raises:
+            GroqRateLimited: Propagated from extraction so `run` can stop the
+                batch cleanly.
         """
         outcome = {"linked": False, "status_applied": False,
                    "status": None, "identity_key": None, "ambiguous": False}
 
         extracted = {}
         if self.client is not None:
-            extracted = extract_update(dict(message), self.client)
+            extracted = await self.executor(
+                extract_update, dict(message), self.client)
 
         resolution = self.resolver.resolve(dict(message), extracted)
         if not resolution.resolved:
@@ -115,7 +141,7 @@ class UpdateHandler:
         self.store.conn.commit()
         return True
 
-    def run(self, limit=50):
+    async def run(self, limit=50):
         """
         Summary:
             Apply each unhandled update email to its job, stopping cleanly if
@@ -134,7 +160,7 @@ class UpdateHandler:
         processed = applied = unresolved = 0
         for message in self._pending(limit):
             try:
-                outcome = self.handle(message)
+                outcome = await self.handle(message)
             except GroqRateLimited as exc:
                 log.info(
                     "Update handling paused by the rate limit after %d "

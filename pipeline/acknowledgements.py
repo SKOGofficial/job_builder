@@ -19,6 +19,7 @@ after downtime, during a backfill - and a wrong application date quietly
 corrupts every time series on the dashboard.
 """
 
+import asyncio
 import logging
 from datetime import date, datetime
 
@@ -53,20 +54,44 @@ def application_date_from(message):
 
 
 class AcknowledgementHandler:
-    def __init__(self, store, mail, resolver, client=None):
+    """Turns "thanks for applying" emails into applications.
+
+    Extraction is a blocking model call and goes to an executor; promoting the
+    lead and writing the application stay on the calling thread, which owns the
+    sqlite connection.
+    """
+
+    def __init__(self, store, mail, resolver, client=None, executor=None):
         self.store = store
         self.mail = mail
         self.resolver = resolver
         self.client = client
+        self.executor = executor or asyncio.to_thread
 
-    def handle(self, message):
+    async def handle(self, message):
         """Process one acknowledgement email.
 
         Returns `{"action": promoted|updated|created|unresolved, "job_id": ...}`.
+
+        Summary:
+            Resolve one acknowledgement email to a lead or job and record that
+            the application was submitted.
+
+        Parameters:
+            message (Mapping): The stored message row to process.
+
+        Returns:
+            dict: Under `action` (`promoted`, `updated`, `created`, or
+                `unresolved`) and `job_id`.
+
+        Raises:
+            GroqRateLimited: Propagated from extraction so `run` can stop the
+                batch cleanly.
         """
         extracted = {}
         if self.client is not None:
-            extracted = extract_acknowledgement(dict(message), self.client)
+            extracted = await self.executor(
+                extract_acknowledgement, dict(message), self.client)
 
         resolution = self.resolver.resolve(dict(message), extracted)
         applied_on = application_date_from(dict(message))
@@ -191,7 +216,7 @@ class AcknowledgementHandler:
                  job_id, extracted["title"], extracted["company"])
         return job_id
 
-    def run(self, limit=50):
+    async def run(self, limit=50):
         """
         Summary:
             Process each unhandled acknowledgement email, stopping cleanly if
@@ -212,7 +237,7 @@ class AcknowledgementHandler:
         counts = {}
         for message in self._pending(limit):
             try:
-                result = self.handle(message)
+                result = await self.handle(message)
             except GroqRateLimited as exc:
                 log.info(
                     "Acknowledgement handling paused by the rate limit after "

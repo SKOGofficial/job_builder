@@ -157,6 +157,24 @@ def cmd_prepare(args):
 
     preparer = LeadPreparer(store, mail, scorer, research)
     try:
+        from clients.research_client import ResearchClient, SpendLimiter
+
+        research = ResearchClient.from_config(limiter=SpendLimiter(mail))
+    except Exception as exc:
+        print(f"Research unavailable ({exc}).")
+
+    # The preparation stage is async so the web UI's event loop is not blocked
+    # by it. The CLI has no loop to protect, so it just drives one.
+    preparer = LeadPreparer(store, mail, groq, research)
+    if args.lead:
+        ok = asyncio.run(preparer.prepare_now(args.lead))
+        print("Prepared." if ok else "Could not prepare that lead.")
+        store.close()
+        return 0 if ok else 1
+
+    print(json.dumps(asyncio.run(preparer.run(prepare_limit=args.max)), indent=2))
+    store.close()
+    return 0
         if args.lead:
             ok = preparer.prepare_now(args.lead)
             print("Prepared." if ok else "Could not prepare that lead.")
