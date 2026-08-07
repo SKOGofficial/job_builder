@@ -44,4 +44,4 @@ jobs:
 
       # Catches syntax errors in every module, including ones no test imports.
       - name: Compile all sources
-        run: python -m compileall -q app.py clients utilities web tests
+        run: python -m compileall -q app.py cli.py clients pipeline utilities web tests

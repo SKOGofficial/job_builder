@@ -11,7 +11,12 @@ missing it. `SCHEMA_VERSION` must be bumped in lockstep.
 
 #: Bump whenever a migration is added. A fresh database is stamped with this
 #: value directly and skips the migration path entirely.
-SCHEMA_VERSION = 2
+#:
+#: A whole *table* added below is the one exception to the rule above: it needs
+#: no migration entry, because `create_tables` runs `CREATE TABLE IF NOT
+#: EXISTS` unconditionally on every `initialise`, before the version gate. Only
+#: new columns on existing tables need a migration.
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 -- Applications the user has actually applied to. -----------------------------
@@ -84,6 +89,11 @@ CREATE TABLE IF NOT EXISTS messages (
     category TEXT,
     category_confidence REAL,
     category_reason TEXT,
+    -- Which model produced the category. More than one provider classifies
+    -- now, and the confidence threshold is deliberately global rather than
+    -- per-provider, so without this there is no way afterwards to tell whether
+    -- a bad label came from the primary or from the fallback.
+    category_model TEXT,
     classified_at TEXT,
     fetched_at TEXT NOT NULL,
     body_fetched_at TEXT
@@ -189,6 +199,7 @@ CREATE TABLE IF NOT EXISTS email_matches (
     ai_status TEXT,
     ai_confidence REAL,
     ai_reason TEXT,
+    ai_model TEXT,
     ai_classified_at TEXT,
     ai_applied INTEGER NOT NULL DEFAULT 0,
     ai_previous_status TEXT,
@@ -197,6 +208,43 @@ CREATE TABLE IF NOT EXISTS email_matches (
     dismissed INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     UNIQUE(job_id, gmail_message_id)
+);
+
+-- What each provider actually spent, one row per call. -------------------------
+--
+-- Rows rather than counters, for the same reason `SpendLimiter` reads
+-- `job_research` back instead of keeping a tally in memory: a counter needs a
+-- reset job, cannot answer "what did the last hour cost", and resets to zero on
+-- exactly the restart that a runaway loop makes most likely.
+--
+-- This is what makes a per-day ceiling real. The per-minute windows stay in
+-- memory in `Pacer` - a restart outlives a sixty-second window, and persisting
+-- one would put sqlite in the hot path of every model call.
+CREATE TABLE IF NOT EXISTS provider_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    task TEXT NOT NULL,
+    model TEXT,
+    requests INTEGER NOT NULL DEFAULT 1,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    -- 'ok' | 'rate_limited' | 'denied_day' | 'error'
+    outcome TEXT NOT NULL,
+    at TEXT NOT NULL
+);
+
+-- Per-task provider routing, edited in Settings. -------------------------------
+--
+-- An absent row means "follow the .env default". Only an explicit edit writes
+-- one, so a user who never opens Settings follows their .env, and editing .env
+-- is not silently overridden by a stale row someone clicked through months ago.
+-- "Reset to defaults" deletes the row rather than writing the current default.
+CREATE TABLE IF NOT EXISTS provider_settings (
+    task TEXT PRIMARY KEY,
+    primary_provider TEXT,
+    fallback_provider TEXT,
+    updated_at TEXT NOT NULL
 );
 """
 
@@ -214,6 +262,9 @@ CREATE INDEX IF NOT EXISTS idx_links_identity ON message_links(identity_key);
 CREATE INDEX IF NOT EXISTS idx_links_message ON message_links(gmail_message_id);
 CREATE INDEX IF NOT EXISTS idx_leads_status ON job_leads(status);
 CREATE INDEX IF NOT EXISTS idx_email_matches_job_id ON email_matches(job_id);
+-- Every budget question is "how much has this provider spent since <time>",
+-- so the pair is the useful order.
+CREATE INDEX IF NOT EXISTS idx_provider_usage_at ON provider_usage(provider, at);
 """
 
 

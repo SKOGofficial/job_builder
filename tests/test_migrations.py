@@ -258,6 +258,79 @@ class TestBackfillCollisions(unittest.TestCase):
         self.assertEqual(len(collisions), 1)
 
 
+class TestProviderAttribution(unittest.TestCase):
+    """v3: recording which model produced a classification.
+
+    Two columns on two tables, deliberately reached by two different
+    mechanisms - `messages.category_model` through the version gate,
+    `email_matches.ai_model` through the ungated widener. Both paths are
+    exercised here because a database that took only one of them is broken in a
+    way nothing else would notice until a write failed.
+    """
+
+    def test_message_column_arrives_through_the_version_gate(self):
+        conn = make_v0()
+        initialise(conn)
+        self.assertIn("category_model", column_names(conn, "messages"))
+
+    def test_match_column_arrives_through_the_ungated_widener(self):
+        conn = make_v0()
+        initialise(conn)
+        self.assertIn("ai_model", column_names(conn, "email_matches"))
+
+    def test_match_column_reaches_a_database_already_past_the_gate(self):
+        """The reason `ai_model` is not in a numbered migration.
+
+        A database can carry a current `user_version` and still be missing an
+        `email_matches` column, because that table predates the gate. A
+        version-gated migration would skip it and every later write would fail.
+        """
+        conn = make_v0()
+        initialise(conn)
+        conn.execute("ALTER TABLE email_matches DROP COLUMN ai_model")
+        conn.commit()
+        self.assertNotIn("ai_model", column_names(conn, "email_matches"))
+
+        # Version is already current, so no migration is pending at all.
+        self.assertEqual(pending_migrations(conn), [])
+        self.assertEqual(initialise(conn), [])
+        self.assertIn("ai_model", column_names(conn, "email_matches"))
+
+    def test_existing_rows_keep_null_rather_than_being_reclassified(self):
+        conn = make_v0()
+        add_job(conn, "AAA111", "Software Engineer", "Google")
+        conn.execute(
+            "INSERT INTO email_matches (job_id, gmail_message_id, sender, subject, "
+            "received_date, created_at) VALUES "
+            "('AAA111', 'msg-1', 'a@google.com', 'Your application', "
+            "'2026-01-20', '2026-01-20T10:00:00')"
+        )
+        conn.commit()
+        initialise(conn)
+        row = conn.execute("SELECT ai_model FROM email_matches").fetchone()
+        self.assertIsNone(row["ai_model"])
+
+    def test_provider_tables_reach_an_existing_database(self):
+        """New tables need no migration entry - `create_tables` is unconditional."""
+        conn = make_v0()
+        initialise(conn)
+        names = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        self.assertIn("provider_usage", names)
+        self.assertIn("provider_settings", names)
+
+    def test_usage_index_exists(self):
+        conn = make_v0()
+        initialise(conn)
+        names = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+        }
+        self.assertIn("idx_provider_usage_at", names)
+
+
 class TestBackupOnDisk(unittest.TestCase):
     def test_structural_migration_writes_a_backup(self):
         directory = tempfile.mkdtemp()

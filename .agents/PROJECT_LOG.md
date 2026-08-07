@@ -2,6 +2,77 @@
 
 Use this file to record meaningful project changes, implementation decisions, and verification notes.
 
+## 2026-08-04 - Gemini as a second engine, and per-task model routing
+
+Groq's free tier was the throughput ceiling on the whole pipeline. A 429 ended a stage:
+each handler caught `GroqRateLimited`, broke, and kept what it had written. Safe, but the
+backlog only drained as fast as one free tier allowed. This adds Gemini as a real second
+provider and a small orchestrator that decides per task which model runs, tracks what each
+has spent, fails over when one runs out, and paces so a provider chugs along instead of
+bursting and stalling. Gemini is also now the *primary* for research, with Claude behind it.
+
+Every classification call in the project already funnelled through one signature -
+`complete_json(messages, parser, fallback, max_tokens)` - and every stage took an injected
+client. So the pool hands each stage a task-bound view of the same shape, and **six of the
+seven pipeline modules changed not at all**. That property is the design's main correctness
+guarantee, and `tests/test_provider_pool.py` drives the real `AlertHandler.run` rather than
+a mock precisely to defend it.
+
+Decisions worth knowing before changing any of this:
+
+- **`GroqRateLimited` became an alias of `ProviderRateLimited`, not a subclass.** Six
+  modules catch it by name. A subclass would mean those catches did *not* fire for a Gemini
+  429 - the exact opposite of what was needed. The cost, accepted knowingly:
+  `GroqNotConfigured` and `ResearchNotConfigured` are now literally the same class.
+  `SpendCeilingReached` stays distinct, because `prepare.py` reads it as "stop the stage"
+  while a rate limit means "stop this pass".
+- **Pacing and failover turned out to be one decision.** A provider needing 400s to honour
+  its daily spread is, from the caller's side, simply unavailable, so `spread_delay` feeds
+  the same comparison as every other pacing rule and exceeding it fails over. No special
+  case was needed.
+- **"Default to Groq and wait" is bounded.** `dispatch()` and `prepare()` are called
+  synchronously from the async `run()`, so an unbounded sleep freezes the UI. Two budgets:
+  2s inline, 45s off the loop - the latter under the scheduler's 60s minimum interval, so a
+  wait can never overlap two cycles. Past the budget, "wait" means what it already meant
+  here: raise, keep what is written, resume next cycle.
+- **A 429 overrides the local counters.** A shared project quota or a limit lowered upstream
+  can exhaust an allowance our arithmetic did not predict, so the provider's own refusal
+  wins, and a day-scoped one is persisted so a restart cannot un-exhaust it.
+- **One budget, cooldown and pacer per provider, not per client.** Gemini holds two clients
+  because grounded research and JSON-mode classification cannot share a request body, but
+  they spend one project quota. Registering them separately would have let a classification
+  429 leave research hammering the same exhausted key.
+- **API finding, verified against Google's docs and issue tracker:** Google Search grounding
+  and `responseMimeType: "application/json"` are **mutually exclusive** - together they
+  return HTTP 400, "Function calling with a response mime type: 'application/json' is
+  unsupported". `responseSchema` likewise. Research needs the tool, so it cannot have the
+  response type; the reply is plain text and `parse_research` digs the JSON out, tolerating
+  fences and prose. `tests/test_gemini_research.py` asserts the pairing directly, because if
+  it regresses every research call fails and the request still looks reasonable.
+- **Corrected a stale model id.** `gemini-2.0-flash`, used in the first commit of this
+  branch, has been shut down by Google. Now `gemini-3.6-flash`, pinned rather than the
+  `gemini-flash-latest` alias: that alias is hot-swapped on every release, which would
+  change classifier behaviour with no commit behind it.
+- **New tables need no migration entry**, because `create_tables` runs
+  `CREATE TABLE IF NOT EXISTS` unconditionally before the version gate. New *columns* do.
+  `email_matches.ai_model` deliberately goes through `ensure_email_match_columns` rather
+  than `migrate_v3`: that table predates the gate, so a database can report a current
+  `user_version` and still lack the column, and a gated migration would skip it.
+
+Schema v3: `messages.category_model`, `email_matches.ai_model`, plus `provider_usage` (one
+row per call, so a daily ceiling survives a restart) and `provider_settings` (routing; an
+absent row means "follow .env", which is why Reset deletes rather than writing a default).
+
+Verified: 492 tests pass on Python 3.14. The app was also launched against a throwaway
+database - all three providers degrade with a readable reason when unconfigured, a pipeline
+cycle completes cleanly, and the Settings cards render in both the provider and routing
+halves. The real `job_applications.sqlite3` was not touched.
+
+Not done, and deliberately: no time-of-day routing (routing is per task, and "when" is
+handled by budget-aware pacing); no per-provider confidence threshold - the threshold is a
+property of the classification, so `LLM_CONFIDENCE_THRESHOLD` is global with
+`GROQ_CONFIDENCE_THRESHOLD` still read for existing setups.
+
 ## 2026-07-31 - UI moved from Tkinter to NiceGUI
 
 - Replaced the Tkinter UI with NiceGUI under `web/`. `pages/` was deleted; `app.py` is now just

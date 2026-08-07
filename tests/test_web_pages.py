@@ -253,6 +253,27 @@ async def test_applied_classification_shows_badge_and_undo(user, store):
     await user.should_see("Undo")
 
 
+async def test_badge_names_the_model_when_one_was_recorded(user, store):
+    add_match(store, company="Acme", index=1)
+    identifier = match_id(store)
+    store.record_classification(
+        identifier, "Rejected", 0.94, "They declined.", "gemini-3.6-flash"
+    )
+
+    await user.open("/email-matches")
+    await user.should_see("via gemini-3.6-flash")
+
+
+async def test_badge_is_unchanged_for_rows_written_before_attribution(user, store):
+    add_match(store, company="Acme", index=1)
+    identifier = match_id(store)
+    store.record_classification(identifier, "Rejected", 0.94, "They declined.")
+
+    await user.open("/email-matches")
+    await user.should_see("AI: Rejected")
+    await user.should_not_see("via")
+
+
 async def test_inert_label_shows_no_undo(user, store):
     # Acknowledgement never applies, however confident, so nothing to undo.
     add_match(store, company="Acme", index=1)
@@ -391,7 +412,7 @@ async def test_drawer_reaches_its_pages(user, state):
         ("Review queue", "could not attach to an application"),
         ("Email matches", "Suggested replies matched"),
         ("Experiences", "Individual resume bullets"),
-        ("Settings", "AI classification (Groq)"),
+        ("Settings", "AI classification"),
         ("Profile", "Store contact details"),
         ("Resume notes", "Free-text resume and CV context"),
     ]:
@@ -408,7 +429,7 @@ async def test_settings_shows_every_card(user, state):
     await user.should_see("Appearance")
     await user.should_see("Dark mode")
     await user.should_see("Gmail")
-    await user.should_see("AI classification (Groq)")
+    await user.should_see("AI classification")
 
 
 async def test_settings_can_run_a_classification_cycle(user, state, store):
@@ -437,6 +458,58 @@ async def test_settings_offers_resume_after_a_rate_limit(user, state, store):
     user.find("Classify 2 message(s)").click()
     await user.should_see("Groq rate limit reached")
     await user.should_see("Resume classification")
+
+
+async def test_settings_names_the_provider_that_refused(user, state, store):
+    """A pool means the model that refused is not always the configured one."""
+    from clients.providers.base import ProviderRateLimited
+
+    add_match(store, company="Acme", index=1)
+
+    class GeminiRefuses:
+        def classify(self, payload):
+            raise ProviderRateLimited("out", retry_after=42, provider="Gemini")
+
+    state.classifier.client_factory = GeminiRefuses
+    state.classifier.is_configured = lambda: True
+
+    await user.open("/settings")
+    user.find("Classify 1 message(s)").click()
+    await user.should_see("Gemini rate limit reached")
+
+
+async def test_settings_shows_task_routing(user, state):
+    await user.open("/settings")
+    await user.should_see("Task routing")
+    await user.should_see("Route incoming email")
+    await user.should_see("Research a company and role")
+
+
+async def test_routing_choice_is_saved_and_reaches_the_pool(user, state):
+    """The whole point of the card: an edit that survives and takes effect."""
+    state.mail.set_provider_route("route_email", "gemini", "groq")
+
+    await user.open("/settings")
+    await user.should_see("Reset")
+
+    assert state.mail.provider_routes()["route_email"] == ("gemini", "groq")
+    assert state.pool.chain("route_email") == ("gemini", "groq")
+
+
+async def test_resetting_a_route_returns_it_to_the_default(user, state):
+    state.mail.set_provider_route("route_email", "gemini", None)
+    await user.open("/settings")
+    user.find("Reset").click()
+    await user.should_see("Reset to the default")
+
+    assert "route_email" not in state.mail.provider_routes()
+    assert state.pool.chain("route_email") == ("groq", "gemini")
+
+
+async def test_an_unconfigured_provider_is_offered_not_hidden(user, state):
+    """Hiding it would make the missing key undiscoverable."""
+    await user.open("/settings")
+    await user.should_see("no key")
 
 
 # Leads ---------------------------------------------------------------------

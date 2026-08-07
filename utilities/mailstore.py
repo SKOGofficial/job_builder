@@ -378,7 +378,8 @@ class MailStore:
             """
         ).fetchone()["n"]
 
-    def record_category(self, gmail_message_id, category, confidence, reason):
+    def record_category(self, gmail_message_id, category, confidence, reason,
+                        model=None):
         """
         Summary:
             Store the category the model assigned to a message.
@@ -389,6 +390,9 @@ class MailStore:
                 acknowledgement, or irrelevant.
             confidence (float): Model confidence, 0.0 to 1.0.
             reason (str): The model's short justification.
+            model (str | None): Which model produced the category. Optional and
+                last so existing callers are unaffected; NULL reads as "written
+                before attribution existed, so it was Groq".
 
         Raises:
             sqlite3.Error: If the update fails.
@@ -402,10 +406,10 @@ class MailStore:
             """
             UPDATE messages
             SET category = ?, category_confidence = ?, category_reason = ?,
-                classified_at = ?
+                category_model = ?, classified_at = ?
             WHERE gmail_message_id = ?
             """,
-            (category, confidence, reason, _now(), gmail_message_id),
+            (category, confidence, reason, model, _now(), gmail_message_id),
         )
 
     def message(self, gmail_message_id):
@@ -1102,6 +1106,288 @@ class MailStore:
             (since_iso,),
         ).fetchone()
         return dict(row)
+
+    # --- provider routing and usage ----------------------------------------
+    #
+    # Everything here is called on the thread that owns the connection, never
+    # from inside a worker. The provider pool loads counters once per cycle,
+    # counts in memory while stages run, and flushes at the end - see the
+    # concurrency contract in .agents/AGENTS.md.
+
+    def provider_routes(self):
+        """Task routing the user has explicitly chosen.
+
+        Only rows written by an edit in Settings come back. A task with no row
+        is absent from the result rather than present with a default, because
+        "no opinion" and "deliberately chose the default" have to stay
+        distinguishable: the first follows `.env` as it changes, the second
+        would pin a value the user never revisits.
+
+        Summary:
+            Read the saved per-task provider routing.
+
+        Returns:
+            dict[str, tuple[str | None, str | None]]: Task id mapped to
+                `(primary, fallback)`. Empty when nothing has been edited.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
+        rows = self.conn.execute(
+            "SELECT task, primary_provider, fallback_provider FROM provider_settings"
+        ).fetchall()
+        return {
+            row["task"]: (row["primary_provider"], row["fallback_provider"])
+            for row in rows
+        }
+
+    def set_provider_route(self, task, primary, fallback=None):
+        """
+        Summary:
+            Save which providers should serve one task, in order.
+
+        Parameters:
+            task (str): The task identifier being routed.
+            primary (str | None): Provider to try first. None means the task is
+                turned off entirely.
+            fallback (str | None): Provider to try when the primary has no
+                headroom. None means there is nowhere to fall back to.
+
+        Raises:
+            sqlite3.Error: If the write or the commit fails.
+
+        Note:
+            Commits, because this is a user action rather than pipeline
+            progress - it must survive whatever the current cycle does next.
+        """
+        self.conn.execute(
+            """
+            INSERT INTO provider_settings
+                (task, primary_provider, fallback_provider, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(task) DO UPDATE SET
+                primary_provider = excluded.primary_provider,
+                fallback_provider = excluded.fallback_provider,
+                updated_at = excluded.updated_at
+            """,
+            (task, primary, fallback, _now()),
+        )
+        self.conn.commit()
+
+    def clear_provider_route(self, task):
+        """Forget an explicit choice, returning the task to its `.env` default.
+
+        Summary:
+            Delete the saved routing for one task.
+
+        Parameters:
+            task (str): The task identifier to reset.
+
+        Returns:
+            bool: True when a row was removed, False when there was nothing
+                saved for that task.
+
+        Raises:
+            sqlite3.Error: If the delete or the commit fails.
+
+        Note:
+            Deletes rather than writing the current default. Writing it would
+            freeze today's default into the database, so a later change to
+            `.env` would silently not take effect.
+        """
+        cursor = self.conn.execute(
+            "DELETE FROM provider_settings WHERE task = ?", (task,)
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def record_provider_usage(self, rows):
+        """Append what a batch of model calls cost.
+
+        Summary:
+            Write one `provider_usage` row per completed call attempt.
+
+        Parameters:
+            rows (list[dict]): Each with `provider`, `task`, and `outcome`;
+                optionally `model`, `input_tokens`, `output_tokens`,
+                `total_tokens`. Missing token counts record as 0.
+
+        Returns:
+            int: How many rows were written.
+
+        Raises:
+            sqlite3.Error: If the write or the commit fails.
+
+        Note:
+            Commits. Failed attempts are recorded too, not just successes - a
+            429 is exactly the event a daily budget needs to remember, and
+            dropping it would let a restart retry a provider that is out.
+        """
+        if not rows:
+            return 0
+        at = _now()
+        self.conn.executemany(
+            """
+            INSERT INTO provider_usage
+                (provider, task, model, requests, input_tokens, output_tokens,
+                 total_tokens, outcome, at)
+            VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["provider"],
+                    row["task"],
+                    row.get("model"),
+                    row.get("input_tokens") or 0,
+                    row.get("output_tokens") or 0,
+                    row.get("total_tokens") or 0,
+                    row["outcome"],
+                    row.get("at") or at,
+                )
+                for row in rows
+            ],
+        )
+        self.conn.commit()
+        return len(rows)
+
+    def provider_requests_since(self, provider, since_iso):
+        """
+        Summary:
+            Count requests one provider has made since a timestamp.
+
+        Parameters:
+            provider (str): The provider name to count.
+            since_iso (str): Inclusive lower bound as an ISO-8601 timestamp,
+                matching the format `_now` writes.
+
+        Returns:
+            int: Requests recorded in the window, successful or not.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            A rolling window, not a calendar day. Google resets its free-tier
+            quota at midnight Pacific; counting the last 24 hours is stricter
+            than that everywhere on earth, which is the safe direction for a
+            ceiling nobody wants to discover by being refused.
+        """
+        row = self.conn.execute(
+            """
+            SELECT COALESCE(SUM(requests), 0) AS n FROM provider_usage
+            WHERE provider = ? AND at >= ?
+            """,
+            (provider, since_iso),
+        ).fetchone()
+        return row["n"]
+
+    def provider_denied_day_since(self, provider, since_iso):
+        """Whether a provider has reported a per-day limit inside the window.
+
+        This is what stops a restart from un-exhausting a daily cap. The
+        in-memory counter is rebuilt from request rows, but a provider can
+        refuse for reasons our count did not predict - a shared project quota,
+        a limit lowered upstream - and its own refusal is better evidence than
+        our arithmetic.
+
+        Summary:
+            Report whether a per-day denial was recorded for a provider.
+
+        Parameters:
+            provider (str): The provider name to check.
+            since_iso (str): Inclusive lower bound as an ISO-8601 timestamp.
+
+        Returns:
+            bool: True when at least one `denied_day` row falls in the window.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM provider_usage
+            WHERE provider = ? AND at >= ? AND outcome = 'denied_day'
+            """,
+            (provider, since_iso),
+        ).fetchone()
+        return row["n"] > 0
+
+    def provider_usage_since(self, since_iso):
+        """
+        Summary:
+            Summarise every provider's spend since a timestamp, for Settings.
+
+        Parameters:
+            since_iso (str): Inclusive lower bound as an ISO-8601 timestamp.
+
+        Returns:
+            dict[str, dict]: Provider name mapped to `requests`, `tokens`,
+                `failures`, and `model` - the model most recently seen for that
+                provider in the window.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT provider,
+                   COALESCE(SUM(requests), 0) AS requests,
+                   COALESCE(SUM(total_tokens), 0) AS tokens,
+                   COALESCE(SUM(CASE WHEN outcome <> 'ok' THEN 1 ELSE 0 END), 0)
+                       AS failures,
+                   MAX(at) AS last_at
+            FROM provider_usage WHERE at >= ?
+            GROUP BY provider
+            """,
+            (since_iso,),
+        ).fetchall()
+        summary = {}
+        for row in rows:
+            model = self.conn.execute(
+                """
+                SELECT model FROM provider_usage
+                WHERE provider = ? AND model IS NOT NULL
+                ORDER BY at DESC LIMIT 1
+                """,
+                (row["provider"],),
+            ).fetchone()
+            summary[row["provider"]] = {
+                "requests": row["requests"],
+                "tokens": row["tokens"],
+                "failures": row["failures"],
+                "last_at": row["last_at"],
+                "model": model["model"] if model else None,
+            }
+        return summary
+
+    def prune_provider_usage(self, older_than_days=30):
+        """
+        Summary:
+            Delete usage rows past the retention window.
+
+        Parameters:
+            older_than_days (int): Retention window in days. Defaults to 30.
+
+        Returns:
+            int: How many rows were deleted.
+
+        Raises:
+            sqlite3.Error: If the delete or the commit fails.
+
+        Note:
+            Commits. The window only ever needs to reach back 24 hours for
+            budgeting; the rest is kept so "what did last month cost" stays
+            answerable, and dropped after that so the table cannot grow without
+            bound on a machine that runs unattended.
+        """
+        cutoff = (datetime.now() - timedelta(days=older_than_days)).isoformat(
+            timespec="seconds"
+        )
+        cursor = self.conn.execute(
+            "DELETE FROM provider_usage WHERE at < ?", (cutoff,)
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     # --- artifacts ---------------------------------------------------------
 
