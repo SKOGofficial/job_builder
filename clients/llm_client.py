@@ -31,14 +31,29 @@ Rate limits: the free tier allows 30 requests and 12,000 tokens per minute for
 llama-3.3-70b-versatile. At roughly 900 tokens per classification the token
 ceiling binds first, so requests are paced from tokens rather than fired in a
 burst. A 429 stops the cycle cleanly instead of hammering the endpoint.
+
+Pacing and the exception vocabulary now live in `clients/providers/base.py`,
+because none of it was ever Groq-specific. They are re-exported here under
+their original names so the six pipeline modules that catch `GroqRateLimited`,
+and the tests that reach for `llm_client.Pacer`, keep working untouched.
 """
 
 import asyncio
 import json
 import logging
 import os
-import time
 
+from clients.providers.base import (
+    CHARS_PER_TOKEN,
+    ESTIMATED_TOKENS_PER_CALL,
+    TOKENS_PER_MINUTE,
+    Pacer,
+    ProviderBudgetExhausted,
+    ProviderNotConfigured,
+    ProviderRateLimited,
+    estimate_tokens,
+    retry_after_seconds,
+)
 from utilities import credentials
 
 log = logging.getLogger(__name__)
@@ -69,17 +84,10 @@ DEFAULT_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_REQUESTS_PER_MINUTE = 12
 DEFAULT_CONFIDENCE_THRESHOLD = 0.85
 
-#: Free tier ceiling for the default model.
-TOKENS_PER_MINUTE = 12000
-#: Fallback projection for a caller that paces without describing its request.
-#: `complete_json` measures the real request instead - see `estimate_tokens`.
-#: Left as the `Pacer.wait` default so a bare pacer still books something.
-ESTIMATED_TOKENS_PER_CALL = 900
+#: Display name used when this provider refuses a request. Reaches the user
+#: through `ProviderRateLimited.provider`.
+DISPLAY_NAME = "Groq"
 
-#: Bytes per token for English prose, the usual rough ratio. Applied to the
-#: JSON-serialised request, whose quoting and escaping inflate the count a
-#: little - which errs toward over-booking, the safe direction.
-CHARS_PER_TOKEN = 4
 #: Body text is truncated before it is sent. Untruncated bodies run to 20,000
 #: characters, which alone would exceed the per-minute token ceiling.
 MODEL_BODY_CHARS = 2000
@@ -136,6 +144,21 @@ class GroqRateLimited(Exception):
         super().__init__(message)
         self.retry_after = retry_after
         self.limits = limits or {}
+# These are aliases, not subclasses, and the difference is load-bearing.
+#
+# `except GroqRateLimited` appears in six pipeline modules and is what stops a
+# batch cleanly on a 429. Once a second provider exists, every one of those
+# sites must stop for *its* rate limit too. A subclass would do the opposite:
+# `except GroqRateLimited` would not catch `ProviderRateLimited`, and a Gemini
+# 429 would escape into the bare `except Exception` below it, logged as an
+# unexplained failure. Aliasing makes all six provider-aware with no edit.
+#
+# The cost, stated plainly: `GroqNotConfigured` and `ResearchNotConfigured` are
+# now the same class, so a site catching one also catches the other. Both mean
+# "this model cannot run, degrade rather than stop", which is what those sites
+# already do.
+GroqNotConfigured = ProviderNotConfigured
+GroqRateLimited = ProviderRateLimited
 
 
 # Configuration ------------------------------------------------------------
@@ -203,10 +226,24 @@ def requests_per_minute():
 
 
 def confidence_threshold():
+    """How confident a label must be before it changes a job's status.
+
+    A property of the classification, not of the provider - more than one model
+    produces labels now and they are all held to the same bar. Hence the
+    provider-neutral name, with the original kept working so an existing .env
+    does not silently revert to the default.
+
+    Summary:
+        Resolve the auto-apply confidence threshold.
+
+    Returns:
+        float: The threshold, clamped to at most 1.0.
+    """
     _load_env()
-    value = _positive_number(
-        os.environ.get("GROQ_CONFIDENCE_THRESHOLD"), DEFAULT_CONFIDENCE_THRESHOLD, float
-    )
+    raw = os.environ.get("LLM_CONFIDENCE_THRESHOLD")
+    if raw is None or not str(raw).strip():
+        raw = os.environ.get("GROQ_CONFIDENCE_THRESHOLD")
+    value = _positive_number(raw, DEFAULT_CONFIDENCE_THRESHOLD, float)
     return min(value, 1.0)
 
 
@@ -477,6 +514,26 @@ class GroqClient:
         self.pacer = pacer or Pacer(per_minute)
         # Injectable so tests never reach the network.
         self.poster = poster or (requests.post if requests else None)
+        #: Total tokens the last response reported. Read by the provider pool
+        #: to reconcile its optimistic booking against what was really spent.
+        self.last_total_tokens = 0
+
+    @property
+    def last_model(self):
+        """The model that served the most recent call.
+
+        Constant for a single-provider client, and only interesting because
+        the pool's task-bound clients answer the same question with a value
+        that changes on failover. Recorded alongside each classification so a
+        label can be traced back to the model that produced it.
+
+        Summary:
+            Name the model behind the most recent completion.
+
+        Returns:
+            str: The configured model name.
+        """
+        return self.model
 
     @classmethod
     def from_config(cls):
@@ -548,6 +605,9 @@ class GroqClient:
             raise GroqRateLimited(
                 "Groq rate limit reached.", retry_after=retry_after,
                 limits=snapshot,
+                "Groq rate limit reached.",
+                retry_after=retry_after_seconds(response),
+                provider=DISPLAY_NAME,
             )
         if response.status_code >= 400:
             raise RuntimeError(
@@ -556,7 +616,8 @@ class GroqClient:
             )
 
         payload = response.json()
-        self.pacer.record((payload.get("usage") or {}).get("total_tokens", 0))
+        self.last_total_tokens = (payload.get("usage") or {}).get("total_tokens", 0)
+        self.pacer.record(self.last_total_tokens)
         choices = payload.get("choices") or []
         if not choices:
             return fallback
@@ -701,8 +762,12 @@ class ClassificationRunner:
             except GroqRateLimited as exc:
                 self.state = RATE_LIMITED
                 self.retry_after = exc.retry_after
+                # Named rather than hard-coded, because with a provider pool
+                # the model that refused is not necessarily the one configured
+                # here. Test doubles raise without a name, hence the fallback.
                 self.message = (
-                    f"Groq rate limit reached after {self.processed} of {self.total}. "
+                    f"{exc.provider or DISPLAY_NAME} rate limit reached after "
+                    f"{self.processed} of {self.total}. "
                     f"Try again in about {self.retry_after}s."
                 )
                 self.emit()
@@ -713,7 +778,7 @@ class ClassificationRunner:
                 self.emit()
                 return
             self.processed += 1
-            self.save(payload["id"], result)
+            self.save(payload["id"], result, client)
             self.emit()
 
         self.state = DONE
@@ -723,10 +788,22 @@ class ClassificationRunner:
         )
         self.emit()
 
-    def save(self, match_id, result):
-        """Record the label, and apply it when it is confident enough."""
+    def save(self, match_id, result, client=None):
+        """Record the label, and apply it when it is confident enough.
+
+        Summary:
+            Store one classification, applying the status when confident.
+
+        Parameters:
+            match_id (int): The `email_matches.id` that was classified.
+            result (dict): Keys `label`, `confidence`, `reason`.
+            client: The client that produced the result, read only for its
+                model name. Optional and read with `getattr`, so every test
+                double keeps working and simply records NULL.
+        """
         self.store.record_classification(
-            match_id, result["label"], result["confidence"], result["reason"]
+            match_id, result["label"], result["confidence"], result["reason"],
+            getattr(client, "last_model", None),
         )
         if (
             result["label"] in APPLICABLE_LABELS

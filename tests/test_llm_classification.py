@@ -44,6 +44,7 @@ class EnvIsolationMixin:
         "GROQ_MODEL",
         "GROQ_REQUESTS_PER_MINUTE",
         "GROQ_CONFIDENCE_THRESHOLD",
+        "LLM_CONFIDENCE_THRESHOLD",
     )
 
     def isolate_env(self):
@@ -194,6 +195,21 @@ class ConfigTests(EnvIsolationMixin, unittest.TestCase):
     def test_confidence_threshold_never_exceeds_one(self):
         os.environ["GROQ_CONFIDENCE_THRESHOLD"] = "5"
         self.assertEqual(llm.confidence_threshold(), 1.0)
+
+    def test_the_neutral_threshold_name_is_read(self):
+        """The threshold describes the classification, not the provider."""
+        os.environ["LLM_CONFIDENCE_THRESHOLD"] = "0.6"
+        self.assertEqual(llm.confidence_threshold(), 0.6)
+
+    def test_the_neutral_name_wins_over_the_provider_one(self):
+        os.environ["GROQ_CONFIDENCE_THRESHOLD"] = "0.5"
+        os.environ["LLM_CONFIDENCE_THRESHOLD"] = "0.7"
+        self.assertEqual(llm.confidence_threshold(), 0.7)
+
+    def test_the_old_name_still_works_alone(self):
+        """An existing .env must not silently revert to the default."""
+        os.environ["GROQ_CONFIDENCE_THRESHOLD"] = "0.5"
+        self.assertEqual(llm.confidence_threshold(), 0.5)
 
 
 class PromptTests(unittest.TestCase):

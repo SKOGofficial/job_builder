@@ -112,10 +112,18 @@ class PipelineScheduler:
     def _prune(self):
         try:
             cleared = self.cycle.mail.prune_bodies(self.prune_after_days)
+            # Budgeting only ever looks back 24 hours; the rest is kept so
+            # "what did last month cost" stays answerable, and dropped after
+            # that so the table cannot grow without bound unattended.
+            usage = self.cycle.mail.prune_provider_usage(self.prune_after_days)
+            if usage:
+                log.info("Pruned %d provider usage row(s) older than %d days",
+                         usage, self.prune_after_days)
             if cleared:
                 log.info("Pruned %d irrelevant message bod%s older than %d days",
                          cleared, "y" if cleared == 1 else "ies",
                          self.prune_after_days)
+            if cleared or usage:
                 # Reclaim the space; without this the file only ever grows.
                 self.cycle.mail.conn.execute("VACUUM")
         except Exception:

@@ -190,11 +190,15 @@ class MessageRouter:
                 log.exception("Router failed on %s", payload["gmail_message_id"])
                 break
 
+            # `getattr` rather than an attribute access: every test double is
+            # a bare stub with no such attribute, and NULL is exactly right
+            # for one of those.
             self.mail.record_category(
                 payload["gmail_message_id"],
                 result["label"],
                 result["confidence"],
                 result["reason"],
+                getattr(client, "last_model", None),
             )
             counts[result["label"]] = counts.get(result["label"], 0) + 1
             self.processed += 1

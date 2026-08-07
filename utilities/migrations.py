@@ -327,9 +327,42 @@ def migrate_v2(conn):
         conn.execute("ALTER TABLE messages ADD COLUMN list_unsubscribe TEXT")
 
 
+def migrate_v3(conn):
+    """Record which model produced a message's category.
+
+    Two providers classify now, and the confidence threshold is deliberately
+    global rather than per-provider, so the name of the model is the only thing
+    that can attribute a label afterwards. Without it, "the fallback is
+    mislabelling alerts" is a hypothesis nobody can test. `job_research.model`
+    and `job_artifacts.model` already set the precedent for storing it.
+
+    Existing rows keep NULL. Re-classifying the mirror to backfill would spend a
+    day of free-tier quota to learn what is already known - everything written
+    before this migration came from Groq, because it was the only provider.
+
+    Summary:
+        Add the `category_model` column to `messages` on a pre-v3 database.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to migrate.
+
+    Raises:
+        sqlite3.Error: If the column check or the `ALTER TABLE` fails.
+
+    Note:
+        Only `messages` is handled here. The matching `email_matches.ai_model`
+        belongs to `ensure_email_match_columns`, which runs with no version
+        gate and so also reaches databases that predate one. Two owners for one
+        concept would mean two places to forget.
+    """
+    if "category_model" not in column_names(conn, "messages"):
+        conn.execute("ALTER TABLE messages ADD COLUMN category_model TEXT")
+
+
 MIGRATIONS = [
     (1, migrate_v1),
     (2, migrate_v2),
+    (3, migrate_v3),
 ]
 
 
@@ -435,6 +468,10 @@ def ensure_email_match_columns(conn):
         ("ai_status", "TEXT"),
         ("ai_confidence", "REAL"),
         ("ai_reason", "TEXT"),
+        # Which model produced the label. Added here rather than in a numbered
+        # migration so it also reaches a database whose recorded version is
+        # already past the one that would have carried it.
+        ("ai_model", "TEXT"),
         ("ai_classified_at", "TEXT"),
         ("ai_applied", "INTEGER NOT NULL DEFAULT 0"),
         ("ai_previous_status", "TEXT"),

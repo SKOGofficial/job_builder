@@ -137,14 +137,25 @@ def cmd_prune(args):
 def cmd_prepare(args):
     from pipeline.prepare import LeadPreparer
 
-    store, mail = open_stores(args.db)
-    groq = research = None
-    try:
-        from clients.llm_client import GroqClient
+    from clients.providers.pool import ProviderPool
 
-        groq = GroqClient.from_config()
-    except Exception as exc:
-        print(f"Groq unavailable ({exc}); leads will not be scored.")
+    store, mail = open_stores(args.db)
+    pool = ProviderPool(mail=mail)
+    pool.begin_cycle()
+    for state in pool.status():
+        if not state["configured"]:
+            print(f"{state['display']} unavailable: {state['last_error']}")
+
+    # No sleep budget is passed: the CLI is not driving a UI, so the pool's
+    # own thread check applies and a paced call may wait the longer bound.
+    scorer = pool.for_task("score_relevance")
+    research = pool.for_task("research")
+    if scorer is None:
+        print("No model is configured for scoring; leads will not be scored.")
+    if research is None:
+        print("No model is configured for research.")
+
+    preparer = LeadPreparer(store, mail, scorer, research)
     try:
         from clients.research_client import ResearchClient, SpendLimiter
 
@@ -164,6 +175,16 @@ def cmd_prepare(args):
     print(json.dumps(asyncio.run(preparer.run(prepare_limit=args.max)), indent=2))
     store.close()
     return 0
+        if args.lead:
+            ok = preparer.prepare_now(args.lead)
+            print("Prepared." if ok else "Could not prepare that lead.")
+            return 0 if ok else 1
+
+        print(json.dumps(preparer.run(prepare_limit=args.max), indent=2))
+        return 0
+    finally:
+        pool.flush()
+        store.close()
 
 
 def cmd_deny(args):

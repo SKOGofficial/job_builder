@@ -939,7 +939,7 @@ class JobStore:
             return self.conn.execute(sql).fetchall()
         return self.conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
 
-    def record_classification(self, match_id, label, confidence, reason):
+    def record_classification(self, match_id, label, confidence, reason, model=None):
         """Store what the model inferred. Applies nothing to the job.
 
         Summary:
@@ -953,6 +953,9 @@ class JobStore:
                 caller compares this against the auto-apply threshold; this
                 method does not.
             reason (str): The model's short justification, shown in the UI.
+            model (str | None): Which model produced the label. Optional and
+                last so existing callers are unaffected; NULL reads as "written
+                before attribution existed, so it was Groq".
 
         Raises:
             sqlite3.Error: If the update or the commit fails.
@@ -965,13 +968,15 @@ class JobStore:
         self.conn.execute(
             """
             UPDATE email_matches
-            SET ai_status = ?, ai_confidence = ?, ai_reason = ?, ai_classified_at = ?
+            SET ai_status = ?, ai_confidence = ?, ai_reason = ?, ai_model = ?,
+                ai_classified_at = ?
             WHERE id = ?
             """,
             (
                 label,
                 confidence,
                 reason,
+                model,
                 datetime.now().isoformat(timespec="seconds"),
                 match_id,
             ),

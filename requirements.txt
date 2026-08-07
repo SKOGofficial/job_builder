@@ -15,7 +15,9 @@ google-auth-oauthlib
 # this installed - research is skipped and leads simply wait unprepared.
 anthropic
 
-# Shared: Groq talks over plain REST, so no provider SDK is needed.
+# Shared: Groq and Gemini both talk over plain REST, so neither needs a provider
+# SDK - one HTTP call with a JSON body does not justify a dependency, and the
+# injectable poster is what keeps the tests off the network.
 python-dotenv
 keyring
 requests

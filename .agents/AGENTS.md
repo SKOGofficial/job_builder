@@ -42,6 +42,9 @@ Help the user log and manage all job applications locally. The app should reduce
   desktop tool, but `--headless` plus a systemd unit is now a supported deployment.
 - **2026-08-02** - user approved a second model provider (Anthropic) for company research
   and resume generation, alongside the existing Groq classification.
+- **2026-08-04** - user approved a third model provider (Google Gemini) as a second engine
+  for classification and as the *primary* for research, with per-task routing editable in
+  Settings. Research falls back to Anthropic.
 
 ## Cost And Safety Rules Specific To This Repo
 
@@ -55,7 +58,12 @@ Help the user log and manage all job applications locally. The app should reduce
   response date first. Applying `Rejected` stamps a response date, which drops the job out
   of the pool future scans check.
 - **Keep the expensive model behind the relevance gate and the daily spend ceiling.**
-  Removing either turns a parser bug into a large bill.
+  Removing either turns a parser bug into a large bill. Gemini being primary for research
+  lowers the bill but does not replace either guard: Claude still picks up whatever Gemini
+  cannot take.
+- **Every model call must record which model served it.** The confidence threshold is
+  global by design, so the recorded model name is the only thing that can attribute a bad
+  label afterwards.
 
 ## Code Organisation Preference
 
@@ -88,9 +96,23 @@ modules back into one file.
   navigation belongs on `AppState`.
 - `clients/` holds external client integrations, none of which imports a UI framework:
   `gmail_client.py` (OAuth, Gmail API calls, History-API sync, and the async `GmailScanner`),
-  `llm_client.py` (Groq config, prompting, pacing, `complete_json`, and the async
-  `ClassificationRunner`), and `research_client.py` (Claude with server-side web search, plus
-  the `SpendLimiter`). All take an injectable caller/executor so tests never reach the network.
+  `llm_client.py` (Groq config, prompting, `complete_json`, and the async
+  `ClassificationRunner`), `research_client.py` (Claude with server-side web search, plus
+  the `SpendLimiter`), and `gemini_research.py` (Gemini with Google Search grounding). All
+  take an injectable caller/executor so tests never reach the network.
+- `clients/providers/` holds the multi-provider machinery: `base.py` (the neutral
+  exceptions, `Pacer`, `estimate_tokens`), `gemini.py` (the Gemini transport), `budget.py`
+  (per-day allowances and spread pacing), `routing.py` (the `TASKS` registry and chain
+  resolution), and `pool.py` (`ProviderPool`, and the failover state machine). Three things
+  here are load-bearing and easy to break:
+  - **`GroqRateLimited` is an *alias* of `ProviderRateLimited`, not a subclass.** Six
+    pipeline modules catch it by name to stop a batch cleanly. Subclassing would mean those
+    catches missed a second provider's 429 - the exact opposite of what is needed.
+  - **`ProviderState` has one budget, cooldown and pacer per *provider*, not per client.**
+    Gemini holds two clients because grounded research and JSON-mode classification cannot
+    share a request body, but they spend one project quota.
+  - **The pool never touches sqlite from a worker thread.** `begin_cycle` and `flush` run on
+    the loop; everything between them counts in memory.
 - `pipeline/` holds the mailbox ingest pipeline, one module per stage: `sync`, `rough_filter`,
   `router`, `resolver`, `extract`, `alerts`, `updates`, `acknowledgements`, `relevance`,
   `generate`, `prepare`, `orchestrator`, `scheduler`, plus board parsers under

@@ -1,26 +1,56 @@
-"""Settings: appearance, Gmail connection, and Groq classification.
+"""Settings: appearance, Gmail connection, AI providers, ingest, denylist.
 
 Both automations can be driven from here as well as from the Email matches
 page, because this is where you land after connecting Gmail or adding a key and
 the natural next step is to run the thing you just configured.
 
 The cards are defined inside the page function rather than at module level so
-each client gets its own refreshable targets.
+each client gets its own refreshable targets. The two model cards are built by
+`web/ai_settings.py`, which is a sibling of `web/shell.py` rather than a page:
+it registers no route, and a module under `web/pages/` would be reloaded by the
+page tests' route fixture.
 """
 
-from nicegui import run, ui
+import logging
+
+from nicegui import ui
 
 from clients import gmail_client, llm_client
 from utilities import credentials
+from web.ai_settings import build_ai_card, build_routing_card
 from web.shell import card, page_shell, page_timer
 from web.state import get_state
+
+log = logging.getLogger(__name__)
+
+
+def _pool_signature(state):
+    """A cheap value that changes when the provider display would.
+
+    Summary:
+        Summarise provider state for the page's change detector.
+
+    Parameters:
+        state (AppState): The shared state holding the pool.
+
+    Returns:
+        tuple: Comparable state, or an empty tuple when the pool cannot be
+            built. Never raises - this runs several times a second on a timer,
+            and a page that stopped redrawing because a provider was
+            misconfigured would be a poor trade.
+    """
+    try:
+        return state.pool.signature()
+    except Exception:
+        log.debug("Pool signature unavailable", exc_info=True)
+        return ()
 
 
 @ui.page("/settings")
 def settings_page():
     state = get_state()
     scanner, classifier = state.scanner, state.classifier
-    seen = {"scanner": scanner.state, "classifier": classifier.state}
+    seen = {"all": (scanner.state, classifier.state, _pool_signature(state))}
 
     with page_shell("Settings", active=""):
 
@@ -144,77 +174,13 @@ def settings_page():
             ui.notify("Access was revoked and the token removed.", type="positive")
             gmail_card.refresh()
 
-        # Groq ----------------------------------------------------------------
-
-        @ui.refreshable
-        def groq_card():
-            with card():
-                ui.label("AI classification (Groq)").classes("text-base font-semibold")
-                if not classifier.available:
-                    ui.label(llm_client.MISSING_PACKAGES_HINT).classes("text-sm opacity-70")
-                    return
-
-                in_keyring = bool(llm_client.stored_api_key())
-                configured = classifier.is_configured()
-                has_store = credentials.backend_available()
-                if in_keyring:
-                    source = "stored in your credential manager"
-                elif configured:
-                    source = "read from .env"
-                else:
-                    source = "not set"
-                if not has_store:
-                    source += " (no credential store on this machine)"
-                ui.label(f"API key: {source}").classes("text-sm opacity-70")
-
-                if configured:
-                    ui.label(
-                        f"Model: {llm_client.model_name()}    "
-                        f"Pace: {llm_client.requests_per_minute()} requests/min    "
-                        f"Auto-apply at: {llm_client.confidence_threshold():.0%} confidence"
-                    ).classes("text-sm opacity-70")
-
-                ui.label(
-                    "Matched replies are labelled as a rejection, offer, interview, online "
-                    "assessment, acknowledgement, or unclear. A label at or above the confidence "
-                    "threshold applies the job status automatically and can be undone from the "
-                    "Email matches page, which records the status it replaced. Anything below "
-                    "the threshold only pre-fills the dropdown. Requests are paced to stay under "
-                    "the free tier's limits, and a rate limit pauses the cycle rather than "
-                    "retrying."
-                ).classes("text-sm opacity-70")
-
-                if configured:
-                    ui.label().classes("text-sm").bind_text_from(
-                        classifier,
-                        "processed",
-                        backward=lambda _n: classifier.progress_text() or "Idle.",
-                    )
-                    if classifier.state in (llm_client.RUNNING, llm_client.RATE_LIMITED):
-                        bar = ui.linear_progress(show_value=False).props("rounded")
-                        bar.bind_value_from(
-                            classifier,
-                            "processed",
-                            backward=lambda n: (n / classifier.total) if classifier.total else 0.0,
-                        )
-                        if classifier.state == llm_client.RATE_LIMITED:
-                            bar.props("color=warning")
-
-                with ui.row().classes("gap-2 pt-2 flex-wrap"):
-                    if configured:
-                        ui.button("Test connection", on_click=test_groq).props("flat no-caps")
-                        classification_control()
-                    # Offering to move the key somewhere that cannot store it
-                    # would only produce an error, so the button appears once a
-                    # backend answers.
-                    if configured and not in_keyring and has_store:
-                        ui.button(
-                            "Move key to credential manager", on_click=move_groq_key
-                        ).props("flat no-caps")
-                    if in_keyring:
-                        ui.button("Forget stored key", on_click=forget_groq_key).props(
-                            "flat no-caps"
-                        )
+        # AI providers ---------------------------------------------------------
+        #
+        # Two cards, built in web/ai_settings.py: provider status and key
+        # management, then which model does which job. They live there because
+        # this file already owns four unrelated cards, and there because a
+        # module under web/pages/ would be treated as a route by the page
+        # tests' reload fixture.
 
         def classification_control():
             if classifier.busy:
@@ -233,59 +199,23 @@ def settings_page():
                 on_click=classify_now,
             ).props(("unelevated" if waiting else "flat") + " no-caps")
 
-        async def test_groq():
-            """Classify one synthetic message so a misconfiguration shows up here."""
-            sample = {
-                "sender": "careers@example.com",
-                "subject": "Thank you for applying",
-                "body": "We received your application and will be in touch soon.",
-                "company": "Example",
-                "position_title": "Engineer",
-            }
-            try:
-                client = llm_client.GroqClient.from_config()
-                result = await run.io_bound(client.classify, sample)
-            except llm_client.GroqRateLimited as exc:
-                ui.notify(
-                    f"Groq is rate limiting requests. Try again in about {exc.retry_after}s.",
-                    type="warning", multi_line=True, close_button=True,
-                )
-                return
-            except Exception as exc:
-                ui.notify(f"Groq test failed: {exc}", type="negative", multi_line=True,
-                          close_button=True)
-                return
-            ui.notify(
-                f"Test message classified as {result['label']} "
-                f"({result['confidence']:.0%}). {result['reason']}",
-                type="positive", multi_line=True, close_button=True,
-            )
+        def notify(message, kind="positive"):
+            """Notify, tolerating a client that has already navigated away.
 
-        def move_groq_key():
-            try:
-                llm_client.save_api_key(llm_client.api_key())
-            except Exception as exc:
-                ui.notify(f"Could not store the key: {exc}", type="negative", multi_line=True,
-                          close_button=True)
-                return
-            ui.notify(
-                "The Groq key is now in your credential manager, which takes precedence over "
-                ".env. You can remove GROQ_API_KEY from .env when you are ready; this app does "
-                "not edit that file for you.",
-                type="positive", multi_line=True, close_button=True,
-            )
-            groq_card.refresh()
+            Summary:
+                Show a notification, ignoring a detached client.
 
-        async def forget_groq_key():
-            if not await confirm(
-                "Forget stored key",
-                "Remove the Groq key from your credential manager? If GROQ_API_KEY is still set "
-                "in .env, that value will be used instead.",
-            ):
-                return
-            llm_client.forget_api_key()
-            ui.notify("The stored Groq key was deleted.", type="positive")
-            groq_card.refresh()
+            Parameters:
+                message (str): The text to show.
+                kind (str): A NiceGUI notification type.
+            """
+            try:
+                ui.notify(message, type=kind, multi_line=True, close_button=True)
+            except RuntimeError:
+                pass
+
+        ai_card = build_ai_card(state, classifier, classification_control, notify)
+        routing_card = build_routing_card(state, notify)
 
         # Ingest pipeline ------------------------------------------------------
 
@@ -421,21 +351,25 @@ def settings_page():
 
         def refresh_all():
             gmail_card.refresh()
-            groq_card.refresh()
+            ai_card.refresh(confirm=confirm)
 
         def watch():
-            """Redraw when a worker changes state.
+            """Redraw when a worker or a provider changes state.
 
             Progress numbers are bound, so this only has to catch the moments
-            where the available controls change.
+            where the available controls change - and now also when a provider
+            starts or stops cooling down, so a failover is visible without a
+            reload. The pool signature is deliberately cheap: it reads memory,
+            never the database, because this runs several times a second.
             """
-            current = (scanner.state, classifier.state)
-            if current != (seen["scanner"], seen["classifier"]):
-                seen["scanner"], seen["classifier"] = current
+            current = (scanner.state, classifier.state, _pool_signature(state))
+            if current != seen["all"]:
+                seen["all"] = current
                 refresh_all()
 
         gmail_card()
-        groq_card()
+        ai_card(confirm=confirm)
+        routing_card()
         pipeline_card()
         denylist_card()
         page_timer(0.4, watch)
