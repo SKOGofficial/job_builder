@@ -7,6 +7,7 @@ did, keeping everything already written. So the last class here drives the real
 `AlertHandler.run`, not a mock of it.
 """
 
+import asyncio
 import os
 import unittest
 
@@ -558,18 +559,18 @@ class RealHandlerTests(PoolFixture):
 
         handler = AlertHandler(
             self.store, self.mail,
-            pool.for_task("extract_alert", max_wait=LOOP_MAX_WAIT),
+            pool.for_task("extract_alert", max_wait=THREAD_MAX_WAIT),
         )
-        created, _skipped, _linked = handler.run(5)
+        created, _skipped, _linked = asyncio.run(handler.run(5))
         self.assertGreaterEqual(created, 1, "the first alert must produce a lead")
 
         groq.error = ProviderRateLimited("busy", retry_after=30, provider="Groq")
         before = self.mail.conn.execute(
             "SELECT COUNT(*) c FROM job_leads").fetchone()["c"]
-        created_again, _s, _l = AlertHandler(
+        created_again, _s, _l = asyncio.run(AlertHandler(
             self.store, self.mail,
-            pool.for_task("extract_alert", max_wait=LOOP_MAX_WAIT),
-        ).run(5)
+            pool.for_task("extract_alert", max_wait=THREAD_MAX_WAIT),
+        ).run(5))
         after = self.mail.conn.execute(
             "SELECT COUNT(*) c FROM job_leads").fetchone()["c"]
 
@@ -583,10 +584,10 @@ class RealHandlerTests(PoolFixture):
         groq = FakeClient("llama-3.3", error=ProviderRateLimited(
             "busy", retry_after=600, provider="Groq"))
         pool = self.pool({"groq": builder(groq, "Groq")})
-        AlertHandler(
+        asyncio.run(AlertHandler(
             self.store, self.mail,
             pool.for_task("extract_alert", max_wait=LOOP_MAX_WAIT),
-        ).run(5)
+        ).run(5))
         self.assertTrue(all(s <= LOOP_MAX_WAIT for s in self.slept),
                         f"slept past the loop budget: {self.slept}")
 
@@ -667,7 +668,7 @@ class OrchestratorWiringTests(PoolFixture):
             return original(task, max_wait=max_wait)
 
         pool.for_task = spy
-        self.cycle(pool).dispatch(pool)
+        asyncio.run(self.cycle(pool).dispatch(pool))
 
         tasks = [task for task, _wait in seen]
         self.assertEqual(
@@ -675,8 +676,15 @@ class OrchestratorWiringTests(PoolFixture):
             ["extract_alert", "extract_acknowledgement", "extract_update"],
         )
 
-    def test_inline_stages_get_the_short_sleep_budget(self):
-        """They run on the event loop, where a long sleep freezes the UI."""
+    def test_handler_stages_get_the_long_sleep_budget(self):
+        """They put their model calls on an executor, so waiting is free.
+
+        These stages used to run inline on the event loop, which is why they
+        took `LOOP_MAX_WAIT`: a long sleep there froze the UI. They are awaited
+        now and each handler offloads its call, so a wait costs the interface
+        nothing - and capping them at two seconds would make the pool fail over
+        to a second provider, or give up, for an ordinary pacing gap.
+        """
         pool = self.two_providers()
         seen = []
         original = pool.for_task
@@ -686,8 +694,8 @@ class OrchestratorWiringTests(PoolFixture):
             return original(task, max_wait=max_wait)
 
         pool.for_task = spy
-        self.cycle(pool).dispatch(pool)
-        self.assertTrue(all(wait == LOOP_MAX_WAIT for wait in seen), seen)
+        asyncio.run(self.cycle(pool).dispatch(pool))
+        self.assertTrue(all(wait == THREAD_MAX_WAIT for wait in seen), seen)
 
     def test_the_pool_is_built_once_and_kept(self):
         """A cooldown must outlive the cycle that earned it."""

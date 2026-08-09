@@ -42,16 +42,20 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 from clients.providers.base import (
     CHARS_PER_TOKEN,
     ESTIMATED_TOKENS_PER_CALL,
+    RATE_LIMIT_HEADERS,
     TOKENS_PER_MINUTE,
     Pacer,
     ProviderBudgetExhausted,
     ProviderNotConfigured,
     ProviderRateLimited,
+    describe_rate_limit,
     estimate_tokens,
+    rate_limit_snapshot,
     retry_after_seconds,
 )
 from utilities import credentials
@@ -131,19 +135,6 @@ class GroqNotConfigured(Exception):
     """Raised when no usable API key is available."""
 
 
-class GroqRateLimited(Exception):
-    """Raised on HTTP 429 so the cycle can stop instead of retrying.
-
-    Carries `limits`, the rate-limit headers the response reported, because
-    `retry_after` alone does not say *which* ceiling was reached. A wait of a
-    minute and a wait until tomorrow are the same exception otherwise, and they
-    call for completely different responses.
-    """
-
-    def __init__(self, message, retry_after=0, limits=None):
-        super().__init__(message)
-        self.retry_after = retry_after
-        self.limits = limits or {}
 # These are aliases, not subclasses, and the difference is load-bearing.
 #
 # `except GroqRateLimited` appears in six pipeline modules and is what stops a
@@ -318,191 +309,6 @@ def parse_classification(content):
     return {"label": label.strip(), "confidence": confidence, "reason": reason}
 
 
-def estimate_tokens(messages, max_tokens):
-    """Project what one request will actually cost the rolling token window.
-
-    A flat per-call estimate is what caused the free-tier 429s this replaces.
-    Classification sends 2,000 body characters and asks for 200 back - around
-    1,100 tokens, close to the old flat 900. Alert extraction sends 6,000
-    characters and asks for 1,500 back, which is nearer 3,400. Booking that at
-    900 let four calls drain a 12,000-token minute while the pacer believed it
-    had room for thirteen.
-
-    Measuring the request removes the guess and, more usefully, removes the
-    need for every new call site to remember to pass a number.
-
-    Summary:
-        Estimate the token cost of a chat request from its serialised messages
-        and its output ceiling.
-
-    Parameters:
-        messages (list[dict]): The chat messages about to be sent.
-        max_tokens (int): The requested output ceiling.
-
-    Returns:
-        int: Projected total tokens, input plus a worst-case output.
-
-    Note:
-        Deliberately errs high. JSON quoting inflates the character count, and
-        `max_tokens` is a ceiling replies rarely reach, so the projection is
-        conservative - which is the safe direction for a rate limit.
-    """
-    serialized = json.dumps(messages, ensure_ascii=False)
-    return len(serialized) // CHARS_PER_TOKEN + max_tokens
-
-
-def retry_after_seconds(response):
-    """Read retry-after, falling back to a minute when it is absent."""
-    raw = (getattr(response, "headers", None) or {}).get("retry-after")
-    try:
-        return max(0, int(float(raw)))
-    except (TypeError, ValueError):
-        return 60
-
-
-#: What Groq reports alongside a 429. Requests are limited per day and tokens
-#: per minute, so the pair says which ceiling was actually reached - the thing
-#: `retry-after` on its own leaves ambiguous.
-RATE_LIMIT_HEADERS = (
-    "x-ratelimit-limit-requests",
-    "x-ratelimit-remaining-requests",
-    "x-ratelimit-reset-requests",
-    "x-ratelimit-limit-tokens",
-    "x-ratelimit-remaining-tokens",
-    "x-ratelimit-reset-tokens",
-)
-
-
-def rate_limit_snapshot(response):
-    """
-    Summary:
-        Collect whichever rate-limit headers a response carries.
-
-    Parameters:
-        response: The HTTP response to read headers from.
-
-    Returns:
-        dict: Header name to value, for the headers that were present. Empty
-            when the response carries none.
-
-    Note:
-        Header lookup is case-insensitive on a real `requests` response; a
-        plain dict from a test is read as-is, so both work.
-    """
-    headers = getattr(response, "headers", None) or {}
-    snapshot = {}
-    for name in RATE_LIMIT_HEADERS:
-        value = headers.get(name)
-        if value is not None:
-            snapshot[name] = value
-    return snapshot
-
-
-def describe_rate_limit(snapshot):
-    """
-    Summary:
-        Render a rate-limit snapshot as one readable line for the log.
-
-    Parameters:
-        snapshot (dict): As returned by `rate_limit_snapshot`.
-
-    Returns:
-        str: A short summary naming what is left and when it resets, or a note
-            that the response said nothing.
-
-    Note:
-        Reports requests and tokens separately and on purpose. Seeing which of
-        the two is at zero is the whole point: a spent per-minute token budget
-        clears in seconds, while a spent daily request budget does not clear
-        until tomorrow, and pacing cannot help with the second.
-    """
-    if not snapshot:
-        return "no rate-limit headers reported"
-    parts = []
-    for kind in ("requests", "tokens"):
-        remaining = snapshot.get(f"x-ratelimit-remaining-{kind}")
-        if remaining is None:
-            continue
-        limit = snapshot.get(f"x-ratelimit-limit-{kind}", "?")
-        reset = snapshot.get(f"x-ratelimit-reset-{kind}", "?")
-        parts.append(f"{remaining}/{limit} {kind} left, resets in {reset}")
-    return "; ".join(parts) or "no rate-limit headers reported"
-
-
-# Pacing -------------------------------------------------------------------
-
-
-class Pacer:
-    """Spaces requests so neither the request nor the token ceiling is reached.
-
-    Both limits are enforced: a minimum gap between calls, and a rolling
-    sixty-second window of tokens actually spent, reported by each response.
-    sleep and clock are injectable so tests can drive this without waiting.
-    """
-
-    def __init__(
-        self,
-        per_minute=DEFAULT_REQUESTS_PER_MINUTE,
-        tokens_per_minute=TOKENS_PER_MINUTE,
-        sleep=time.sleep,
-        clock=time.monotonic,
-    ):
-        self.min_interval = 60.0 / max(1, per_minute)
-        self.tokens_per_minute = tokens_per_minute
-        self._sleep = sleep
-        self._clock = clock
-        self._last_call = None
-        self._spent = []
-
-    def wait(self, projected_tokens=ESTIMATED_TOKENS_PER_CALL):
-        now = self._clock()
-        if self._last_call is not None:
-            gap = self.min_interval - (now - self._last_call)
-            if gap > 0:
-                self._sleep(gap)
-                now = self._clock()
-        delay = self.token_delay(now, projected_tokens)
-        if delay > 0:
-            self._sleep(delay)
-            now = self._clock()
-        self._last_call = now
-
-    def token_delay(self, now, projected_tokens):
-        """
-        Summary:
-            How long to wait before a request of this size fits inside the
-            rolling sixty-second token window.
-
-        Parameters:
-            now (float): Current monotonic time, from the injected clock.
-            projected_tokens (int): What the pending request is expected to
-                cost. See `estimate_tokens`.
-
-        Returns:
-            float: Seconds to sleep. 0.0 when the request fits now.
-
-        Note:
-            Returns 0.0 when nothing has been spent yet, even if the request
-            alone exceeds the whole per-minute budget. Waiting cannot make room
-            that no earlier call is occupying, so blocking would stall forever;
-            better to send it and let the API answer. This mattered less when
-            every call was booked at a flat 900 tokens - now that projections
-            are measured, they can in principle exceed the ceiling.
-        """
-        self._spent = [(at, n) for at, n in self._spent if now - at < 60.0]
-        used = sum(n for _at, n in self._spent)
-        if used + projected_tokens <= self.tokens_per_minute:
-            return 0.0
-        if not self._spent:
-            return 0.0
-        oldest = min(at for at, _n in self._spent)
-        return max(0.0, 60.0 - (now - oldest))
-
-    def record(self, tokens):
-        if tokens:
-            self._spent.append((self._clock(), tokens))
-
-
 # Client -------------------------------------------------------------------
 
 
@@ -603,9 +409,8 @@ class GroqClient:
             log.warning("Groq rate limit reached (retry in about %ss): %s",
                         retry_after, describe_rate_limit(snapshot))
             raise GroqRateLimited(
-                "Groq rate limit reached.", retry_after=retry_after,
-                limits=snapshot,
                 "Groq rate limit reached.",
+                limits=snapshot,
                 retry_after=retry_after_seconds(response),
                 provider=DISPLAY_NAME,
             )

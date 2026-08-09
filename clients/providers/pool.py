@@ -52,9 +52,13 @@ from clients.providers.routing import (
 log = logging.getLogger(__name__)
 
 #: How long a call may block when it is running on the event loop thread.
-#: `dispatch` and `prepare` are called synchronously from the async `run`, so
-#: anything longer than a beat here is a visibly frozen UI. Short enough to
+#: Anything longer than a beat there is a visibly frozen UI. Short enough to
 #: absorb a pacing gap, not long enough to ride out a rate limit.
+#:
+#: No pipeline stage takes this any more - `dispatch` and `prepare` are awaited
+#: and put their model calls on an executor, so they take `THREAD_MAX_WAIT`
+#: like the router. This remains the default for a call made on the loop
+#: thread, which is what the thread check in `sleep_budget` falls back to.
 LOOP_MAX_WAIT = 2.0
 
 #: How long a call may block off the event loop. Bounded below

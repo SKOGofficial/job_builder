@@ -15,7 +15,7 @@ calling thread and only network calls go to the executor.
 import logging
 
 from clients.llm_client import GroqRateLimited
-from clients.providers.pool import LOOP_MAX_WAIT, THREAD_MAX_WAIT
+from clients.providers.pool import THREAD_MAX_WAIT
 from pipeline.acknowledgements import AcknowledgementHandler
 from pipeline.alerts import AlertHandler
 from pipeline.resolver import JobResolver
@@ -160,25 +160,14 @@ class PipelineCycle:
             result["filter"] = self.apply_filter()
             result["bodies"] = await self.bodies.run(self.limits["bodies"])
 
-            client = self._client()
-            if client is not None:
-                router = MessageRouter(
-                    self.mail,
-                    client_factory=lambda: client,
-                    executor=self.executor,
-                )
-                result["classified"] = await router.run(self.limits["classify"])
-                result["handled"] = await self.dispatch(client)
-                result["prepared"] = await self.prepare(client)
             pool = self._pool()
             if pool is not None:
                 pool.begin_cycle()
                 try:
-                    # The router already runs its model calls through an
-                    # executor, so it may block for the longer budget. Every
-                    # other stage runs inline on this loop and gets the short
-                    # one - passed explicitly rather than left to the pool's
-                    # thread check, since here the answer is already known.
+                    # Every model-calling stage now runs its calls through an
+                    # executor, so all of them may block for the longer budget.
+                    # Passed explicitly rather than left to the pool's thread
+                    # check, since here the answer is already known.
                     route = pool.for_task("route_email",
                                           max_wait=THREAD_MAX_WAIT)
                     if route is not None:
@@ -192,8 +181,8 @@ class PipelineCycle:
                         )
                     else:
                         result["classified"] = {}
-                    result["handled"] = self.dispatch(pool)
-                    result["prepared"] = self.prepare(pool)
+                    result["handled"] = await self.dispatch(pool)
+                    result["prepared"] = await self.prepare(pool)
                 finally:
                     pool.flush()
             else:
@@ -211,8 +200,7 @@ class PipelineCycle:
         self.last_result = result
         return result
 
-    async def dispatch(self, client):
-    def dispatch(self, pool):
+    async def dispatch(self, pool):
         """Hand classified messages to their category handler.
 
         Alerts first: an acknowledgement processed before the alert that
@@ -220,32 +208,6 @@ class PipelineCycle:
         lead, losing the board metadata and the canonical apply URL.
 
         Summary:
-            Run the alert, acknowledgement, and update handlers in order.
-
-        Parameters:
-            client (GroqClient): The model client the handlers extract with.
-
-        Returns:
-            dict: Counts under `leads_created`, `leads_skipped`,
-                `acknowledgements`, and `updates`.
-
-        Note:
-            Awaited rather than called directly. Each handler makes blocking
-            model calls, and this runs on the loop that serves the web UI, so a
-            synchronous call here froze the interface for as long as the batch
-            took - minutes, once the rate limit started forcing waits.
-        """
-        limit = self.limits["handle"]
-        created, skipped, _ = await AlertHandler(
-            self.store, self.mail, client, executor=self.executor).run(limit)
-
-        acknowledged = await AcknowledgementHandler(
-            self.store, self.mail, self.resolver, client,
-            executor=self.executor).run(limit)
-
-        updated = await UpdateHandler(
-            self.store, self.mail, self.resolver, client,
-            threshold=self.threshold, executor=self.executor).run(limit)
             Run each category handler with a client bound to its own task.
 
         Parameters:
@@ -255,26 +217,30 @@ class PipelineCycle:
             dict: Counts per handler.
 
         Note:
-            Every handler here runs inline on the event loop, so each client
-            gets the short sleep budget. A stage that blocked for a rate limit
-            would freeze the UI; instead the pool raises and the handler's
-            existing `except ... break` keeps what it has written and resumes
-            next cycle.
+            Awaited, and each handler puts its model call on an executor, so
+            none of this blocks the loop that serves the UI. That is why the
+            clients get the longer sleep budget: the short one exists for calls
+            made on the loop thread, and a handler waiting out a pacing gap in
+            a worker thread costs the interface nothing. Capping it at the
+            short budget here would make the pool give up and fail over after
+            two seconds for no reason.
         """
         limit = self.limits["handle"]
-        created, skipped, _ = AlertHandler(
+        created, skipped, _ = await AlertHandler(
             self.store, self.mail,
-            pool.for_task("extract_alert", max_wait=LOOP_MAX_WAIT)).run(limit)
+            pool.for_task("extract_alert", max_wait=THREAD_MAX_WAIT),
+            executor=self.executor).run(limit)
 
-        acknowledged = AcknowledgementHandler(
+        acknowledged = await AcknowledgementHandler(
             self.store, self.mail, self.resolver,
             pool.for_task("extract_acknowledgement",
-                          max_wait=LOOP_MAX_WAIT)).run(limit)
+                          max_wait=THREAD_MAX_WAIT),
+            executor=self.executor).run(limit)
 
-        updated = UpdateHandler(
+        updated = await UpdateHandler(
             self.store, self.mail, self.resolver,
-            pool.for_task("extract_update", max_wait=LOOP_MAX_WAIT),
-            threshold=self.threshold).run(limit)
+            pool.for_task("extract_update", max_wait=THREAD_MAX_WAIT),
+            threshold=self.threshold, executor=self.executor).run(limit)
 
         return {
             "leads_created": created,
@@ -283,46 +249,7 @@ class PipelineCycle:
             "updates": updated,
         }
 
-    async def prepare(self, client):
-        """Score new leads and build artifacts for the ones worth it.
-
-        Degrades in two independent steps. Without the research client, leads
-        still get scored and simply wait at `new`; without the Groq client this
-        is not reached at all. Neither absence stops the rest of the pipeline.
-
-        Summary:
-            Run the scoring and artifact-building stage.
-
-        Parameters:
-            client (GroqClient): The model client used to score leads.
-
-        Returns:
-            dict: Counts under `scored`, `prepared`, and `failed`; empty when
-                the stage could not run.
-        """
-        from pipeline.prepare import LeadPreparer
-
-        research = self._research_client()
-        preparer = LeadPreparer(self.store, self.mail, client, research,
-                                threshold=self.relevance_threshold,
-                                executor=self.executor)
-        try:
-            return await preparer.run(prepare_limit=self.limits["prepare"])
-        except GroqRateLimited as exc:
-            # Routine. Without this the stage reported a traceback and an
-            # error for what is simply "out of tokens, resume next cycle".
-            log.info(
-                "Lead preparation paused by the rate limit; retrying next "
-                "cycle, in about %ss", exc.retry_after,
-            )
-            return {}
-        except Exception:
-            log.exception("Lead preparation stage failed")
-            return {}
-
-    def _research_client(self):
-        """A Claude client with a spend limiter, or None when unconfigured."""
-    def prepare(self, pool):
+    async def prepare(self, pool):
         """Score new leads and build artifacts for the ones worth it.
 
         Degrades in two independent steps. Without a research provider, leads
@@ -338,10 +265,15 @@ class PipelineCycle:
 
         Returns:
             dict: The preparer's per-stage counts, or an empty dict on failure.
+
+        Note:
+            Awaited, and the scorer and the builder both put their slow work on
+            an executor, so these clients take the longer sleep budget for the
+            same reason `dispatch`'s do.
         """
         from pipeline.prepare import LeadPreparer
 
-        research = pool.for_task("research", max_wait=LOOP_MAX_WAIT)
+        research = pool.for_task("research", max_wait=THREAD_MAX_WAIT)
         if self._research_factory is not None:
             try:
                 research = self._research_factory()
@@ -351,12 +283,21 @@ class PipelineCycle:
 
         preparer = LeadPreparer(
             self.store, self.mail,
-            pool.for_task("score_relevance", max_wait=LOOP_MAX_WAIT),
+            pool.for_task("score_relevance", max_wait=THREAD_MAX_WAIT),
             research,
             threshold=self.relevance_threshold,
+            executor=self.executor,
         )
         try:
-            return preparer.run(prepare_limit=self.limits["prepare"])
+            return await preparer.run(prepare_limit=self.limits["prepare"])
+        except GroqRateLimited as exc:
+            # Routine. Without this the stage reported a traceback and an
+            # error for what is simply "out of tokens, resume next cycle".
+            log.info(
+                "Lead preparation paused by the rate limit; retrying next "
+                "cycle, in about %ss", exc.retry_after,
+            )
+            return {}
         except Exception:
             log.exception("Lead preparation stage failed")
             return {}
