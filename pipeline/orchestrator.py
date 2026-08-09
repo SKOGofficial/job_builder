@@ -164,25 +164,7 @@ class PipelineCycle:
             if pool is not None:
                 pool.begin_cycle()
                 try:
-                    # Every model-calling stage now runs its calls through an
-                    # executor, so all of them may block for the longer budget.
-                    # Passed explicitly rather than left to the pool's thread
-                    # check, since here the answer is already known.
-                    route = pool.for_task("route_email",
-                                          max_wait=THREAD_MAX_WAIT)
-                    if route is not None:
-                        router = MessageRouter(
-                            self.mail,
-                            client_factory=lambda: route,
-                            executor=self.executor,
-                        )
-                        result["classified"] = await router.run(
-                            self.limits["classify"]
-                        )
-                    else:
-                        result["classified"] = {}
-                    result["handled"] = await self.dispatch(pool)
-                    result["prepared"] = await self.prepare(pool)
+                    result.update(await self._model_stages(pool))
                 finally:
                     pool.flush()
             else:
@@ -199,6 +181,63 @@ class PipelineCycle:
             result["error"] = str(exc)
         self.last_result = result
         return result
+
+    async def _model_stages(self, pool):
+        """Classify, dispatch, and prepare - or skip the lot and say when.
+
+        Summary:
+            Run every stage that needs a model, unless no provider can take a
+            call yet.
+
+        Parameters:
+            pool (ProviderPool): The pool to draw task clients from.
+
+        Returns:
+            dict: `classified`, `handled`, and `prepared`, plus `retry_after`
+                in seconds when the stages were skipped.
+
+        Note:
+            Asking the pool once, up front, replaces five stages each
+            discovering the same cooldown for itself and logging its own line
+            about it. The cost was never the API - `candidates` filters a
+            cooling provider without calling it - but an hour of cooldown at a
+            ten-minute cadence still meant thirty log lines saying nothing.
+
+            Only the model stages are skipped. Sync, filtering, and body
+            fetching have already run by the time this is called, on purpose:
+            a rate-limited model must not stop new mail from reaching the
+            inbox view.
+        """
+        wait = pool.next_available_in()
+        if wait > 0:
+            log.info(
+                "Model stages skipped: no provider is available for about "
+                "%ds. Mail still synced; classification resumes when one frees "
+                "up.", int(wait),
+            )
+            return {"classified": {}, "handled": {}, "prepared": {},
+                    "retry_after": int(wait)}
+
+        # Every model-calling stage runs its calls through an executor, so all
+        # of them may block for the longer budget. Passed explicitly rather
+        # than left to the pool's thread check, since here the answer is
+        # already known.
+        route = pool.for_task("route_email", max_wait=THREAD_MAX_WAIT)
+        if route is not None:
+            router = MessageRouter(
+                self.mail,
+                client_factory=lambda: route,
+                executor=self.executor,
+            )
+            classified = await router.run(self.limits["classify"])
+        else:
+            classified = {}
+
+        return {
+            "classified": classified,
+            "handled": await self.dispatch(pool),
+            "prepared": await self.prepare(pool),
+        }
 
     async def dispatch(self, pool):
         """Hand classified messages to their category handler.
@@ -335,4 +374,15 @@ def _summarise(result):
     handled = result.get("handled") or {}
     if handled.get("leads_created"):
         parts.append(f"{handled['leads_created']} new lead(s)")
+    # Said even when other parts exist: "3 new message(s)" with no mention of
+    # classification reads as a pipeline that quietly stopped working.
+    if result.get("retry_after"):
+        parts.append(f"waiting {_minutes(result['retry_after'])} for a model")
     return "; ".join(parts) or "Nothing new."
+
+
+def _minutes(seconds):
+    """Seconds as a short human phrase, for the status line."""
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    return f"{round(seconds / 60)}m"

@@ -643,6 +643,81 @@ class AttributionThroughRouterTests(PoolFixture):
         self.assertIsNone(self.mail.message("m1")["category_model"])
 
 
+class NextAvailableTests(PoolFixture):
+    """When the pool can next take a model call at all.
+
+    The question a caller asks before deciding whether to attempt the model
+    stages, rather than letting five of them each rediscover the same cooldown.
+    """
+
+    def test_zero_while_a_provider_is_ready(self):
+        pool = self.two_providers()
+        self.assertEqual(pool.next_available_in(), 0.0)
+
+    def test_zero_when_only_one_of_two_is_cooling(self):
+        """Failover is the point: one provider down is not the pipeline down."""
+        pool = self.two_providers()
+        pool.providers["groq"].cool_down(self.now + 300)
+        self.assertEqual(pool.next_available_in(), 0.0)
+
+    def test_the_soonest_wait_when_every_provider_is_cooling(self):
+        pool = self.two_providers()
+        pool.providers["groq"].cool_down(self.now + 900)
+        pool.providers["gemini"].cool_down(self.now + 120)
+        self.assertEqual(pool.next_available_in(), 120)
+
+    def test_a_spent_daily_budget_counts_as_unavailable(self):
+        """Not a cooldown, but just as much a reason not to try."""
+        pool = self.two_providers(gemini_daily=1)
+        pool.providers["groq"].cool_down(self.now + 600)
+        pool.providers["gemini"].budget.deny("day", self.now)
+        self.assertGreater(pool.next_available_in(), 0)
+
+    def test_nothing_configured_is_not_a_wait(self):
+        # "Cannot ever" is not "not yet"; the caller's own None handling covers
+        # it, and reporting a wait here would promise a recovery that is not
+        # coming.
+        pool = self.pool({"groq": builder(None, "Groq")})
+        self.assertEqual(pool.next_available_in(), 0.0)
+
+
+class ModelStageSkipTests(PoolFixture):
+    """Skipping the model stages as a group while nothing can serve them."""
+
+    def cycle(self, pool):
+        from pipeline.orchestrator import PipelineCycle
+
+        return PipelineCycle(
+            self.store, self.mail, client_factory=lambda: pool
+        )
+
+    def test_stages_are_skipped_and_the_wait_reported(self):
+        pool = self.two_providers()
+        for state in pool.providers.values():
+            state.cool_down(self.now + 1800)
+
+        result = asyncio.run(self.cycle(pool)._model_stages(pool))
+
+        self.assertEqual(result["retry_after"], 1800)
+        self.assertEqual(result["classified"], {})
+        self.assertEqual(result["handled"], {})
+        self.assertEqual(self.groq.calls, 0, "nothing may be sent while cooling")
+        self.assertEqual(self.gemini.calls, 0)
+
+    def test_no_wait_is_reported_when_a_provider_is_ready(self):
+        pool = self.two_providers()
+        result = asyncio.run(self.cycle(pool)._model_stages(pool))
+        self.assertNotIn("retry_after", result)
+
+    def test_the_summary_says_why_nothing_was_classified(self):
+        from pipeline.orchestrator import _summarise
+
+        self.assertIn("waiting 30m for a model",
+                      _summarise({"synced": 3, "retry_after": 1800}))
+        self.assertIn("3 new message(s)",
+                      _summarise({"synced": 3, "retry_after": 1800}))
+
+
 class OrchestratorWiringTests(PoolFixture):
     """`PipelineCycle` handing each stage a client bound to its own task.
 

@@ -504,6 +504,43 @@ class ProviderPool:
         now = self._clock()
         return [state.snapshot(now) for state in self.providers.values()]
 
+    def next_available_in(self, now=None):
+        """How long until any provider could take a model call again.
+
+        Summary:
+            Report the shortest wait before some configured provider is out of
+            cooldown and inside its daily budget.
+
+        Parameters:
+            now (float | None): Monotonic time to evaluate against. Defaults to
+                the pool's clock.
+
+        Returns:
+            float: Seconds to wait. 0.0 when a provider can take a call now,
+                and also when nothing is configured at all - "cannot ever" is
+                not a wait, and the caller already handles an absent provider.
+
+        Note:
+            Deliberately ignores the task chain and the shape. A caller asking
+            this is deciding whether to attempt the model stages at all, and
+            answering per-task would mean claiming a provider is free for work
+            its chain does not route to it. The pessimistic reading is the
+            useful one here.
+        """
+        now = self._clock() if now is None else now
+        waits = []
+        for state in self.providers.values():
+            if not state.configured():
+                continue
+            if state.cooling_down(now):
+                waits.append(state.cooldown_until - now)
+                continue
+            if not state.budget.has_headroom(now):
+                waits.append(state.budget.reset_in(now))
+                continue
+            return 0.0
+        return min(waits) if waits else 0.0
+
     def signature(self):
         """A cheap value that changes when the displayed state would.
 
