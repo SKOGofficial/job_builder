@@ -23,6 +23,8 @@ import logging
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 
+from utilities.durations import spell_duration
+
 log = logging.getLogger(__name__)
 
 # --- vocabulary --------------------------------------------------------------
@@ -78,13 +80,9 @@ def waiting_note(retry_after):
         str: A note beginning with `PREPARE_WAITING_PREFIX`, which is what
             tells the Leads page to show it as a pause and not a failure.
     """
-    try:
-        seconds = int(retry_after or 0)
-    except (TypeError, ValueError):
-        seconds = 0
-    if seconds <= 0:
+    when = spell_duration(retry_after)
+    if not when:
         return f"{PREPARE_WAITING_PREFIX}. Retrying next cycle."
-    when = f"{seconds}s" if seconds < 90 else f"{round(seconds / 60)}m"
     return f"{PREPARE_WAITING_PREFIX}. Retrying in about {when}."
 
 

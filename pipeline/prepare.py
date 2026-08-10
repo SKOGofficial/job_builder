@@ -20,6 +20,7 @@ from clients.llm_client import GroqRateLimited
 from clients.research_client import ResearchNotConfigured, SpendCeilingReached
 from pipeline.generate import ArtifactBuilder
 from pipeline.relevance import RelevanceScorer
+from utilities.durations import spell_duration
 from utilities.mailstore import LEAD_PREPARING, LEAD_READY, waiting_note
 
 log = logging.getLogger(__name__)
@@ -88,7 +89,8 @@ class LeadPreparer:
         wait = getattr(self.builder.research_client, "available_in", _never)()
         if wait > 0:
             log.info("Lead preparation skipped: no provider is available for "
-                     "research for about %ds; retrying next cycle.", int(wait))
+                     "research for about %s; retrying next cycle.",
+                     spell_duration(wait))
             return {"scored": scored, "prepared": 0, "failed": 0}
 
         for lead in self.scorer.worth_preparing(prepare_limit):
@@ -140,7 +142,7 @@ class LeadPreparer:
             # become a traceback, and None rather than False so the rest of the
             # batch is not each marked failed finding the same wall.
             log.info("Lead preparation paused by the rate limit; retrying next "
-                     "cycle, in about %ss", exc.retry_after)
+                     "cycle, in about %s", spell_duration(exc.retry_after))
             self.mail.set_lead_status(lead["id"], lead["status"],
                                       waiting_note(exc.retry_after))
             return None

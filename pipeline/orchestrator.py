@@ -23,6 +23,7 @@ from pipeline.rough_filter import build_filter
 from pipeline.router import MessageRouter
 from pipeline.sync import BodyFetcher, MailboxSync
 from pipeline.updates import UpdateHandler
+from utilities.durations import spell_duration
 from utilities.mailstore import VERDICT_PASSED
 
 log = logging.getLogger(__name__)
@@ -388,7 +389,9 @@ def _summarise(result):
 
 
 def _minutes(seconds):
-    """Seconds as a short human phrase, for the status line."""
-    if seconds < 90:
-        return f"{int(seconds)}s"
-    return f"{round(seconds / 60)}m"
+    """Seconds as a short human phrase, for the status line.
+
+    Kept as a name because that is what `_summarise` reads; the spelling itself
+    is shared, so a daily ceiling reads as "24h" rather than "1440m".
+    """
+    return spell_duration(seconds) or "0s"
