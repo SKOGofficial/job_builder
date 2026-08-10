@@ -1,0 +1,371 @@
+"""The Claude Code CLI provider.
+
+Two clusters matter most, and neither is about the happy path.
+
+The **command line**, because this provider's safety properties are entirely
+carried by argv and cwd. The prompt is untrusted email text, so it must never
+be interpolated into an argument; the CLI is an agent with shell and file
+access, so the tool grant must be closed rather than merely discouraged; and
+without `--bare` the working directory decides whether this repository's own
+CLAUDE.md gets loaded into an email-classification call. None of that is
+visible from the outside once it works, so it is asserted here.
+
+And the **failure mapping**, because it decides whether the pool fails over. A
+timeout that raises RuntimeError escapes `ProviderPool.call` uncaught and takes
+the stage down; a timeout that raises ProviderRateLimited moves the work to
+Gemini. The two look identical until the day the CLI hangs.
+"""
+
+import json
+import os
+import subprocess
+import unittest
+
+import clients.providers.claude_cli as claude_cli
+from clients.providers.base import (
+    ProviderBudgetExhausted,
+    ProviderNotConfigured,
+    ProviderRateLimited,
+)
+
+
+class FakeCompleted:
+    """What `subprocess.run` returns, reduced to what this module reads."""
+
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+def envelope(result="{}", *, structured=None, tokens=(120, 340), cost=0.02,
+             is_error=False, subtype="success", model="claude-sonnet-4-6"):
+    """A result envelope shaped like `--output-format json` produces."""
+    body = {
+        "type": "result",
+        "subtype": subtype,
+        "is_error": is_error,
+        "result": result,
+        "session_id": "sess-1",
+        "total_cost_usd": cost,
+        "duration_ms": 8100,
+        "num_turns": 1,
+        "model": model,
+        "usage": {"input_tokens": tokens[0], "output_tokens": tokens[1]},
+    }
+    if structured is not None:
+        body["structured_output"] = structured
+    return json.dumps(body)
+
+
+class Recorder:
+    """A fake runner that records the call and replays a scripted result."""
+
+    def __init__(self, stdout="", stderr="", returncode=0, raises=None):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+        self.raises = raises
+        self.argv = None
+        self.kwargs = None
+        self.calls = 0
+
+    def __call__(self, argv, **kwargs):
+        self.calls += 1
+        self.argv = list(argv)
+        self.kwargs = kwargs
+        if self.raises is not None:
+            raise self.raises
+        return FakeCompleted(self.stdout, self.stderr, self.returncode)
+
+    def flag(self, name):
+        """The value following `name`, or None when the flag is absent."""
+        if name not in self.argv:
+            return None
+        index = self.argv.index(name)
+        return self.argv[index + 1] if index + 1 < len(self.argv) else ""
+
+
+class EnvIsolationMixin:
+    """Keeps tests off the developer's real .env.
+
+    Mirrors `tests/test_gemini_client.py`. `claude_cli.load_dotenv` is nulled
+    the same way, which is why the module keeps a module-level handle on it.
+    """
+
+    CLI_VARS = (
+        "CLAUDE_CLI_PATH", "CLAUDE_CLI_MODEL", "CLAUDE_CLI_WORKDIR",
+        "CLAUDE_CLI_TIMEOUT", "CLAUDE_CLI_MAX_BUDGET_USD",
+        "CLAUDE_CLI_REQUESTS_PER_DAY", "CLAUDE_CLI_BARE",
+    )
+
+    def isolate_env(self):
+        self.saved_env = {name: os.environ.get(name) for name in self.CLI_VARS}
+        for name in self.CLI_VARS:
+            os.environ.pop(name, None)
+        self.saved_loader = claude_cli.load_dotenv
+        claude_cli.load_dotenv = None
+        self.addCleanup(self.restore_env)
+
+    def restore_env(self):
+        for name, value in self.saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        claude_cli.load_dotenv = self.saved_loader
+
+
+class ConfigTests(EnvIsolationMixin, unittest.TestCase):
+    def setUp(self):
+        self.isolate_env()
+
+    def test_a_missing_binary_is_not_configured(self):
+        os.environ["CLAUDE_CLI_PATH"] = os.path.join("no", "such", "claude")
+        with self.assertRaises(ProviderNotConfigured):
+            claude_cli.binary_path()
+        self.assertFalse(claude_cli.is_configured())
+
+    def test_the_daily_ceiling_defaults_to_none(self):
+        """0 is meaningful here, not a bad value: no ceiling."""
+        self.assertEqual(claude_cli.requests_per_day(), 0)
+        os.environ["CLAUDE_CLI_REQUESTS_PER_DAY"] = "40"
+        self.assertEqual(claude_cli.requests_per_day(), 40)
+        os.environ["CLAUDE_CLI_REQUESTS_PER_DAY"] = "nonsense"
+        self.assertEqual(claude_cli.requests_per_day(), 0)
+
+    def test_the_workdir_is_never_this_repository(self):
+        """The whole isolation story rests on this."""
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.assertNotEqual(os.path.abspath(claude_cli.workdir()), here)
+
+    def test_retry_after_reads_the_largest_duration_mentioned(self):
+        self.assertEqual(claude_cli.parse_retry_after("try again in 4 hours"), 14400)
+        self.assertEqual(claude_cli.parse_retry_after("wait 30 seconds"), 30)
+        self.assertEqual(
+            claude_cli.parse_retry_after("nothing useful", default=99), 99)
+
+
+class CommandLineTests(EnvIsolationMixin, unittest.TestCase):
+    """What is on the command line, and - more importantly - what is not."""
+
+    def setUp(self):
+        self.isolate_env()
+
+    def run_client(self, client, **kwargs):
+        recorder = Recorder(stdout=envelope('{"label": "alert"}'))
+        client.runner = recorder
+        client.binary = "claude"
+        return recorder
+
+    def test_the_prompt_is_on_stdin_and_never_in_argv(self):
+        """It is untrusted email. It does not go near a command line."""
+        secret = "COMPANY-SPECIFIC-BODY-TEXT"
+        client = claude_cli.ClaudeCliClient(binary="claude")
+        recorder = self.run_client(client)
+        client.complete_json(
+            [{"role": "system", "content": "SYS"},
+             {"role": "user", "content": secret}],
+            lambda text: text, "fallback",
+        )
+        self.assertNotIn(secret, " ".join(recorder.argv))
+        self.assertIn(secret, recorder.kwargs["input"])
+
+    def test_classification_is_given_no_tools_at_all(self):
+        client = claude_cli.ClaudeCliClient(binary="claude")
+        recorder = self.run_client(client)
+        client.complete_json([{"role": "user", "content": "hi"}],
+                             lambda text: text, "fallback")
+        self.assertIsNone(recorder.flag("--allowed-tools"))
+        denied = recorder.flag("--disallowed-tools").split(",")
+        for tool in ("Bash", "Read", "Edit", "Write", "WebSearch", "WebFetch"):
+            self.assertIn(tool, denied)
+
+    def test_research_is_given_exactly_the_two_web_tools(self):
+        client = claude_cli.ClaudeCliResearchClient(binary="claude")
+        recorder = Recorder(stdout=envelope(structured={"company_summary": "ok"}))
+        client.runner = recorder
+        client.research(_lead())
+        self.assertEqual(recorder.flag("--allowed-tools"), "WebSearch,WebFetch")
+        denied = recorder.flag("--disallowed-tools").split(",")
+        self.assertIn("Bash", denied)
+        self.assertNotIn("WebSearch", denied)
+
+    def test_the_system_prompt_is_replaced_not_appended(self):
+        """An email classifier should not also be a coding agent."""
+        client = claude_cli.ClaudeCliClient(binary="claude")
+        recorder = self.run_client(client)
+        client.complete_json([{"role": "system", "content": "SYS"}],
+                             lambda text: text, "fallback")
+        self.assertEqual(recorder.flag("--system-prompt"), "SYS")
+        self.assertNotIn("--append-system-prompt", recorder.argv)
+
+    def test_the_subprocess_does_not_run_in_this_repository(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        client = claude_cli.ClaudeCliClient(binary="claude")
+        recorder = self.run_client(client)
+        client.complete_json([{"role": "user", "content": "hi"}],
+                             lambda text: text, "fallback")
+        self.assertNotEqual(os.path.abspath(recorder.kwargs["cwd"]), here)
+
+    def test_permissions_and_mcp_are_closed(self):
+        client = claude_cli.ClaudeCliClient(binary="claude")
+        recorder = self.run_client(client)
+        client.complete_json([{"role": "user", "content": "hi"}],
+                             lambda text: text, "fallback")
+        self.assertEqual(recorder.flag("--permission-mode"), "dontAsk")
+        self.assertIn("--strict-mcp-config", recorder.argv)
+        self.assertIn("--no-session-persistence", recorder.argv)
+
+    def test_bare_mode_is_off_unless_asked_for(self):
+        client = claude_cli.ClaudeCliClient(binary="claude")
+        recorder = self.run_client(client)
+        client.complete_json([{"role": "user", "content": "hi"}],
+                             lambda text: text, "fallback")
+        self.assertNotIn("--bare", recorder.argv)
+
+        os.environ["CLAUDE_CLI_BARE"] = "1"
+        client.complete_json([{"role": "user", "content": "hi"}],
+                             lambda text: text, "fallback")
+        self.assertIn("--bare", recorder.argv)
+
+
+class CompletionTests(EnvIsolationMixin, unittest.TestCase):
+    def setUp(self):
+        self.isolate_env()
+
+    def test_a_reply_reaches_the_parser_and_tokens_are_recorded(self):
+        recorder = Recorder(stdout=envelope('{"label": "alert"}', tokens=(120, 340)))
+        client = claude_cli.ClaudeCliClient(binary="claude", runner=recorder)
+        result = client.complete_json([{"role": "user", "content": "hi"}],
+                                      json.loads, "fallback")
+        self.assertEqual(result, {"label": "alert"})
+        self.assertEqual(client.last_total_tokens, 460)
+        self.assertEqual(client.model, "claude-sonnet-4-6")
+        self.assertEqual(client.last_model, "claude-sonnet-4-6")
+
+    def test_an_empty_reply_degrades_to_the_fallback(self):
+        recorder = Recorder(stdout=envelope(""))
+        client = claude_cli.ClaudeCliClient(binary="claude", runner=recorder)
+        self.assertEqual(
+            client.complete_json([{"role": "user", "content": "hi"}],
+                                 json.loads, "fallback"),
+            "fallback",
+        )
+
+
+class ResearchTests(EnvIsolationMixin, unittest.TestCase):
+    def setUp(self):
+        self.isolate_env()
+
+    def test_structured_output_is_preferred_over_the_text_result(self):
+        """The schema is the guarantee; the text field is the fallback."""
+        recorder = Recorder(stdout=envelope(
+            "prose the model added anyway",
+            structured={"company_summary": "From the schema",
+                        "posting_keywords": ["python"]},
+        ))
+        client = claude_cli.ClaudeCliResearchClient(binary="claude",
+                                                    runner=recorder)
+        payload, input_tokens, output_tokens = client.research(_lead())
+        self.assertEqual(payload["company_summary"], "From the schema")
+        self.assertEqual(payload["posting_keywords"], ["python"])
+        self.assertEqual((input_tokens, output_tokens), (120, 340))
+
+    def test_the_schema_is_sent_and_matches_what_the_parser_validates(self):
+        from clients.research_client import parse_research
+
+        recorder = Recorder(stdout=envelope(structured={}))
+        client = claude_cli.ClaudeCliResearchClient(binary="claude",
+                                                    runner=recorder)
+        client.research(_lead())
+        schema = json.loads(recorder.flag("--json-schema"))
+        self.assertEqual(sorted(schema["properties"]),
+                         sorted(parse_research("{}")))
+
+    def test_a_text_only_reply_still_parses(self):
+        recorder = Recorder(stdout=envelope(
+            '```json\n{"company_summary": "From text"}\n```'))
+        client = claude_cli.ClaudeCliResearchClient(binary="claude",
+                                                    runner=recorder)
+        payload, _in, _out = client.research(_lead())
+        self.assertEqual(payload["company_summary"], "From text")
+
+
+class FailureMappingTests(EnvIsolationMixin, unittest.TestCase):
+    """Which exception comes out decides whether the pool fails over."""
+
+    def setUp(self):
+        self.isolate_env()
+
+    def client(self, **kwargs):
+        return claude_cli.ClaudeCliClient(binary="claude",
+                                          runner=Recorder(**kwargs))
+
+    def call(self, client):
+        return client.complete_json([{"role": "user", "content": "hi"}],
+                                    json.loads, "fallback")
+
+    def test_a_timeout_is_a_rate_limit_and_not_a_runtime_error(self):
+        """A RuntimeError escapes pool.call uncaught and kills the stage."""
+        client = self.client(
+            raises=subprocess.TimeoutExpired(cmd="claude", timeout=90))
+        with self.assertRaises(ProviderRateLimited) as caught:
+            self.call(client)
+        self.assertGreater(caught.exception.retry_after, 0)
+
+    def test_a_usage_limit_carries_the_wait_it_named(self):
+        client = self.client(stdout=envelope(
+            "Usage limit reached. Try again in 3 hours.",
+            is_error=True, subtype="error_during_execution"))
+        with self.assertRaises(ProviderRateLimited) as caught:
+            self.call(client)
+        self.assertEqual(caught.exception.retry_after, 10800)
+        # Minute scope on purpose: a five-hour window is not a day, and "day"
+        # would close the whole daily budget on the way past.
+        self.assertEqual(caught.exception.scope, "minute")
+
+    def test_a_spend_ceiling_is_its_own_exception(self):
+        """prepare.py distinguishes it from a rate limit, so the pool must."""
+        client = self.client(stdout=envelope(
+            "Exceeded max budget of $0.50 for this run.",
+            is_error=True, subtype="error_max_budget"))
+        with self.assertRaises(ProviderBudgetExhausted):
+            self.call(client)
+
+    def test_an_auth_failure_does_not_permanently_unconfigure_the_provider(self):
+        """ProviderNotConfigured deletes the client until the process restarts."""
+        client = self.client(stdout=envelope(
+            "Not logged in. Run `claude` to authenticate.",
+            is_error=True, subtype="error"))
+        with self.assertRaises(ProviderRateLimited):
+            self.call(client)
+
+    def test_unparseable_output_fails_over_rather_than_crashing(self):
+        client = self.client(stdout="not json at all", returncode=0)
+        with self.assertRaises(ProviderRateLimited):
+            self.call(client)
+
+    def test_a_non_zero_exit_with_no_output_fails_over(self):
+        client = self.client(stdout="", stderr="boom", returncode=2)
+        with self.assertRaises(ProviderRateLimited):
+            self.call(client)
+
+    def test_a_vanished_binary_is_a_configuration_problem(self):
+        client = self.client(raises=OSError("No such file"))
+        with self.assertRaises(ProviderNotConfigured):
+            self.call(client)
+
+
+def _lead():
+    return {
+        "title": "Backend Engineer",
+        "company": "Stripe",
+        "location": "Remote",
+        "apply_url": "https://example.com/job/1",
+        "identity_key": "KEY",
+    }
+
+
+if __name__ == "__main__":
+    unittest.main()

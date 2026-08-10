@@ -300,6 +300,69 @@ class FailoverTests(PoolFixture):
         self.assertEqual(self.call(pool), "only-one-left")
 
 
+class ClaudeCliFailoverTests(PoolFixture):
+    """The CLI provider inside a real pool, not a FakeClient standing in.
+
+    Worth its own class because the CLI's failure modes are subprocess-shaped
+    rather than HTTP-shaped, and the reason its client translates them into
+    ProviderRateLimited is precisely so this machinery keeps working. A test
+    against FakeClient would prove the pool works, not that the translation
+    happened.
+    """
+
+    def cli_pool(self, raises=None, stdout=""):
+        from clients.providers import claude_cli
+
+        def runner(_argv, **_kwargs):
+            if raises is not None:
+                raise raises
+            return type("Done", (), {"stdout": stdout, "stderr": "",
+                                     "returncode": 0})()
+
+        cli = claude_cli.ClaudeCliClient(binary="claude", runner=runner)
+        self.gemini = FakeClient("gemini-3.6-flash", results=["from-gemini"])
+        pool = self.pool({
+            "claude_cli": builder(cli, "Claude Code"),
+            "gemini": builder(self.gemini, "Gemini"),
+        })
+        self.mail.set_provider_route("route_email", "claude_cli", "gemini")
+        pool.reload_routes()
+        return pool
+
+    def call(self, pool):
+        client = pool.for_task("route_email", max_wait=THREAD_MAX_WAIT)
+        return client.complete_json(
+            [{"role": "user", "content": "hi"}], lambda t: t, "fallback"
+        )
+
+    def test_a_hung_cli_hands_the_work_to_the_next_provider(self):
+        import subprocess
+
+        pool = self.cli_pool(
+            raises=subprocess.TimeoutExpired(cmd="claude", timeout=90))
+        self.assertEqual(self.call(pool), "from-gemini")
+        self.assertEqual(self.gemini.calls, 1)
+
+    def test_the_hung_provider_is_skipped_for_the_rest_of_the_cycle(self):
+        import subprocess
+
+        pool = self.cli_pool(
+            raises=subprocess.TimeoutExpired(cmd="claude", timeout=90))
+        self.call(pool)
+        self.assertTrue(pool.providers["claude_cli"].cooling_down(self.now))
+
+    def test_it_serves_the_call_when_it_works(self):
+        import json
+
+        pool = self.cli_pool(stdout=json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "from-cli", "model": "claude-sonnet-4-6",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        }))
+        self.assertEqual(self.call(pool), "from-cli")
+        self.assertEqual(self.gemini.calls, 0)
+
+
 class TaskAvailabilityTests(PoolFixture):
     """`next_available_for`, which exists because the pool-wide check lies.
 
