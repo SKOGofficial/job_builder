@@ -541,6 +541,52 @@ class ProviderPool:
             return 0.0
         return min(waits) if waits else 0.0
 
+    def next_available_for(self, task, now=None):
+        """How long until this particular task's chain could take a call.
+
+        The per-task counterpart to `next_available_in`. That one answers "is
+        any provider alive at all", which is the right question for the stage
+        group but the wrong one for a task whose chain is narrower than the
+        pool: research routes to Gemini and Anthropic only, and Groq being
+        healthy says nothing about whether research can run.
+
+        Summary:
+            Report the shortest wait before some provider in a task's chain
+            could serve it.
+
+        Parameters:
+            task (str): A task id or alias.
+            now (float | None): Monotonic time to evaluate against. Defaults to
+                the pool's clock.
+
+        Returns:
+            float: Seconds to wait. 0.0 when a provider can take the call now,
+                and also when every blocker is permanent - "cannot ever" is not
+                a wait, and the caller already handles an absent client.
+
+        Raises:
+            KeyError: If the task id is unknown.
+
+        Note:
+            Evaluated against `THREAD_MAX_WAIT`, because every caller is a
+            stage whose calls go to the executor and so may wait the longer
+            budget. Asking with the short budget would report a pacing gap as
+            unavailability.
+        """
+        canonical = resolve(task)
+        now = self._clock() if now is None else now
+        ready, blocked = self.candidates(
+            canonical,
+            TASKS[canonical].shape,
+            TASKS[canonical].max_tokens,
+            THREAD_MAX_WAIT,
+            now,
+        )
+        if ready:
+            return 0.0
+        waits = [seconds for _name, _why, seconds in blocked if seconds > 0]
+        return min(waits) if waits else 0.0
+
     def signature(self):
         """A cheap value that changes when the displayed state would.
 
@@ -921,6 +967,21 @@ class TaskClient:
         seen = self.pool.attribution.get(self.task)
         return seen[0] if seen else None
 
+    def available_in(self):
+        """
+        Summary:
+            How long until some provider could serve this task.
+
+        Returns:
+            float: Seconds to wait, 0.0 when a call could go out now. See
+                `ProviderPool.next_available_for`.
+
+        Note:
+            Exposed on the client so a stage can ask before it starts a batch,
+            without being handed the pool it was deliberately kept away from.
+        """
+        return self.pool.next_available_for(self.task)
+
     def complete_json(self, messages, parser, fallback, max_tokens=200):
         """
         Summary:
@@ -995,6 +1056,22 @@ class ResearchTaskClient:
         """
         seen = self.pool.attribution.get(self.task)
         return seen[1] if seen else None
+
+    def available_in(self):
+        """
+        Summary:
+            How long until some provider could serve this task.
+
+        Returns:
+            float: Seconds to wait, 0.0 when a call could go out now. See
+                `ProviderPool.next_available_for`.
+
+        Note:
+            The reason this exists. Research is the one task whose chain can be
+            entirely blocked while the pool as a whole looks healthy, so the
+            preparer asks this before spending a batch discovering it.
+        """
+        return self.pool.next_available_for(self.task)
 
     def research(self, lead):
         """

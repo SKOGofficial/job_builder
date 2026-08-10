@@ -300,6 +300,84 @@ class FailoverTests(PoolFixture):
         self.assertEqual(self.call(pool), "only-one-left")
 
 
+class TaskAvailabilityTests(PoolFixture):
+    """`next_available_for`, which exists because the pool-wide check lies.
+
+    The state reproduced here is the one from the logs: Groq healthy and
+    serving every JSON task, while research - which routes only to Gemini and
+    Anthropic - has nowhere to go. `next_available_in` reports 0.0 throughout,
+    correctly, because something *is* alive. Only the per-task question sees
+    the starvation.
+    """
+
+    def research_pool(self, gemini_daily=0, anthropic=None):
+        self.groq = FakeClient("llama-3.3")
+        self.gemini = FakeClient("gemini-3.6-flash")
+        return self.pool({
+            "groq": builder(self.groq, "Groq"),
+            "gemini": builder(self.gemini, "Gemini",
+                              shapes=frozenset({SHAPE_JSON, SHAPE_RESEARCH}),
+                              daily_limit=gemini_daily),
+            "anthropic": builder(anthropic, "Claude",
+                                 shapes=frozenset({SHAPE_RESEARCH})),
+        })
+
+    def test_a_ready_chain_is_no_wait(self):
+        pool = self.research_pool()
+        self.assertEqual(pool.next_available_for("research"), 0.0)
+
+    def test_the_starved_task_reports_a_wait_while_the_pool_looks_healthy(self):
+        pool = self.research_pool(gemini_daily=5)
+        pool.providers["gemini"].budget.seed(5)
+
+        self.assertGreater(pool.next_available_for("research"), 0)
+        # The whole point: the pool-wide check cannot see this.
+        self.assertEqual(pool.next_available_in(), 0.0)
+        self.assertEqual(pool.next_available_for("route_email"), 0.0)
+
+    def test_a_cooldown_is_reported_as_the_wait(self):
+        pool = self.research_pool()
+        pool.providers["gemini"].cool_down(self.now + 40, "429")
+        self.assertAlmostEqual(pool.next_available_for("research"), 40)
+
+    def test_the_soonest_blocker_wins(self):
+        pool = self.research_pool(anthropic=FakeClient("claude"))
+        pool.providers["gemini"].cool_down(self.now + 90, "429")
+        pool.providers["anthropic"].cool_down(self.now + 25, "429")
+        self.assertAlmostEqual(pool.next_available_for("research"), 25)
+
+    def test_an_unconfigured_chain_is_not_a_wait(self):
+        """"Cannot ever" is not a wait - the caller handles an absent client."""
+        pool = self.pool({
+            "groq": builder(FakeClient("llama-3.3"), "Groq"),
+            "gemini": builder(None, "Gemini"),
+            "anthropic": builder(None, "Claude"),
+        })
+        self.assertEqual(pool.next_available_for("research"), 0.0)
+        self.assertIsNone(pool.for_task("research"))
+
+    def test_a_shape_the_provider_cannot_serve_is_not_a_wait(self):
+        """Groq is JSON-only, so it is permanently blocked, not delayed."""
+        os.environ["LLM_ROUTE_RESEARCH"] = "groq"
+        pool = self.research_pool()
+        self.assertEqual(pool.next_available_for("research"), 0.0)
+
+    def test_the_client_asks_on_the_stage_s_behalf(self):
+        pool = self.research_pool(gemini_daily=5)
+        pool.providers["gemini"].budget.seed(5)
+        client = pool.for_task("research", max_wait=THREAD_MAX_WAIT)
+        self.assertEqual(client.available_in(),
+                         pool.next_available_for("research"))
+        self.assertGreater(client.available_in(), 0)
+
+    def test_json_clients_can_be_asked_too(self):
+        pool = self.research_pool()
+        self.assertEqual(
+            pool.for_task("route_email", max_wait=THREAD_MAX_WAIT).available_in(),
+            0.0,
+        )
+
+
 class SleepBudgetTests(PoolFixture):
     def test_an_explicit_budget_wins(self):
         pool = self.two_providers()

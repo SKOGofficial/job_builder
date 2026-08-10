@@ -23,6 +23,7 @@ from pipeline.rough_filter import build_filter
 from pipeline.router import MessageRouter
 from pipeline.sync import BodyFetcher, MailboxSync
 from pipeline.updates import UpdateHandler
+from utilities.durations import spell_duration
 from utilities.mailstore import VERDICT_PASSED
 
 log = logging.getLogger(__name__)
@@ -332,8 +333,12 @@ class PipelineCycle:
         try:
             return await preparer.run(prepare_limit=self.limits["prepare"])
         except GroqRateLimited as exc:
-            # Routine. Without this the stage reported a traceback and an
-            # error for what is simply "out of tokens, resume next cycle".
+            # A backstop, not the primary handler. `LeadPreparer` catches its
+            # own limits per lead - it has to, since it is the one that knows
+            # which lead to put back - so this only sees one raised outside
+            # that loop. It stays because "out of tokens, resume next cycle" is
+            # routine wherever it surfaces from, and should never be a
+            # traceback.
             log.info(
                 "Lead preparation paused by the rate limit; retrying next "
                 "cycle, in about %ss", exc.retry_after,
@@ -384,7 +389,9 @@ def _summarise(result):
 
 
 def _minutes(seconds):
-    """Seconds as a short human phrase, for the status line."""
-    if seconds < 90:
-        return f"{int(seconds)}s"
-    return f"{round(seconds / 60)}m"
+    """Seconds as a short human phrase, for the status line.
+
+    Kept as a name because that is what `_summarise` reads; the spelling itself
+    is shared, so a daily ceiling reads as "24h" rather than "1440m".
+    """
+    return spell_duration(seconds) or "0s"

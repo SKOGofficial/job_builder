@@ -23,6 +23,8 @@ import logging
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 
+from utilities.durations import spell_duration
+
 log = logging.getLogger(__name__)
 
 # --- vocabulary --------------------------------------------------------------
@@ -53,6 +55,35 @@ LEAD_STATUSES = (LEAD_NEW, LEAD_PREPARING, LEAD_READY, LEAD_DISMISSED, LEAD_APPL
 #: Statuses the to-apply list shows by default. `ready` first - that is the
 #: state the user can actually act on.
 LEAD_OPEN_STATUSES = (LEAD_READY, LEAD_PREPARING, LEAD_NEW)
+
+#: Marks a `prepare_error` that is a pause rather than a failure. The column
+#: holds free text and the Leads page renders it in red as "Preparation
+#: failed", which is the wrong thing to say about a lead that is simply waiting
+#: for a rate limit to clear. Written by `pipeline/prepare.py`, read by
+#: `web/pages/leads.py`; the constant is here because both already import from
+#: this module.
+PREPARE_WAITING_PREFIX = "Waiting for a model"
+
+
+def waiting_note(retry_after):
+    """
+    Summary:
+        Phrase the note shown on a lead whose preparation is paused by a rate
+        limit.
+
+    Parameters:
+        retry_after (float | int | None): Seconds until a provider frees up, as
+            carried on `ProviderRateLimited`. None or a non-positive value
+            drops the estimate rather than promising "in about 0s".
+
+    Returns:
+        str: A note beginning with `PREPARE_WAITING_PREFIX`, which is what
+            tells the Leads page to show it as a pause and not a failure.
+    """
+    when = spell_duration(retry_after)
+    if not when:
+        return f"{PREPARE_WAITING_PREFIX}. Retrying next cycle."
+    return f"{PREPARE_WAITING_PREFIX}. Retrying in about {when}."
 
 
 def _now():
