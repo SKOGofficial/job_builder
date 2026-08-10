@@ -68,10 +68,16 @@ DEFAULT_MODEL = ""
 UNKNOWN_MODEL = "claude-code-cli"
 
 #: One agent turn for classification: a single structured answer, no tool use,
-#: nothing to iterate on. Research gets more because searching, fetching a
-#: posting and synthesising is genuinely multi-turn.
+#: nothing to iterate on.
 DEFAULT_MAX_TURNS = 1
-RESEARCH_MAX_TURNS = 6
+
+#: Research needs far more than it looks. A real grounded run - search, read
+#: results, search again, fetch the posting, synthesise - measured at sixteen
+#: turns. At six it was being cut off mid-search and returning an empty result
+#: with `subtype: success`, which reads exactly like a model that found
+#: nothing. Twenty-four leaves headroom without letting a loop run forever;
+#: the timeout is the real backstop.
+RESEARCH_MAX_TURNS = 24
 
 #: Wall-clock ceilings. Cycles cannot overlap - the scheduler awaits
 #: `run_once` - but a hung call still holds an executor thread for its whole
@@ -91,6 +97,15 @@ TRANSIENT_COOLDOWN = 60.0
 #: Tools the research call may use. Nothing else searches the web, and nothing
 #: here can write.
 RESEARCH_TOOLS = ("WebSearch", "WebFetch")
+
+#: Not attempted: a run that could not reach the web is not retried without it.
+#: Measured, when asked to answer from model knowledge instead, the model wrote
+#: "NOT RESEARCHED - web search and page fetch were both denied" into
+#: `company_summary` and left the rest blank, correctly refusing to substitute
+#: recall for sources. That string would then be cached against the lead and
+#: read by the covering-letter prompt, which is worse than no research at all.
+#: To prepare leads without research, route the task to `none` instead - that
+#: path is designed for it and caches nothing.
 
 #: Named in `permissions.deny` on top of the allow-list. Redundant by
 #: construction - `dontAsk` already denies everything not allowed - and kept
@@ -688,6 +703,32 @@ def json_text(reply):
     return cleaned
 
 
+def _research_payload(envelope):
+    """
+    Summary:
+        Pull the validated research object out of a result envelope.
+
+    Parameters:
+        envelope (dict): A decoded result envelope.
+
+    Returns:
+        dict: The `parse_research` shape, empty when nothing usable came back.
+
+    Note:
+        `structured_output` is present only sometimes even when `--json-schema`
+        was passed - a measured sixteen-turn run returned the object in
+        `result` instead - so both are read, in that order.
+    """
+    from clients.research_client import parse_research
+
+    structured = envelope.get("structured_output")
+    if isinstance(structured, dict):
+        # Already schema-valid; parse_research is still what clamps the field
+        # lengths and list sizes, so it runs either way.
+        return parse_research(json.dumps(structured))
+    return parse_research(json_text(envelope.get("result") or ""))
+
+
 def research_schema():
     """The shape `parse_research` validates, restated for `--json-schema`.
 
@@ -883,24 +924,16 @@ class ClaudeCliResearchClient(_CliClient):
         from clients.research_client import (
             RESEARCH_SYSTEM_PROMPT,
             build_research_prompt,
-            parse_research,
         )
 
+        prompt = build_research_prompt(lead)
         envelope = self._call(
-            RESEARCH_SYSTEM_PROMPT,
-            build_research_prompt(lead),
+            RESEARCH_SYSTEM_PROMPT, prompt,
             tools=RESEARCH_TOOLS,
             schema=research_schema(),
             max_turns=RESEARCH_MAX_TURNS,
         )
-
-        structured = envelope.get("structured_output")
-        if isinstance(structured, dict):
-            # Already schema-valid; parse_research is still what clamps the
-            # field lengths and list sizes, so it runs either way.
-            payload = parse_research(json.dumps(structured))
-        else:
-            payload = parse_research(envelope.get("result") or "")
+        payload = _research_payload(envelope)
 
         # An all-empty payload is a failure wearing a success's clothes, and
         # the caller cannot tell: `pipeline/generate.py` caches whatever comes
