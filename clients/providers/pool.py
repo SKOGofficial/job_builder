@@ -52,9 +52,13 @@ from clients.providers.routing import (
 log = logging.getLogger(__name__)
 
 #: How long a call may block when it is running on the event loop thread.
-#: `dispatch` and `prepare` are called synchronously from the async `run`, so
-#: anything longer than a beat here is a visibly frozen UI. Short enough to
+#: Anything longer than a beat there is a visibly frozen UI. Short enough to
 #: absorb a pacing gap, not long enough to ride out a rate limit.
+#:
+#: No pipeline stage takes this any more - `dispatch` and `prepare` are awaited
+#: and put their model calls on an executor, so they take `THREAD_MAX_WAIT`
+#: like the router. This remains the default for a call made on the loop
+#: thread, which is what the thread check in `sleep_budget` falls back to.
 LOOP_MAX_WAIT = 2.0
 
 #: How long a call may block off the event loop. Bounded below
@@ -499,6 +503,43 @@ class ProviderPool:
         """
         now = self._clock()
         return [state.snapshot(now) for state in self.providers.values()]
+
+    def next_available_in(self, now=None):
+        """How long until any provider could take a model call again.
+
+        Summary:
+            Report the shortest wait before some configured provider is out of
+            cooldown and inside its daily budget.
+
+        Parameters:
+            now (float | None): Monotonic time to evaluate against. Defaults to
+                the pool's clock.
+
+        Returns:
+            float: Seconds to wait. 0.0 when a provider can take a call now,
+                and also when nothing is configured at all - "cannot ever" is
+                not a wait, and the caller already handles an absent provider.
+
+        Note:
+            Deliberately ignores the task chain and the shape. A caller asking
+            this is deciding whether to attempt the model stages at all, and
+            answering per-task would mean claiming a provider is free for work
+            its chain does not route to it. The pessimistic reading is the
+            useful one here.
+        """
+        now = self._clock() if now is None else now
+        waits = []
+        for state in self.providers.values():
+            if not state.configured():
+                continue
+            if state.cooling_down(now):
+                waits.append(state.cooldown_until - now)
+                continue
+            if not state.budget.has_headroom(now):
+                waits.append(state.budget.reset_in(now))
+                continue
+            return 0.0
+        return min(waits) if waits else 0.0
 
     def signature(self):
         """A cheap value that changes when the displayed state would.

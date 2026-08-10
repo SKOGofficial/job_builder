@@ -79,6 +79,16 @@ TASKS = {
         "Researches the company and the opening so the resume can be tailored "
         "to it. The only task that reaches the web.",
     ),
+    # Gemini leads because this is the only output an employer reads in the
+    # applicant's own voice, and it runs once per application rather than per
+    # email. Groq rather than Anthropic behind it: Claude is registered for
+    # SHAPE_RESEARCH only, so it cannot serve a plain JSON completion at all -
+    # a chain naming it here would be unroutable.
+    "write_cover_letter": Task(
+        "Write a cover letter", SHAPE_JSON, 1200, ("gemini", "groq"),
+        "Writes the covering letter for one application, from the requirements "
+        "the research found and the experience bullets that answer them.",
+    ),
 }
 
 #: Gap-filling shares `AlertHandler`'s injected client with alert extraction -

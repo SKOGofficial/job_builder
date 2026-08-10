@@ -274,24 +274,35 @@ class TestArtifactBuilder(unittest.IsolatedAsyncioTestCase):
         return ResearchClient(key="x", model="claude-opus-5",
                               caller=lambda prompt: (payload, 100, 200))
 
-    async def test_builds_resume_and_cv(self):
+    async def test_records_a_bullet_selection(self):
         builder = ArtifactBuilder(self.store, self.mail, self._client(),
                                   output_dir=self.directory, executor=immediate)
-        written = await builder.build(self.lead)
-        self.assertIn("resume", written)
-        self.assertIn("cv", written)
-        for path in written.values():
-            self.assertTrue(os.path.exists(path), path)
+        result = await builder.build(self.lead)
 
-    async def test_artifacts_are_keyed_on_identity(self):
+        self.assertTrue(result["bullet_ids"])
+        stored = self.mail.selection_for(self.lead["identity_key"], "resume")
+        self.assertEqual(stored["bullet_ids"], result["bullet_ids"])
+        # Every id must resolve; a selection naming a row that is not there
+        # would render a resume quietly missing a bullet.
+        known = {row["id"] for row in self.mail.list_experiences()}
+        self.assertTrue(set(stored["bullet_ids"]) <= known)
+
+    async def test_writes_no_files(self):
+        # The whole point of storing a selection: nothing on disk to go stale
+        # when an experience bullet is edited.
+        builder = ArtifactBuilder(self.store, self.mail, self._client(),
+                                  output_dir=self.directory, executor=immediate)
+        await builder.build(self.lead)
+        self.assertEqual(os.listdir(self.directory), [])
+
+    async def test_selections_are_keyed_on_identity(self):
         # Not on job_id: a lead has none until promotion, and keying on the
         # identity means nothing moves when it is promoted.
         builder = ArtifactBuilder(self.store, self.mail, self._client(),
                                   output_dir=self.directory, executor=immediate)
         await builder.build(self.lead)
-        rows = self.mail.artifacts_for(self.lead["identity_key"])
-        self.assertEqual({row["kind"] for row in rows}, {"resume", "cv"})
-        self.assertIn(self.lead["identity_key"], rows[0]["path"])
+        rows = self.mail.selections_for(self.lead["identity_key"])
+        self.assertEqual({row["kind"] for row in rows}, {"resume"})
 
     async def test_research_is_cached_not_repeated(self):
         calls = []

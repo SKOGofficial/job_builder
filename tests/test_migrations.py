@@ -355,5 +355,89 @@ class TestBackupOnDisk(unittest.TestCase):
         restored.close()
 
 
+class TestSelectionsReplacePaths(unittest.TestCase):
+    """v4: `job_artifacts` stops recording files and starts recording recipes.
+
+    The migration throws away rows it cannot convert, so the interesting part is
+    not the new columns - it is what happens to the leads those rows belonged
+    to.
+    """
+
+    def _at_v3(self):
+        """A database carrying the pre-v4 `job_artifacts`.
+
+        Built by bringing a fresh one fully up and then putting that one table
+        back the way it was, which is less brittle than pinning a copy of the
+        old schema that would drift.
+        """
+        conn = make_v0()
+        initialise(conn)
+        conn.execute("DROP TABLE job_artifacts")
+        conn.execute(
+            """
+            CREATE TABLE job_artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                identity_key TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                model TEXT,
+                generated_at TEXT NOT NULL,
+                UNIQUE(identity_key, kind)
+            )
+            """
+        )
+        conn.execute("PRAGMA user_version = 3")
+        conn.commit()
+        return conn
+
+    def _migrated(self):
+        conn = self._at_v3()
+        initialise(conn)
+        return conn
+
+    def test_the_selection_columns_arrive(self):
+        columns = column_names(self._migrated(), "job_artifacts")
+        for expected in ("bullet_ids", "letter_json", "mapping_json",
+                         "keywords", "master_fingerprint"):
+            self.assertIn(expected, columns)
+
+    def test_the_path_column_is_gone(self):
+        self.assertNotIn("path", column_names(self._migrated(), "job_artifacts"))
+
+    def test_ready_leads_are_requeued_rather_than_left_lying(self):
+        """The part that is easy to miss.
+
+        `ready` promises a document is waiting. The migration drops every
+        recorded document, and `leads_awaiting_preparation` only ever looks at
+        `new` - so a lead left at `ready` would show that promise on the page
+        for ever and never be revisited.
+        """
+        conn = self._at_v3()
+        conn.execute(
+            "INSERT INTO job_leads (identity_key, title, company, status, "
+            "prepare_error, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("KEY-READY", "Engineer", "Acme", "ready", "stale error",
+             "2026-01-01", "2026-01-01"),
+        )
+        conn.execute(
+            "INSERT INTO job_leads (identity_key, title, company, status, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("KEY-APPLIED", "Engineer", "Beta", "applied", "2026-01-01",
+             "2026-01-01"),
+        )
+        conn.commit()
+
+        initialise(conn)
+
+        rows = {r["identity_key"]: r for r in
+                conn.execute("SELECT * FROM job_leads").fetchall()}
+        self.assertEqual(rows["KEY-READY"]["status"], "new")
+        self.assertIsNone(rows["KEY-READY"]["prepare_error"],
+                          "the old failure reason must not survive the requeue")
+        # Only `ready` is affected - an application already sent is history.
+        self.assertEqual(rows["KEY-APPLIED"]["status"], "applied")
+
+
 if __name__ == "__main__":
     unittest.main()

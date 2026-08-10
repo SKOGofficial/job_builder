@@ -359,10 +359,79 @@ def migrate_v3(conn):
         conn.execute("ALTER TABLE messages ADD COLUMN category_model TEXT")
 
 
+def migrate_v4(conn):
+    """Store what a document is made of instead of where a copy of it landed.
+
+    `job_artifacts.path` pointed at files under `generated/`. Those files went
+    stale the moment an experience bullet was edited, and nothing noticed - the
+    recorded path still resolved, to a document making a claim the user had
+    since rewritten. Four files per lead, all of it derivable from rows the
+    database already held.
+
+    What replaces it is the recipe: the ordered experience ids a resume was
+    built from, and the letter text for a covering letter. Rendering happens on
+    demand, so an edited bullet or an edited master shows up in the next
+    download with nothing to invalidate.
+
+    Existing rows are dropped rather than converted. A path cannot be turned
+    back into the selection that produced it, and every one of them points at a
+    Markdown or HTML file that was never the deliverable - no PDF was ever
+    produced, because no engine was installed.
+
+    Leads sitting at `ready` are returned to `new` in the same breath. `ready`
+    means "documents are waiting", and after the drop theirs are not; left
+    alone they would keep that promise on the page for ever, because
+    `leads_awaiting_preparation` only ever looks at `new` and so would never
+    revisit them. Sending them back is what makes "the next preparation pass
+    rebuilds them" true rather than merely hopeful.
+
+    Summary:
+        Rebuild `job_artifacts` around selections, and requeue the leads whose
+        documents it discarded.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to migrate.
+
+    Raises:
+        sqlite3.Error: If the table rebuild or the status reset fails.
+
+    Note:
+        A rebuild rather than a sequence of `ALTER TABLE`s because `path` is
+        `NOT NULL` and sqlite cannot drop a column on older versions. The
+        `UNIQUE(identity_key, kind)` constraint has to survive, so the table is
+        recreated from the current schema rather than patched.
+    """
+    if "path" not in column_names(conn, "job_artifacts"):
+        return
+    conn.execute("DROP TABLE job_artifacts")
+    conn.execute(
+        """
+        CREATE TABLE job_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            identity_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            bullet_ids TEXT,
+            letter_json TEXT,
+            mapping_json TEXT,
+            keywords TEXT,
+            master_fingerprint TEXT,
+            model TEXT,
+            generated_at TEXT NOT NULL,
+            UNIQUE(identity_key, kind)
+        )
+        """
+    )
+    conn.execute(
+        "UPDATE job_leads SET status = 'new', prepare_error = NULL "
+        "WHERE status = 'ready'"
+    )
+
+
 MIGRATIONS = [
     (1, migrate_v1),
     (2, migrate_v2),
     (3, migrate_v3),
+    (4, migrate_v4),
 ]
 
 

@@ -1,21 +1,26 @@
 """To-apply: roles surfaced from job-board alerts that you have not applied to.
 
 The list is meant to be acted on directly - open a row, click through to the
-portal, apply. So a `ready` lead already carries its generated resume and CV;
-there is deliberately no "generate" step in the middle.
+portal, apply. A `ready` lead has already had the expensive half done: the
+company researched, its resume bullets chosen, its letter written. Clicking
+Resume or Cover Letter only renders and delivers, so there is still no
+"generate" step waiting on a model.
 
 Rows sit in one of three visible states. `new` means it has not cleared the
 relevance gate that keeps research spend proportional, `preparing` means the
-artifacts are being built, and `ready` means it can be acted on now. A lead
-whose preparation failed stays out of `ready` and shows the reason, so the list
-never contains a row whose resume link is dead.
+work is under way, and `ready` means it can be acted on now. A lead whose
+preparation failed stays out of `ready` and shows the reason.
 """
 
+import asyncio
+import logging
 import os
 
 from nicegui import ui
 
 from pipeline.acknowledgements import AcknowledgementHandler
+from pipeline.documents import build_document, deliver, document_name
+from pipeline.generate import ARTIFACT_COVER_LETTER, ARTIFACT_RESUME
 from pipeline.resolver import JobResolver
 from utilities.mailstore import (
     LEAD_APPLIED,
@@ -28,6 +33,8 @@ from utilities.mailstore import (
 from web.shell import card, page_shell
 from web.state import get_state
 
+log = logging.getLogger(__name__)
+
 STATUS_COLORS = {
     LEAD_READY: "#22c55e",
     LEAD_PREPARING: "#f97316",
@@ -37,7 +44,7 @@ STATUS_COLORS = {
 }
 
 STATUS_HINTS = {
-    LEAD_READY: "Resume and CV are built. Open the posting and apply.",
+    LEAD_READY: "Resume and cover letter are ready. Download and apply.",
     LEAD_PREPARING: "Research and resume generation are running.",
     LEAD_NEW: "Waiting on relevance scoring, or scored below the threshold.",
 }
@@ -65,7 +72,8 @@ def leads_page():
 
     with page_shell(
         "To apply",
-        "Roles found in job-board alerts. Ready rows already have a tailored resume attached.",
+        "Roles found in job-board alerts. Ready rows have a tailored resume and "
+        "cover letter waiting to be downloaded.",
         active="/leads",
     ):
 
@@ -177,24 +185,86 @@ def leads_page():
                     "text-xs opacity-60 px-1"
                 )
 
+        def profile():
+            """Contact details for a document header.
+
+            Summary:
+                Read the stored profile values a rendered document needs.
+
+            Returns:
+                dict: Name, email, phone, location, and website. Missing values
+                    come back empty rather than absent.
+            """
+            get = store.get_profile_value
+            return {key: get(key, "") for key in
+                    ("name", "email", "phone", "location", "website")}
+
+        async def download(lead, kind):
+            """Render one document and put it in the user's Downloads folder.
+
+            Summary:
+                Build and deliver a resume or covering letter on demand.
+
+            Parameters:
+                lead (Mapping): The lead the document belongs to.
+                kind (str): `resume` or `cover_letter`.
+
+            Note:
+                Split across the thread boundary the same way every other
+                stage is. The database reads and the LaTeX rendering happen
+                here, on the thread that owns the sqlite connection; only the
+                compile - which shells out and blocks for a second or more -
+                goes to a worker. Sending the whole build over would hand a
+                connection to a thread that does not own it.
+            """
+            label = kind.replace("_", " ")
+            try:
+                tex_text = build_document(mail, profile(), dict(lead), kind)
+                path, is_pdf = await asyncio.to_thread(
+                    deliver, tex_text, document_name(kind, dict(lead))
+                )
+            except LookupError as exc:
+                ui.notify(str(exc), type="warning")
+                return
+            except FileNotFoundError as exc:
+                # Almost always an unset JOB_BUILDER_RESUME_MASTER, so say so
+                # rather than showing a bare path.
+                ui.notify(str(exc), type="negative", timeout=0, close_button=True)
+                return
+            except Exception as exc:
+                log.exception("Could not build the %s for lead %s",
+                              label, lead["id"])
+                ui.notify(f"Could not build the {label}: {exc}",
+                          type="negative")
+                return
+
+            name = os.path.basename(path)
+            if is_pdf:
+                ui.notify(f"Saved {name} to your Downloads folder.",
+                          type="positive")
+            else:
+                ui.notify(
+                    f"Saved {name} to your Downloads folder. No LaTeX engine "
+                    "is installed, so this is the source rather than a PDF - "
+                    "it compiles as-is on Overleaf.",
+                    type="warning", timeout=0, close_button=True,
+                )
+
         def artifacts(lead):
-            rows = mail.artifacts_for(lead["identity_key"])
-            if not rows:
+            records = {r["kind"] for r in mail.selections_for(lead["identity_key"])}
+            if not records:
                 return
             with ui.row().classes("items-center gap-2 flex-wrap"):
                 ui.label("Documents:").classes("text-xs opacity-70")
-                for row in rows:
-                    # A recorded path whose file has since been removed would
-                    # otherwise render as a link that downloads nothing.
-                    if not os.path.exists(row["path"]):
-                        ui.label(f"{row['kind']} (file missing)").classes(
-                            "text-xs opacity-60 italic"
-                        )
+                for kind, text, icon in (
+                    (ARTIFACT_RESUME, "Resume", "description"),
+                    (ARTIFACT_COVER_LETTER, "Cover letter", "mail"),
+                ):
+                    if kind not in records:
                         continue
                     ui.button(
-                        row["kind"],
-                        icon="description",
-                        on_click=lambda p=row["path"]: ui.download(p),
+                        text, icon=icon,
+                        on_click=lambda l=lead, k=kind: download(l, k),
                     ).props("flat dense no-caps")
 
         def actions(lead):

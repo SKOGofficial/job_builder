@@ -28,7 +28,8 @@ class LeadPreparer:
     """Scores new leads, then prepares the ones worth preparing."""
 
     def __init__(self, store, mail, groq_client=None, research_client=None,
-                 threshold=None, output_dir=None, executor=None):
+                 threshold=None, output_dir=None, executor=None,
+                 letter_client=None):
         self.store = store
         self.mail = mail
         self.scorer = RelevanceScorer(store, mail, groq_client,
@@ -37,7 +38,9 @@ class LeadPreparer:
                                          is not None else {}))
         builder_kwargs = {"output_dir": output_dir} if output_dir else {}
         self.builder = ArtifactBuilder(store, mail, research_client,
-                                       executor=executor, **builder_kwargs)
+                                       executor=executor,
+                                       letter_client=letter_client,
+                                       **builder_kwargs)
 
     async def run(self, score_limit=50, prepare_limit=5):
         """One preparation pass.

@@ -1391,60 +1391,123 @@ class MailStore:
 
     # --- artifacts ---------------------------------------------------------
 
-    def save_artifact(self, identity_key, kind, path, model=None):
+    def save_selection(self, identity_key, kind, bullet_ids=None, letter=None,
+                       mapping=None, keywords=None, master_fingerprint=None,
+                       model=None):
         """
         Summary:
-            Record a generated file for a job identity, replacing any earlier
-            one of the same kind.
+            Record what a document is made of, replacing any earlier record of
+            the same kind.
 
         Parameters:
-            identity_key (str): The identity the artifact was generated for.
-            kind (str): What it is, for example a resume or a cover letter.
-                Unique together with `identity_key`, so regenerating replaces.
-            path (str): Filesystem path to the file. Only the path is stored;
-                the file itself lives under `generated/`, which is gitignored
-                because it contains personal detail.
-            model (str | None): Which model produced it.
+            identity_key (str): The identity the document is for.
+            kind (str): `resume` or `cover_letter`. Unique together with
+                `identity_key`, so regenerating replaces.
+            bullet_ids (list[int] | None): Experience row ids in render order.
+            letter (Mapping | None): The four-part covering letter.
+            mapping (list | None): Requirement-to-bullet pairs the letter was
+                argued from, kept so a letter can be audited against it later.
+            keywords (list[str] | None): What the selection was scored against.
+            master_fingerprint (str | None): Hash of the master at selection
+                time, so a since-edited master is detectable.
+            model (str | None): Which model wrote the letter.
 
         Raises:
             sqlite3.Error: If the upsert or the commit fails.
 
         Note:
-            Commits. Nothing verifies the file exists, so a row can outlive a
-            deleted file.
+            Commits. Stores no document text beyond the letter itself - the
+            resume is re-rendered from these ids, which is what keeps an edited
+            bullet from leaving stale copies behind.
         """
         self.conn.execute(
             """
-            INSERT INTO job_artifacts (identity_key, kind, path, model, generated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO job_artifacts (
+                identity_key, kind, bullet_ids, letter_json, mapping_json,
+                keywords, master_fingerprint, model, generated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(identity_key, kind) DO UPDATE SET
-                path = excluded.path,
+                bullet_ids = excluded.bullet_ids,
+                letter_json = excluded.letter_json,
+                mapping_json = excluded.mapping_json,
+                keywords = excluded.keywords,
+                master_fingerprint = excluded.master_fingerprint,
                 model = excluded.model,
                 generated_at = excluded.generated_at
             """,
-            (identity_key, kind, path, model, _now()),
+            (
+                identity_key, kind,
+                json.dumps(bullet_ids) if bullet_ids is not None else None,
+                json.dumps(letter) if letter is not None else None,
+                json.dumps(mapping) if mapping is not None else None,
+                json.dumps(keywords) if keywords is not None else None,
+                master_fingerprint, model, _now(),
+            ),
         )
         self.conn.commit()
 
-    def artifacts_for(self, identity_key):
+    def selection_for(self, identity_key, kind):
         """
         Summary:
-            List the generated files recorded for a job identity.
+            Read back what one document is made of.
+
+        Parameters:
+            identity_key (str): The identity to look up.
+            kind (str): `resume` or `cover_letter`.
+
+        Returns:
+            dict | None: The record with its JSON columns already decoded, or
+                None when nothing has been recorded.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Decodes here so no caller has to know which columns are JSON. A
+            column that fails to parse comes back empty rather than raising -
+            a corrupt record should cost one document, not the page.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM job_artifacts WHERE identity_key = ? AND kind = ?",
+            (identity_key, kind),
+        ).fetchone()
+        if row is None:
+            return None
+
+        def _decode(value, fallback):
+            try:
+                return json.loads(value) if value else fallback
+            except (TypeError, ValueError):
+                return fallback
+
+        record = dict(row)
+        record["bullet_ids"] = _decode(record.get("bullet_ids"), [])
+        record["letter"] = _decode(record.get("letter_json"), {})
+        record["mapping"] = _decode(record.get("mapping_json"), [])
+        record["keywords"] = _decode(record.get("keywords"), [])
+        return record
+
+    def selections_for(self, identity_key):
+        """
+        Summary:
+            List every document recorded for a job identity.
 
         Parameters:
             identity_key (str): The identity to look up.
 
         Returns:
-            list[sqlite3.Row]: Artifact rows ordered by kind, so the same
-                document always appears in the same place in the UI.
+            list[dict]: Decoded records ordered by kind, so the same document
+                always appears in the same place in the UI.
 
         Raises:
             sqlite3.Error: If the query fails.
         """
-        return self.conn.execute(
-            "SELECT * FROM job_artifacts WHERE identity_key = ? ORDER BY kind",
+        kinds = [row["kind"] for row in self.conn.execute(
+            "SELECT kind FROM job_artifacts WHERE identity_key = ? ORDER BY kind",
             (identity_key,),
-        ).fetchall()
+        ).fetchall()]
+        return [self.selection_for(identity_key, kind) for kind in kinds]
 
     # --- experiences -------------------------------------------------------
 
