@@ -129,6 +129,26 @@ def _build_anthropic(mail):
     return {SHAPE_RESEARCH: ResearchClient.from_config(limiter=limiter)}, "Claude", 0
 
 
+def _build_claude_cli(mail):
+    from clients.providers import claude_cli
+    from clients.research_client import SpendLimiter
+
+    # Resolved once, here, so a missing binary raises ProviderNotConfigured
+    # before either client is constructed - the same "one check, then build"
+    # shape the key-based builders get from `api_key()`.
+    binary = claude_cli.binary_path()
+    limiter = SpendLimiter(mail) if mail is not None else None
+    model = claude_cli.model_name()
+    clients = {
+        SHAPE_JSON: claude_cli.ClaudeCliClient(
+            model=model, binary=binary, limiter=limiter),
+        SHAPE_RESEARCH: claude_cli.ClaudeCliResearchClient(
+            model=model, binary=binary, limiter=limiter,
+            timeout=claude_cli.timeout_seconds(claude_cli.RESEARCH_TIMEOUT)),
+    }
+    return clients, claude_cli.DISPLAY_NAME, claude_cli.requests_per_day()
+
+
 #: Provider name -> the function that builds it. Construction knowledge lives
 #: here rather than in the provider modules so those stay unaware of the pool,
 #: and so the modules keep working standalone (`cli.py`, the Settings test
@@ -139,6 +159,7 @@ BUILDERS = {
     "groq": _build_groq,
     "gemini": _build_gemini,
     "anthropic": _build_anthropic,
+    "claude_cli": _build_claude_cli,
 }
 
 #: What each provider *could* do, independent of whether it is configured.
@@ -149,6 +170,10 @@ PROVIDER_SHAPES = {
     "groq": frozenset({SHAPE_JSON}),
     "gemini": frozenset({SHAPE_JSON, SHAPE_RESEARCH}),
     "anthropic": frozenset({SHAPE_RESEARCH}),
+    # Both, so any task can be pointed at it from Settings. Nothing routes
+    # here by default: an agent loop takes tens of seconds where Groq takes
+    # under one, so which work is worth that is the operator's call.
+    "claude_cli": frozenset({SHAPE_JSON, SHAPE_RESEARCH}),
 }
 
 #: What to call each provider in the UI. Declared here as well as returned by
@@ -159,6 +184,7 @@ PROVIDER_DISPLAY = {
     "groq": "Groq",
     "gemini": "Gemini",
     "anthropic": "Claude",
+    "claude_cli": "Claude Code",
 }
 
 
