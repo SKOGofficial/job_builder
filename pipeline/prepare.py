@@ -16,12 +16,26 @@ roles actually worth pursuing.
 
 import logging
 
+from clients.llm_client import GroqRateLimited
 from clients.research_client import ResearchNotConfigured, SpendCeilingReached
 from pipeline.generate import ArtifactBuilder
 from pipeline.relevance import RelevanceScorer
-from utilities.mailstore import LEAD_PREPARING, LEAD_READY
+from utilities.mailstore import LEAD_PREPARING, LEAD_READY, waiting_note
 
 log = logging.getLogger(__name__)
+
+
+def _never():
+    """
+    Summary:
+        Stand in for `available_in` on a research client that does not have
+        one - None, or an object injected by a test or a research factory.
+
+    Returns:
+        float: 0.0, meaning "no known wait", which leaves the behaviour of
+            those paths exactly as it was.
+    """
+    return 0.0
 
 
 class LeadPreparer:
@@ -59,10 +73,23 @@ class LeadPreparer:
             prepare_limit (int): Most leads to prepare in this pass.
 
         Returns:
-            dict: Counts under `scored`, `prepared`, and `failed`.
+            dict: Counts under `scored`, `prepared`, and `failed`. Scoring runs
+                first and unconditionally: it is a different task on a
+                different chain, and a research provider being out is no reason
+                to leave the backlog unscored.
         """
         scored = await self.scorer.run(score_limit)
         prepared = failed = 0
+
+        # Research routes to its own short chain, so it can be entirely blocked
+        # while the pool as a whole looks healthy and the group skip in
+        # `orchestrator._model_stages` sees nothing wrong. Asking first costs
+        # nothing and saves a batch of leads each discovering the same wall.
+        wait = getattr(self.builder.research_client, "available_in", _never)()
+        if wait > 0:
+            log.info("Lead preparation skipped: no provider is available for "
+                     "research for about %ds; retrying next cycle.", int(wait))
+            return {"scored": scored, "prepared": 0, "failed": 0}
 
         for lead in self.scorer.worth_preparing(prepare_limit):
             outcome = await self.prepare(lead)
@@ -71,8 +98,8 @@ class LeadPreparer:
             elif outcome is False:
                 failed += 1
             else:
-                # Budget exhausted or research unconfigured - stop rather than
-                # marking every remaining lead as failed.
+                # Budget exhausted, rate limited, or research unconfigured -
+                # stop rather than marking every remaining lead as failed.
                 break
 
         return {"scored": scored, "prepared": prepared, "failed": failed}
@@ -81,7 +108,8 @@ class LeadPreparer:
         """Build artifacts for one lead.
 
         Returns True on success, False on a failure specific to this lead, and
-        None when the whole stage should stop (no budget, not configured).
+        None when the whole stage should stop (no budget, not configured, or
+        rate limited - none of which the next lead would fare better against).
 
         Summary:
             Move one lead through `preparing` to `ready`, recording the reason
@@ -105,6 +133,16 @@ class LeadPreparer:
         except ResearchNotConfigured as exc:
             log.info("Stopping preparation: %s", exc)
             self.mail.set_lead_status(lead["id"], lead["status"], str(exc))
+            return None
+        except GroqRateLimited as exc:
+            # Routine, not a failure: the same pause every other model stage
+            # reports as one line. Above the generic handler so it does not
+            # become a traceback, and None rather than False so the rest of the
+            # batch is not each marked failed finding the same wall.
+            log.info("Lead preparation paused by the rate limit; retrying next "
+                     "cycle, in about %ss", exc.retry_after)
+            self.mail.set_lead_status(lead["id"], lead["status"],
+                                      waiting_note(exc.retry_after))
             return None
         except Exception as exc:
             log.exception("Could not prepare lead %s", lead["id"])

@@ -332,8 +332,12 @@ class PipelineCycle:
         try:
             return await preparer.run(prepare_limit=self.limits["prepare"])
         except GroqRateLimited as exc:
-            # Routine. Without this the stage reported a traceback and an
-            # error for what is simply "out of tokens, resume next cycle".
+            # A backstop, not the primary handler. `LeadPreparer` catches its
+            # own limits per lead - it has to, since it is the one that knows
+            # which lead to put back - so this only sees one raised outside
+            # that loop. It stays because "out of tokens, resume next cycle" is
+            # routine wherever it surfaces from, and should never be a
+            # traceback.
             log.info(
                 "Lead preparation paused by the rate limit; retrying next "
                 "cycle, in about %ss", exc.retry_after,

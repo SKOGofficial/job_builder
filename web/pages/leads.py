@@ -29,6 +29,7 @@ from utilities.mailstore import (
     LEAD_OPEN_STATUSES,
     LEAD_PREPARING,
     LEAD_READY,
+    PREPARE_WAITING_PREFIX,
 )
 from web.shell import card, page_shell
 from web.state import get_state
@@ -160,9 +161,17 @@ def leads_page():
                     ui.label(hint).classes("text-xs opacity-60")
 
                 if lead["prepare_error"]:
-                    ui.label(f"Preparation failed: {lead['prepare_error']}").classes(
-                        "text-xs text-red-500"
-                    )
+                    # A pause is not a failure. Saying "Preparation failed" about
+                    # a lead that is only waiting out a rate limit reads as
+                    # something to fix, when the next cycle handles it.
+                    if lead["prepare_error"].startswith(PREPARE_WAITING_PREFIX):
+                        ui.label(lead["prepare_error"]).classes(
+                            "text-xs text-amber-500"
+                        )
+                    else:
+                        ui.label(
+                            f"Preparation failed: {lead['prepare_error']}"
+                        ).classes("text-xs text-red-500")
 
                 research(lead)
                 artifacts(lead)
