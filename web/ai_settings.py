@@ -21,6 +21,7 @@ from clients import llm_client
 from clients.providers import gemini
 from clients.providers.routing import TASKS, chain_for
 from utilities import credentials
+from utilities.durations import spell_duration
 from web.shell import card
 
 #: Providers whose API key can be managed from this page, in display order.
@@ -30,6 +31,10 @@ KEY_MANAGED = (
     ("groq", "Groq", llm_client),
     ("gemini", "Gemini", gemini),
 )
+
+#: Providers with no secret to manage, so "no key" would be the wrong thing to
+#: say about them. What the CLI provider lacks when unconfigured is the binary.
+KEYLESS = frozenset({"claude_cli"})
 
 #: Shown in the routing selects for "do not use a second provider".
 NO_FALLBACK = "None"
@@ -99,7 +104,11 @@ def provider_row(row, module, handlers):
         with ui.row().classes("w-full items-center gap-2"):
             ui.label(row["display"]).classes("text-sm font-medium")
             if not row["configured"]:
-                ui.badge("no key").props("color=grey-7")
+                # "no key" is wrong for a provider that has no key to be
+                # missing; what it lacks is the binary.
+                ui.badge(
+                    "not installed" if row["name"] in KEYLESS else "no key"
+                ).props("color=grey-7")
             elif row["cooling"]:
                 ui.badge("cooling down").props("color=orange")
 
@@ -131,7 +140,8 @@ def provider_row(row, module, handlers):
 
         if row["cooling"]:
             ui.label(
-                f"Rate limited. Trying again in about {row['cooldown_seconds']}s; "
+                f"Rate limited. Trying again in about "
+                f"{spell_duration(row['cooldown_seconds']) or 'a moment'}; "
                 f"other providers keep working."
             ).classes("text-xs text-orange-600 dark:text-orange-400")
 
@@ -198,6 +208,34 @@ def build_ai_card(state, classifier, controls, notify):
             )
 
         return run_test
+
+    async def check_cli():
+        """Report the CLI's version, which is the whole of its configuration.
+
+        Summary:
+            Run `claude --version` and report what came back.
+        """
+        import subprocess
+
+        from clients.providers import claude_cli
+
+        def probe():
+            return subprocess.run(
+                [claude_cli.binary_path(), "--version"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=30, cwd=claude_cli.workdir(),
+            )
+
+        try:
+            completed = await run.io_bound(probe)
+        except Exception as exc:
+            notify(f"The Claude Code CLI could not be run: {exc}", "negative")
+            return
+        detail = (completed.stdout or completed.stderr or "").strip()
+        if completed.returncode != 0:
+            notify(f"The Claude Code CLI returned an error: {detail}", "negative")
+            return
+        notify(f"Claude Code CLI is available: {detail}", "positive")
 
     def move(name, module):
         def run_move():
@@ -266,8 +304,14 @@ def build_ai_card(state, classifier, controls, notify):
                 provider_row(row, module, handlers)
 
             for name, row in rows.items():
-                if name not in modules:
-                    provider_row(row, None, {})
+                if name in modules:
+                    continue
+                # The CLI provider has no key to test, but it does have a
+                # binary that can be missing, stale, or signed out - which is
+                # the same question "Test connection" answers for the others.
+                extras = {"test": check_cli} if name == "claude_cli" and \
+                    row["configured"] else {}
+                provider_row(row, None, extras)
 
             ui.separator().classes("my-1")
             ui.label(
