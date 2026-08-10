@@ -51,6 +51,35 @@ This file tracks the remaining work for the Job Board Tracker. Keep it current a
 - Add duplicate detection that considers normalized URL, company, title, and external job IDs when available.
 - Add a browser popup or lightweight companion entry point that writes to the same local API or database safely.
 
+### P1 - Claude Code CLI as a provider (delivered)
+
+The locally installed `claude` binary serves the pool as a fourth provider, run headlessly
+as a subprocess rather than over HTTP: `claude -p` with the prompt on stdin and a JSON
+envelope on stdout. `clients/providers/claude_cli.py` holds both client shapes.
+
+Settled, and not to be re-litigated without a reason:
+
+- **In no default chain.** An agent loop costs tens of seconds against Groq's sub-second.
+  Research is the task worth that, because it gains live web search; routing a per-message
+  task to it multiplies invocations by the batch size.
+- **Runs in a neutral empty directory.** Without `--bare` the CLI loads CLAUDE.md, hooks
+  and MCP config from its working directory, so it is deliberately never started in a real
+  project. This is a safety control, not a preference.
+- **Tools denied by default, `WebSearch`/`WebFetch` for research only.** The input is
+  untrusted email and the CLI is an agent with shell and file access.
+- **A crash or timeout raises `ProviderRateLimited`, not `RuntimeError`.** Any other
+  exception escapes `ProviderPool.call` uncaught and takes the stage down with no failover.
+- **Subscription auth, by the operator's choice.** Anthropic asks Agent SDK developers to
+  use API keys; `CLAUDE_CLI_BARE=1` switches to that.
+
+Follow-ups not taken:
+
+- `--json-schema` is used for research, where the schema is fixed and known. Using it for
+  the JSON tasks needs task identity threaded into `complete_json`, which today receives
+  only messages and a parser.
+- No pacer is attached. Subscription limits are a rolling five-hour window, which the
+  per-minute `Pacer` does not model; the cooldown from a refusal covers it instead.
+
 ### P1 - Gmail integration (design approved)
 
 Replaces the earlier "design OAuth and privacy boundaries first" placeholder. User approved

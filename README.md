@@ -177,6 +177,9 @@ takes the call. Otherwise the next one does.
 | Classify matched replies | Groq, then Gemini |
 | Research a company and role | Gemini, then Claude |
 
+A fourth provider, **Claude Code**, is available for every task but is in no default order —
+see [below](#using-the-claude-code-cli-as-a-provider).
+
 Edit these in **Settings -> Task routing**, or set `LLM_ROUTE_<TASK>` in `.env`. A task with
 no saved choice follows `.env`, so changing that file keeps working; **Reset** on a row
 deletes the saved choice rather than freezing today's default into the database.
@@ -201,6 +204,36 @@ Rate limits:
 - Free-tier limits are per project and move. Google publishes yours in AI Studio rather
   than in the docs; `GEMINI_REQUESTS_PER_MINUTE`, `GEMINI_TOKENS_PER_MINUTE` and
   `GEMINI_REQUESTS_PER_DAY` start conservative and are meant to be raised.
+
+### Using the Claude Code CLI as a provider
+
+If the `claude` CLI is installed and signed in, it can serve any task. It is not an HTTP
+client: it runs `claude -p` as a subprocess with the prompt on stdin and reads a JSON
+envelope back. Configuration is discovery rather than secrets — install it, run `claude`
+once, and Settings shows it as available.
+
+Nothing routes to it by default, because one call is an agent loop taking tens of seconds
+where Groq answers in under a second. **Research is where that time buys something**: the
+CLI gets live web search, so the result is grounded rather than recalled, and a cycle only
+makes a handful of research calls. Pointing `Route incoming email` at it instead turns a
+twenty-message batch into twenty agent invocations.
+
+Two things are deliberate and worth knowing before you turn it on:
+
+- **It runs in an empty directory, not in this project.** Without `--bare` the CLI loads
+  `CLAUDE.md`, hooks and MCP configuration from wherever it starts. Started here, every
+  classification would quietly inherit this repo's `.claude/CLAUDE.md` as context.
+  `CLAUDE_CLI_WORKDIR` moves it; the default is `~/.job_builder/claude_cli`.
+- **It gets no tools except web access, and only for research.** The CLI is an agent with
+  Bash, Read and Edit available, and the text being classified is untrusted email. Every
+  tool is denied for classification; research is allowed `WebSearch` and `WebFetch` and
+  nothing else.
+
+On authentication: as configured it uses your signed-in subscription. Anthropic's
+[legal and compliance documentation](https://code.claude.com/docs/en/legal-and-compliance)
+asks developers building on the Agent SDK to use API-key authentication, and states that
+Pro and Max limits assume ordinary individual use. Setting `CLAUDE_CLI_BARE=1` with
+`ANTHROPIC_API_KEY` runs it that way instead.
 
 How your data is handled:
 
