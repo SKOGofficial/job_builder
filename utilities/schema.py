@@ -16,7 +16,7 @@ missing it. `SCHEMA_VERSION` must be bumped in lockstep.
 #: no migration entry, because `create_tables` runs `CREATE TABLE IF NOT
 #: EXISTS` unconditionally on every `initialise`, before the version gate. Only
 #: new columns on existing tables need a migration.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 -- Applications the user has actually applied to. -----------------------------
@@ -148,11 +148,19 @@ CREATE TABLE IF NOT EXISTS job_research (
 );
 
 -- Generated resume/CV artifacts, also keyed on identity. ----------------------
+-- Not the documents themselves: what they are made of. A resume is the ordered
+-- list of experience rows chosen for it, so a stored application is tens of
+-- bytes rather than four files, and re-rendering picks up edited bullets and an
+-- edited master automatically. `kind` is `resume` or `cover_letter`.
 CREATE TABLE IF NOT EXISTS job_artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     identity_key TEXT NOT NULL,
     kind TEXT NOT NULL,
-    path TEXT NOT NULL,
+    bullet_ids TEXT,
+    letter_json TEXT,
+    mapping_json TEXT,
+    keywords TEXT,
+    master_fingerprint TEXT,
     model TEXT,
     generated_at TEXT NOT NULL,
     UNIQUE(identity_key, kind)

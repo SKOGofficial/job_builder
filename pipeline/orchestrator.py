@@ -326,6 +326,8 @@ class PipelineCycle:
             research,
             threshold=self.relevance_threshold,
             executor=self.executor,
+            letter_client=pool.for_task("write_cover_letter",
+                                        max_wait=THREAD_MAX_WAIT),
         )
         try:
             return await preparer.run(prepare_limit=self.limits["prepare"])

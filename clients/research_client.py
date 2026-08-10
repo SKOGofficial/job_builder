@@ -176,14 +176,22 @@ Report only what you actually found. An empty field is correct and useful; an \
 invented one is worse than useless, because the applicant may repeat it in an \
 interview.
 
+Quote the posting's own wording for responsibilities and requirements. An \
+application that answers a requirement in the words the posting used is easier \
+for a reader to match against; a paraphrase makes them do the work.
+
 Reply with JSON only, in this exact shape:
 {
   "company_summary": "<2-3 sentences on what the company does>",
+  "mission": "<the company's stated mission or the problem it exists to solve>",
   "products": ["<main product or service>"],
   "tech_stack": ["<technology named in the posting or on their engineering site>"],
   "recent_news": ["<a notable recent development, with rough date>"],
+  "responsibilities": ["<what the holder of this role will actually do, the posting's wording>"],
+  "requirements": ["<a stated requirement, the posting's wording>"],
+  "nice_to_haves": ["<a preferred or 'nice to have' item, the posting's wording>"],
   "posting_keywords": ["<skill or requirement emphasised by the posting>"],
-  "culture_notes": ["<something specific about how they work>"],
+  "culture_notes": ["<something specific about how they work, including community or employee development programmes>"],
   "tailoring_advice": "<2-3 sentences on what an application should emphasise>"
 }"""
 
@@ -282,9 +290,13 @@ def parse_research(text):
 
     return {
         "company_summary": _text(data.get("company_summary")),
+        "mission": _text(data.get("mission")),
         "products": _list(data.get("products")),
         "tech_stack": _list(data.get("tech_stack")),
         "recent_news": _list(data.get("recent_news")),
+        "responsibilities": _list(data.get("responsibilities")),
+        "requirements": _list(data.get("requirements")),
+        "nice_to_haves": _list(data.get("nice_to_haves")),
         "posting_keywords": _list(data.get("posting_keywords")),
         "culture_notes": _list(data.get("culture_notes")),
         "tailoring_advice": _text(data.get("tailoring_advice")),
