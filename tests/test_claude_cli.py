@@ -171,34 +171,83 @@ class CommandLineTests(EnvIsolationMixin, unittest.TestCase):
         self.assertNotIn(secret, " ".join(recorder.argv))
         self.assertIn(secret, recorder.kwargs["input"])
 
+    def permissions(self, recorder):
+        """The allow/deny rules actually sent, which are the real gate."""
+        return json.loads(recorder.flag("--settings"))["permissions"]
+
     def test_classification_is_given_no_tools_at_all(self):
+        """An empty allow-list under dontAsk denies everything, including
+        tools this CLI version has not shipped yet."""
         client = claude_cli.ClaudeCliClient(binary="claude")
         recorder = self.run_client(client)
         client.complete_json([{"role": "user", "content": "hi"}],
                              lambda text: text, "fallback")
+        rules = self.permissions(recorder)
+        self.assertEqual(rules["allow"], [])
         self.assertIsNone(recorder.flag("--allowed-tools"))
-        denied = recorder.flag("--disallowed-tools").split(",")
-        for tool in ("Bash", "Read", "Edit", "Write", "WebSearch", "WebFetch"):
-            self.assertIn(tool, denied)
+        for tool in ("Bash", "Edit", "Write", "SendMessage"):
+            self.assertIn(tool, rules["deny"])
 
     def test_research_is_given_exactly_the_two_web_tools(self):
         client = claude_cli.ClaudeCliResearchClient(binary="claude")
-        recorder = Recorder(stdout=envelope(structured={"company_summary": "ok"}))
+        recorder = Recorder(stdout=envelope(
+            structured={"company_summary": "ok"}))
         client.runner = recorder
         client.research(_lead())
+        rules = self.permissions(recorder)
+        self.assertEqual(rules["allow"], ["WebSearch", "WebFetch"])
+        self.assertIn("Bash", rules["deny"])
+        self.assertNotIn("WebSearch", rules["deny"])
         self.assertEqual(recorder.flag("--allowed-tools"), "WebSearch,WebFetch")
-        denied = recorder.flag("--disallowed-tools").split(",")
-        self.assertIn("Bash", denied)
-        self.assertNotIn("WebSearch", denied)
 
-    def test_the_system_prompt_is_replaced_not_appended(self):
-        """An email classifier should not also be a coding agent."""
+    def test_no_mcp_server_is_offered(self):
+        """A real run had the model reach for a personal Indeed connector,
+        including its `get_resume` tool. Local servers are excluded here; the
+        account-level ones the allow-list refuses."""
         client = claude_cli.ClaudeCliClient(binary="claude")
         recorder = self.run_client(client)
-        client.complete_json([{"role": "system", "content": "SYS"}],
+        client.complete_json([{"role": "user", "content": "hi"}],
                              lambda text: text, "fallback")
-        self.assertEqual(recorder.flag("--system-prompt"), "SYS")
-        self.assertNotIn("--append-system-prompt", recorder.argv)
+        self.assertEqual(json.loads(recorder.flag("--mcp-config")),
+                         {"mcpServers": {}})
+        self.assertIn("--strict-mcp-config", recorder.argv)
+
+    def test_the_task_instructions_reach_stdin_not_only_the_flag(self):
+        """`--system-prompt` alone does not bind, which cost a day to find.
+
+        Passed only as a flag, the classification prompt never reached the
+        model: asked for {"label","confidence","reason"} it invented keys from
+        the user turn. The system text goes on stdin as well, and that is the
+        half that carries - so it is the half asserted here.
+        """
+        client = claude_cli.ClaudeCliClient(binary="claude")
+        recorder = self.run_client(client)
+        client.complete_json([{"role": "system", "content": "SYSTEM-RULES"},
+                              {"role": "user", "content": "USER-TURN"}],
+                             lambda text: text, "fallback")
+        self.assertIn("SYSTEM-RULES", recorder.kwargs["input"])
+        self.assertIn("USER-TURN", recorder.kwargs["input"])
+        self.assertEqual(recorder.flag("--append-system-prompt"), "SYSTEM-RULES")
+
+    def test_every_prompt_ends_with_the_json_only_instruction(self):
+        """The CLI has no JSON mode; a trailing user instruction is the only
+        thing measured to stop it answering in prose."""
+        client = claude_cli.ClaudeCliClient(binary="claude")
+        recorder = self.run_client(client)
+        client.complete_json([{"role": "user", "content": "hi"}],
+                             lambda text: text, "fallback")
+        self.assertTrue(recorder.kwargs["input"].endswith(
+            claude_cli.JSON_ONLY_TAIL))
+
+    def test_a_prose_reply_still_yields_its_json(self):
+        """Belt to the tail's braces: the agent narrates when it feels like it."""
+        recorder = Recorder(stdout=envelope(
+            'Here is the classification:\n```json\n{"label": "Rejected"}\n```\n'
+            'Let me know if you want more.'))
+        client = claude_cli.ClaudeCliClient(binary="claude", runner=recorder)
+        result = client.complete_json([{"role": "user", "content": "hi"}],
+                                      json.loads, "fallback")
+        self.assertEqual(result, {"label": "Rejected"})
 
     def test_the_subprocess_does_not_run_in_this_repository(self):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -275,13 +324,53 @@ class ResearchTests(EnvIsolationMixin, unittest.TestCase):
     def test_the_schema_is_sent_and_matches_what_the_parser_validates(self):
         from clients.research_client import parse_research
 
-        recorder = Recorder(stdout=envelope(structured={}))
+        recorder = Recorder(stdout=envelope(
+            structured={"company_summary": "non-empty, so it does not fail over"}))
         client = claude_cli.ClaudeCliResearchClient(binary="claude",
                                                     runner=recorder)
         client.research(_lead())
         schema = json.loads(recorder.flag("--json-schema"))
         self.assertEqual(sorted(schema["properties"]),
                          sorted(parse_research("{}")))
+
+    def test_an_all_empty_payload_fails_over_instead_of_being_cached(self):
+        """A blocked run produces a well-formed husk, which is not a success.
+
+        Observed for real: the CLI's web tools were refused in headless mode
+        and RESEARCH_SYSTEM_PROMPT correctly told the model to leave fields
+        blank rather than invent them, so a schema-valid object came back with
+        nothing in it. generate.py caches whatever it is given against the
+        lead's identity key, so returning that would persist emptiness and
+        never retry.
+        """
+        recorder = Recorder(stdout=envelope(structured={
+            "company_summary": "", "posting_keywords": [], "mission": "",
+        }))
+        client = claude_cli.ClaudeCliResearchClient(binary="claude",
+                                                    runner=recorder)
+        with self.assertRaises(ProviderRateLimited):
+            client.research(_lead())
+
+    def test_the_refused_tools_are_named_in_the_failure(self):
+        body = json.loads(envelope(structured={"company_summary": ""}))
+        body["permission_denials"] = [{"tool_name": "WebSearch"},
+                                      {"tool_name": "WebFetch"}]
+        client = claude_cli.ClaudeCliResearchClient(
+            binary="claude", runner=Recorder(stdout=json.dumps(body)))
+        with self.assertRaises(ProviderRateLimited) as caught:
+            client.research(_lead())
+        self.assertIn("WebFetch", str(caught.exception))
+        self.assertIn("WebSearch", str(caught.exception))
+
+    def test_a_partial_payload_is_still_a_success(self):
+        """One real field beats failing over; research is best-effort."""
+        recorder = Recorder(stdout=envelope(
+            structured={"company_summary": "A payments company.",
+                        "posting_keywords": []}))
+        client = claude_cli.ClaudeCliResearchClient(binary="claude",
+                                                    runner=recorder)
+        payload, _in, _out = client.research(_lead())
+        self.assertEqual(payload["company_summary"], "A payments company.")
 
     def test_a_text_only_reply_still_parses(self):
         recorder = Recorder(stdout=envelope(

@@ -92,15 +92,23 @@ TRANSIENT_COOLDOWN = 60.0
 #: here can write.
 RESEARCH_TOOLS = ("WebSearch", "WebFetch")
 
-#: The denylist floor. `--permission-mode dontAsk` is the real gate - it refuses
-#: anything not explicitly allowed - but that leaves a read-only command set
-#: still reachable, and this pipeline feeds the model untrusted third-party
-#: email. Naming the tools costs one constant and closes the capability rather
-#: than arguing with the prompt about it.
+#: Named in `permissions.deny` on top of the allow-list. Redundant by
+#: construction - `dontAsk` already denies everything not allowed - and kept
+#: anyway, because these are the tools whose accidental grant would matter
+#: most and a second statement of that costs one constant.
 DENIED_TOOLS = (
-    "Bash", "BashOutput", "KillShell", "Read", "Edit", "Write", "NotebookEdit",
-    "Glob", "Grep", "Task", "Agent", "TodoWrite", "SlashCommand", "WebSearch",
-    "WebFetch",
+    "Bash", "BashOutput", "KillShell", "Edit", "Write", "NotebookEdit",
+    "Task", "SendMessage", "PushNotification", "RemoteTrigger",
+    "CronCreate", "CronDelete", "CronUpdate",
+)
+
+#: Appended to every prompt. The CLI is a conversational agent with no JSON
+#: mode: asked for JSON by a system prompt alone it answers in prose with a
+#: markdown heading, which turns every classification into Unclear. A trailing
+#: instruction in the user turn is what actually binds - measured, not assumed.
+JSON_ONLY_TAIL = (
+    "\n\nOutput ONLY the JSON object described above. No prose, no markdown "
+    "fence, no explanation."
 )
 
 MISSING_BINARY_HINT = (
@@ -380,8 +388,35 @@ def build_argv(binary, *, system_prompt, model, tools, schema, max_turns,
     # Replace rather than append: an email classifier should not also be
     # carrying Claude Code's instructions about being a coding agent.
     argv += [
-        "--system-prompt", system_prompt,
+        # Appended, not replaced. `--system-prompt` looked like the right flag -
+        # an email classifier has no business also being told it is a coding
+        # agent - but a real run showed its content never reaching the model:
+        # asked for {"label","confidence","reason"} it invented keys from the
+        # user turn instead. The task instructions go on stdin as well, which
+        # is what actually binds; this keeps them stated at the system layer
+        # too.
+        "--append-system-prompt", system_prompt,
+        # `dontAsk` denies everything outside `permissions.allow`, which makes
+        # the settings blob below an allow-list rather than a denylist - the
+        # difference that matters, because the CLI's tool surface grows with
+        # every release and a denylist would be a losing race with it.
+        #
+        # `--allowed-tools` alone is *not* enough: under `dontAsk` the CLI
+        # consults `permissions.allow`, and a real run had WebSearch denied
+        # despite being passed there. Both are sent; the settings blob is what
+        # actually grants.
         "--permission-mode", "dontAsk",
+        "--settings", json.dumps({
+            "permissions": {
+                "allow": list(tools),
+                "deny": [name for name in DENIED_TOOLS if name not in set(tools)],
+            }
+        }),
+        # An empty server set, not just the strict flag. Local `.mcp.json`
+        # servers are excluded by this pair; account-level connectors are not,
+        # and are denied by the allow-list instead - a real run saw the model
+        # reach for a personal Indeed connector it could never call.
+        "--mcp-config", json.dumps({"mcpServers": {}}),
         "--strict-mcp-config",
         "--no-session-persistence",
         "--max-turns", str(max_turns),
@@ -392,9 +427,6 @@ def build_argv(binary, *, system_prompt, model, tools, schema, max_turns,
         argv += ["--json-schema", json.dumps(schema)]
     if tools:
         argv += ["--allowed-tools", ",".join(tools)]
-    denied = [name for name in DENIED_TOOLS if name not in set(tools)]
-    if denied:
-        argv += ["--disallowed-tools", ",".join(denied)]
     return argv
 
 
@@ -506,10 +538,15 @@ def run_cli(system_prompt, prompt, *, tools=(), schema=None,
         bare=use_bare(),
     )
 
+    # Everything the model must follow goes on stdin, including the system
+    # text. See the `--append-system-prompt` comment above: the flag alone is
+    # not enough, and this is the half that carries.
+    stdin = f"{system_prompt}\n\n{prompt}{JSON_ONLY_TAIL}"
+
     try:
         completed = run(
             argv,
-            input=prompt,
+            input=stdin,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -609,6 +646,46 @@ def flatten_messages(messages):
         else:
             rest.append(content)
     return "\n\n".join(system).strip(), "\n\n".join(rest).strip()
+
+
+def json_text(reply):
+    """Dig the JSON object out of a reply that may be wrapped in prose.
+
+    The other two JSON providers have a guaranteed JSON mode - Groq sends
+    `response_format: json_object`, Gemini sets `responseMimeType`. The CLI has
+    no equivalent for an arbitrary task's parser, and it is an agent that
+    narrates by default, so a reply arrives fenced or prefaced often enough
+    that treating it as raw JSON turns every classification into Unclear.
+
+    Summary:
+        Normalise a CLI reply into something a task's parser can read.
+
+    Parameters:
+        reply (str): The model's raw text.
+
+    Returns:
+        str: The JSON substring when one is found, otherwise the input
+            unchanged - the parser is entitled to see what actually came back
+            rather than an empty string.
+    """
+    cleaned = (reply or "").strip()
+    if cleaned.startswith("```"):
+        parts = cleaned.split("```")
+        if len(parts) > 1:
+            cleaned = parts[1]
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+    try:
+        json.loads(cleaned)
+    except (TypeError, ValueError):
+        pass
+    else:
+        return cleaned
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start != -1 and end > start:
+        return cleaned[start:end + 1]
+    return cleaned
 
 
 def research_schema():
@@ -756,7 +833,7 @@ class ClaudeCliClient(_CliClient):
         text = envelope.get("result")
         if not isinstance(text, str) or not text.strip():
             return fallback
-        return parser(text)
+        return parser(json_text(text))
 
 
 class ClaudeCliResearchClient(_CliClient):
@@ -824,6 +901,29 @@ class ClaudeCliResearchClient(_CliClient):
             payload = parse_research(json.dumps(structured))
         else:
             payload = parse_research(envelope.get("result") or "")
+
+        # An all-empty payload is a failure wearing a success's clothes, and
+        # the caller cannot tell: `pipeline/generate.py` caches whatever comes
+        # back against the lead's identity key, so returning nothing here
+        # would persist nothing and never retry. It happens for a real reason -
+        # the web tools can be refused in headless mode, and
+        # RESEARCH_SYSTEM_PROMPT correctly tells the model to leave fields
+        # blank rather than invent them, so a blocked run produces a
+        # well-formed husk. Failing over is the honest response.
+        if not any(payload.values()):
+            denied = sorted({
+                entry.get("tool_name", "")
+                for entry in (envelope.get("permission_denials") or [])
+                if isinstance(entry, dict)
+            })
+            detail = (f" Tools refused: {', '.join(denied)}." if denied else "")
+            log.warning("Claude Code CLI researched nothing usable.%s", detail)
+            raise ProviderRateLimited(
+                "The Claude Code CLI returned no usable research." + detail,
+                retry_after=int(TRANSIENT_COOLDOWN),
+                provider=DISPLAY_NAME,
+                scope="minute",
+            )
 
         usage = envelope.get("usage")
         usage = usage if isinstance(usage, dict) else {}

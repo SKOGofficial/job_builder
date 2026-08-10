@@ -213,10 +213,16 @@ envelope back. Configuration is discovery rather than secrets — install it, ru
 once, and Settings shows it as available.
 
 Nothing routes to it by default, because one call is an agent loop taking tens of seconds
-where Groq answers in under a second. **Research is where that time buys something**: the
-CLI gets live web search, so the result is grounded rather than recalled, and a cycle only
-makes a handful of research calls. Pointing `Route incoming email` at it instead turns a
+where Groq answers in under a second. Pointing `Route incoming email` at it turns a
 twenty-message batch into twenty agent invocations.
+
+**Classification works; grounded research depends on your account.** Classification is
+verified end to end. Research asks the CLI for `WebSearch` and `WebFetch`, and some
+accounts refuse both in headless mode regardless of the permissions passed. When that
+happens the model correctly declines to invent facts and returns empty fields, so the
+provider treats an all-empty result as a failure and hands the lead to the next provider in
+the chain rather than caching emptiness against it. You will see one warning naming the
+refused tools. Try it before routing research here permanently.
 
 Two things are deliberate and worth knowing before you turn it on:
 
@@ -225,9 +231,11 @@ Two things are deliberate and worth knowing before you turn it on:
   classification would quietly inherit this repo's `.claude/CLAUDE.md` as context.
   `CLAUDE_CLI_WORKDIR` moves it; the default is `~/.job_builder/claude_cli`.
 - **It gets no tools except web access, and only for research.** The CLI is an agent with
-  Bash, Read and Edit available, and the text being classified is untrusted email. Every
-  tool is denied for classification; research is allowed `WebSearch` and `WebFetch` and
-  nothing else.
+  Bash, Read and Edit available, and the text being classified is untrusted email. The
+  permission mode denies everything not explicitly allowed, so the list is an allowlist
+  rather than a denylist and future tools are closed by default. This is not theoretical:
+  during testing the model reached for a personal Indeed connector on the account —
+  including its "get my resume" tool — from a job-research prompt. Every one was refused.
 
 On authentication: as configured it uses your signed-in subscription. Anthropic's
 [legal and compliance documentation](https://code.claude.com/docs/en/legal-and-compliance)

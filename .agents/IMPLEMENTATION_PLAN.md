@@ -72,11 +72,29 @@ Settled, and not to be re-litigated without a reason:
 - **Subscription auth, by the operator's choice.** Anthropic asks Agent SDK developers to
   use API keys; `CLAUDE_CLI_BARE=1` switches to that.
 
+Found by running it against the real binary (2.1.220), and not guessable from the docs:
+
+- **`--system-prompt` does not bind.** Passed only as a flag, the classification prompt
+  never reached the model — asked for `{"label","confidence","reason"}` it invented keys
+  from the user turn. The system text goes on stdin as well, and that is the half that
+  works. `--append-system-prompt` keeps it stated at the system layer too.
+- **There is no JSON mode.** Groq and Gemini both guarantee JSON; the CLI is a
+  conversational agent that answers with a markdown heading unless the *user* turn ends
+  with an explicit "output only the JSON object". A permissive `{"type":"object"}` schema
+  does not help — `--json-schema` returns nothing unless the schema names properties.
+- **`--allowed-tools` is not the gate under `dontAsk`.** The allow rules in `--settings`
+  are. Both are sent.
+- **Account-level MCP connectors load regardless of `--mcp-config`.** They are denied by
+  the allow-list, which is the argument for an allowlist over a denylist.
+- **Some accounts refuse `WebSearch`/`WebFetch` in headless mode** whatever the permission
+  mode. Research then returns a schema-valid husk, which is why an all-empty payload
+  raises rather than being cached.
+
 Follow-ups not taken:
 
-- `--json-schema` is used for research, where the schema is fixed and known. Using it for
-  the JSON tasks needs task identity threaded into `complete_json`, which today receives
-  only messages and a parser.
+- Per-task `--json-schema` for the JSON tasks. It needs task identity threaded into
+  `complete_json`, which today receives only messages and a parser; the trailing
+  instruction plus prose-tolerant extraction covers it without an interface change.
 - No pacer is attached. Subscription limits are a rolling five-hour window, which the
   per-minute `Pacer` does not model; the cooldown from a refusal covers it instead.
 
