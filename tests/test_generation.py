@@ -15,6 +15,7 @@ import os
 import tempfile
 import unittest
 
+from clients.providers.base import ProviderRateLimited
 from clients.research_client import (
     ResearchClient,
     SpendCeilingReached,
@@ -31,7 +32,12 @@ from pipeline.generate import (
 from pipeline.prepare import LeadPreparer
 from pipeline.relevance import RelevanceScorer, parse_score
 from utilities.identity import identity_key
-from utilities.mailstore import LEAD_NEW, LEAD_READY, MailStore
+from utilities.mailstore import (
+    LEAD_NEW,
+    LEAD_READY,
+    PREPARE_WAITING_PREFIX,
+    MailStore,
+)
 from utilities.store import JobStore
 
 
@@ -48,6 +54,33 @@ class FakeGroq:
 async def immediate(func, *args):
     """Executor stand-in that calls straight through, no thread involved."""
     return func(*args)
+
+
+class RateLimitedResearch:
+    """A research client whose chain is out, shaped like `ResearchTaskClient`.
+
+    `available_in` is the cheap question the preparer asks before a batch;
+    `research` is the wall it hits when it does not, which is what the pool
+    raises once every provider in the chain is blocked.
+    """
+
+    def __init__(self, retry_after=240, available_in=0.0):
+        self.retry_after = retry_after
+        self.model = "gemini-3.6-flash"
+        self.calls = 0
+        self._available_in = available_in
+
+    def available_in(self):
+        return self._available_in
+
+    def research(self, lead):
+        self.calls += 1
+        raise ProviderRateLimited(
+            "No model is available for research a company and role: "
+            "gemini (daily limit reached), anthropic (not configured).",
+            retry_after=self.retry_after,
+            provider="Gemini",
+        )
 
 
 def make_app():
@@ -400,6 +433,68 @@ class TestLeadPreparer(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["prepared"], 0)
         self.assertEqual(result["failed"], 0, "budget stop is not a lead failure")
+
+    async def test_a_rate_limit_pauses_the_batch_instead_of_failing_it(self):
+        """The reported bug: five leads, five tracebacks, five failures.
+
+        A rate limit is what every other model stage reports as one INFO line.
+        Here it fell into the generic handler, so each lead in the batch was
+        attempted, marked failed, and given the pool's error string as its
+        reason - a permanent-looking failure for a wait of a few minutes.
+        """
+        for title in ("Backend Engineer", "Platform Engineer", "Data Engineer"):
+            add_lead(self.mail, title, "Stripe")
+        research = RateLimitedResearch(retry_after=240)
+        preparer = LeadPreparer(
+            self.store, self.mail,
+            FakeGroq(['{"score": 0.9, "reason": "fit"}'] * 3),
+            research, output_dir=self.directory, executor=immediate)
+
+        with self.assertNoLogs("pipeline.prepare", level="ERROR"):
+            result = await preparer.run()
+
+        self.assertEqual(result["prepared"], 0)
+        self.assertEqual(result["failed"], 0, "a pause is not a lead failure")
+        self.assertEqual(research.calls, 1, "the batch stops at the first wall")
+        self.assertEqual(result["scored"], 3, "scoring is a different chain")
+
+        for lead in self.mail.list_leads():
+            self.assertNotEqual(lead["status"], LEAD_READY)
+        touched = self.mail.list_leads()[0]
+        self.assertTrue(touched["prepare_error"].startswith(
+            PREPARE_WAITING_PREFIX))
+        self.assertIn("4m", touched["prepare_error"])
+
+    async def test_a_blocked_research_chain_costs_no_attempts(self):
+        add_lead(self.mail)
+        research = RateLimitedResearch(available_in=180)
+        preparer = LeadPreparer(
+            self.store, self.mail,
+            FakeGroq(['{"score": 0.9, "reason": "fit"}']),
+            research, output_dir=self.directory, executor=immediate)
+        result = await preparer.run()
+
+        self.assertEqual(research.calls, 0, "asked before spending an attempt")
+        self.assertEqual(result["prepared"], 0)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["scored"], 1, "the backlog is still scored")
+
+    async def test_a_lead_recovers_once_a_provider_frees_up(self):
+        """The note is a pause, so nothing has to clear it by hand."""
+        add_lead(self.mail)
+        research = RateLimitedResearch(retry_after=60)
+        preparer = LeadPreparer(
+            self.store, self.mail,
+            FakeGroq(['{"score": 0.9, "reason": "fit"}']),
+            research, output_dir=self.directory, executor=immediate)
+        await preparer.run()
+        self.assertTrue(self.mail.list_leads()[0]["prepare_error"])
+
+        preparer.builder.research_client = self._research()
+        self.assertTrue(await preparer.prepare_now(self.mail.list_leads()[0]["id"]))
+        recovered = self.mail.list_leads()[0]
+        self.assertEqual(recovered["status"], LEAD_READY)
+        self.assertIsNone(recovered["prepare_error"])
 
 
 if __name__ == "__main__":
