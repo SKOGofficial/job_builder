@@ -129,21 +129,46 @@ def _build_anthropic(mail):
     return {SHAPE_RESEARCH: ResearchClient.from_config(limiter=limiter)}, "Claude", 0
 
 
-def _build_claude_cli(mail):
+def _build_claude_cli(_mail):
+    """Both shapes over the local `claude` binary.
+
+    Summary:
+        Build the Claude Code CLI's classification and research clients.
+
+    Parameters:
+        _mail: Unused, deliberately. See the note.
+
+    Returns:
+        tuple: `(clients_by_shape, display, daily_limit)`.
+
+    Raises:
+        ProviderNotConfigured: When no binary resolves.
+
+    Note:
+        No `SpendLimiter`, following `_build_gemini` rather than
+        `_build_anthropic`. The limiter reads `job_research` through the
+        MailStore's connection, and a client is called from an executor
+        thread, so checking it there raises `sqlite3.ProgrammingError` -
+        sqlite connections belong to the thread that made them. Anthropic has
+        the same wiring and has simply never been configured, so it has never
+        fired.
+
+        Nothing is lost by dropping it here: `--max-budget-usd` caps a single
+        run inside the CLI, and `CLAUDE_CLI_REQUESTS_PER_DAY` gives the pool's
+        own `Budget` a daily ceiling, which is read and written on the thread
+        that owns the connection.
+    """
     from clients.providers import claude_cli
-    from clients.research_client import SpendLimiter
 
     # Resolved once, here, so a missing binary raises ProviderNotConfigured
     # before either client is constructed - the same "one check, then build"
     # shape the key-based builders get from `api_key()`.
     binary = claude_cli.binary_path()
-    limiter = SpendLimiter(mail) if mail is not None else None
     model = claude_cli.model_name()
     clients = {
-        SHAPE_JSON: claude_cli.ClaudeCliClient(
-            model=model, binary=binary, limiter=limiter),
+        SHAPE_JSON: claude_cli.ClaudeCliClient(model=model, binary=binary),
         SHAPE_RESEARCH: claude_cli.ClaudeCliResearchClient(
-            model=model, binary=binary, limiter=limiter,
+            model=model, binary=binary,
             timeout=claude_cli.timeout_seconds(claude_cli.RESEARCH_TIMEOUT)),
     }
     return clients, claude_cli.DISPLAY_NAME, claude_cli.requests_per_day()

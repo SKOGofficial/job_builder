@@ -351,6 +351,24 @@ class ClaudeCliFailoverTests(PoolFixture):
         self.call(pool)
         self.assertTrue(pool.providers["claude_cli"].cooling_down(self.now))
 
+    def test_the_builder_attaches_no_database_reading_limiter(self):
+        """A client is called from an executor thread; the limiter is not.
+
+        `SpendLimiter` reads `job_research` through the MailStore connection,
+        and sqlite connections belong to the thread that created them. Wiring
+        one in raised `sqlite3.ProgrammingError` on every prepare - caught by
+        the generic handler, so it arrived as five tracebacks and five failed
+        leads rather than as anything that named the cause.
+        """
+        from clients.providers.pool import _build_claude_cli
+
+        try:
+            clients, _display, _limit = _build_claude_cli(self.mail)
+        except Exception:
+            self.skipTest("the claude CLI is not installed here")
+        for client in clients.values():
+            self.assertIsNone(client.limiter)
+
     def test_it_serves_the_call_when_it_works(self):
         import json
 

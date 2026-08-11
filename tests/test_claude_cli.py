@@ -381,6 +381,52 @@ class ResearchTests(EnvIsolationMixin, unittest.TestCase):
         self.assertEqual(payload["company_summary"], "From text")
 
 
+class ThreadSafetyTests(EnvIsolationMixin, unittest.TestCase):
+    """Clients run on executor threads. Whatever they touch must survive that.
+
+    The pipeline calls every model client through `asyncio.to_thread`, so a
+    client that reads sqlite through a connection made on the main thread
+    raises `ProgrammingError` on every call - and the generic handler in
+    `pipeline/prepare.py` turns that into a traceback per lead rather than
+    anything naming the cause.
+    """
+
+    def setUp(self):
+        self.isolate_env()
+
+    def test_a_call_from_a_worker_thread_touches_no_database(self):
+        import threading
+
+        from utilities.mailstore import MailStore
+        from utilities.store import JobStore
+
+        store = JobStore(":memory:")
+        mail = MailStore(store.conn)
+        self.addCleanup(store.conn.close)
+
+        recorder = Recorder(stdout=envelope('{"label": "alert"}'))
+        client = claude_cli.ClaudeCliClient(binary="claude", runner=recorder)
+        # Whatever the builder chose to attach, exercise it off the main
+        # thread the way the pipeline does.
+        outcome = {}
+
+        def worker():
+            try:
+                outcome["value"] = client.complete_json(
+                    [{"role": "user", "content": "hi"}], json.loads, "fallback")
+            except Exception as exc:  # noqa: BLE001 - recorded, then asserted
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        self.assertNotIn("error", outcome,
+                         f"call failed off the main thread: {outcome.get('error')}")
+        self.assertEqual(outcome["value"], {"label": "alert"})
+        self.assertIsNotNone(mail)
+
+
 class FailureMappingTests(EnvIsolationMixin, unittest.TestCase):
     """Which exception comes out decides whether the pool fails over."""
 
