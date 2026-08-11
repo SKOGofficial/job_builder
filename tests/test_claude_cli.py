@@ -93,11 +93,14 @@ class EnvIsolationMixin:
     the same way, which is why the module keeps a module-level handle on it.
     """
 
+    #: The Anthropic names are here because tests below *set* them to prove
+    #: they are scrubbed from the child environment. Leaking `sk-ant-real` out
+    #: of this file makes Anthropic look configured to every later test.
     CLI_VARS = (
         "CLAUDE_CLI_PATH", "CLAUDE_CLI_MODEL", "CLAUDE_CLI_WORKDIR",
         "CLAUDE_CLI_TIMEOUT", "CLAUDE_CLI_MAX_BUDGET_USD",
         "CLAUDE_CLI_REQUESTS_PER_DAY", "CLAUDE_CLI_BARE",
-    )
+    ) + claude_cli.ANTHROPIC_ENV_VARS
 
     def isolate_env(self):
         self.saved_env = {name: os.environ.get(name) for name in self.CLI_VARS}
@@ -265,6 +268,38 @@ class CommandLineTests(EnvIsolationMixin, unittest.TestCase):
         self.assertEqual(recorder.flag("--permission-mode"), "dontAsk")
         self.assertIn("--strict-mcp-config", recorder.argv)
         self.assertIn("--no-session-persistence", recorder.argv)
+
+    def test_an_anthropic_key_never_reaches_the_subprocess(self):
+        """`.env`'s placeholder key was enough to break every call.
+
+        The app loads .env into its own environment and the child inherits it.
+        An API key there outranks the subscription login inside the CLI, which
+        then reports `Invalid API key - Fix external API key` and refuses the
+        work - from the outside, a provider that looks configured and declines
+        everything.
+        """
+        os.environ["ANTHROPIC_API_KEY"] = "your-anthropic-api-key-here"
+        os.environ["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
+        client = claude_cli.ClaudeCliClient(binary="claude")
+        recorder = self.run_client(client)
+        client.complete_json([{"role": "user", "content": "hi"}],
+                             lambda text: text, "fallback")
+        child = recorder.kwargs["env"]
+        for name in claude_cli.ANTHROPIC_ENV_VARS:
+            self.assertNotIn(name, child)
+        # Everything else is still inherited; this is a scrub, not a sandbox.
+        self.assertTrue(len(child) > 1)
+
+    def test_bare_mode_keeps_the_key_it_needs(self):
+        """--bare never reads the subscription login, so the key is the point."""
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-real"
+        os.environ["CLAUDE_CLI_BARE"] = "1"
+        client = claude_cli.ClaudeCliClient(binary="claude")
+        recorder = self.run_client(client)
+        client.complete_json([{"role": "user", "content": "hi"}],
+                             lambda text: text, "fallback")
+        self.assertEqual(recorder.kwargs["env"]["ANTHROPIC_API_KEY"], "sk-ant-real")
+        self.assertIn("--bare", recorder.argv)
 
     def test_bare_mode_is_off_unless_asked_for(self):
         client = claude_cli.ClaudeCliClient(binary="claude")

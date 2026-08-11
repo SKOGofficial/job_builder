@@ -126,6 +126,23 @@ JSON_ONLY_TAIL = (
     "fence, no explanation."
 )
 
+#: Anthropic credentials the subprocess must not inherit unless it is running
+#: in bare mode, where an API key is the point.
+#:
+#: The app loads `.env` into its own environment, and a subprocess inherits it.
+#: A key there - including `.env.example`'s placeholder, which this repo's own
+#: code correctly treats as "not configured" but still leaves in `os.environ` -
+#: takes precedence over the subscription login inside the CLI, which then
+#: reports `Invalid API key - Fix external API key` and gets nothing done. The
+#: symptom is a provider that looks authenticated from the outside and refuses
+#: every call.
+ANTHROPIC_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+)
+
 MISSING_BINARY_HINT = (
     "The Claude Code CLI was not found. Install it and sign in with `claude`, "
     "or set CLAUDE_CLI_PATH in .env to the binary's full path."
@@ -371,6 +388,35 @@ def parse_retry_after(text, default=DEFAULT_LIMIT_COOLDOWN):
     return float(max(found)) if found else float(default)
 
 
+def subprocess_env(bare=False, environ=None):
+    """The environment to hand the CLI, minus credentials that would hijack it.
+
+    Summary:
+        Copy the process environment, dropping Anthropic auth variables unless
+        running in bare mode.
+
+    Parameters:
+        bare (bool): True when `--bare` is being passed, which needs
+            `ANTHROPIC_API_KEY` and so keeps everything.
+        environ (Mapping | None): The environment to copy. Defaults to
+            `os.environ`.
+
+    Returns:
+        dict: The child's environment.
+
+    Note:
+        Subscription auth is the default, and an API key in the environment
+        silently outranks it. `.env` shipping a placeholder is enough to break
+        every call, so this is a correctness fix rather than hygiene.
+    """
+    env = dict(os.environ if environ is None else environ)
+    if bare:
+        return env
+    for name in ANTHROPIC_ENV_VARS:
+        env.pop(name, None)
+    return env
+
+
 def build_argv(binary, *, system_prompt, model, tools, schema, max_turns,
                budget_usd, bare):
     """Assemble the command line for one headless run.
@@ -542,6 +588,7 @@ def run_cli(system_prompt, prompt, *, tools=(), schema=None,
             could not be decoded.
     """
     run = runner or subprocess.run
+    bare = use_bare()
     argv = build_argv(
         binary or binary_path(),
         system_prompt=system_prompt,
@@ -550,7 +597,7 @@ def run_cli(system_prompt, prompt, *, tools=(), schema=None,
         schema=schema,
         max_turns=max_turns,
         budget_usd=(budget_usd if budget_usd is not None else max_budget_usd()),
-        bare=use_bare(),
+        bare=bare,
     )
 
     # Everything the model must follow goes on stdin, including the system
@@ -568,6 +615,7 @@ def run_cli(system_prompt, prompt, *, tools=(), schema=None,
             errors="replace",
             timeout=(timeout if timeout is not None else timeout_seconds()),
             cwd=workdir(),
+            env=subprocess_env(bare),
         )
     except subprocess.TimeoutExpired:
         _refuse("Claude Code CLI timed out", "the call exceeded its timeout")
