@@ -98,6 +98,22 @@ TRANSIENT_COOLDOWN = 60.0
 #: here can write.
 RESEARCH_TOOLS = ("WebSearch", "WebFetch")
 
+#: Permission mode per shape, and the two are different on purpose.
+#:
+#: `dontAsk` refuses anything outside `permissions.allow`. For classification
+#: that is exactly right and costs nothing: the allow-list is empty, no tool
+#: should ever run, and a tool shipped in a future release is closed by
+#: default rather than needing to be named.
+#:
+#: Research needs tools, and there `dontAsk` is the wrong shape - it wants a
+#: permission decision, and headless has nobody to make one. `auto` lets the
+#: CLI decide for itself whether a call is reasonable. It is not a blank
+#: cheque: it runs its own classifier, and `permissions.deny` still applies
+#: above it, so Bash, Write, Edit and the outward-reaching tools stay refused
+#: whatever it decides.
+JSON_PERMISSION_MODE = "dontAsk"
+RESEARCH_PERMISSION_MODE = "auto"
+
 #: Not attempted: a run that could not reach the web is not retried without it.
 #: Measured, when asked to answer from model knowledge instead, the model wrote
 #: "NOT RESEARCHED - web search and page fetch were both denied" into
@@ -418,7 +434,7 @@ def subprocess_env(bare=False, environ=None):
 
 
 def build_argv(binary, *, system_prompt, model, tools, schema, max_turns,
-               budget_usd, bare):
+               budget_usd, bare, permission_mode=JSON_PERMISSION_MODE):
     """Assemble the command line for one headless run.
 
     Split out from `run_cli` so the tests can assert on it directly. What is
@@ -437,6 +453,8 @@ def build_argv(binary, *, system_prompt, model, tools, schema, max_turns,
         max_turns (int): Agent-turn ceiling.
         budget_usd (float): Per-call spend cap; skipped when 0.
         bare (bool): Whether to pass `--bare`.
+        permission_mode (str): `dontAsk` for work that needs no tools, `auto`
+            where the CLI must decide for itself. See the constants.
 
     Returns:
         list[str]: The argument vector.
@@ -457,16 +475,15 @@ def build_argv(binary, *, system_prompt, model, tools, schema, max_turns,
         # is what actually binds; this keeps them stated at the system layer
         # too.
         "--append-system-prompt", system_prompt,
-        # `dontAsk` denies everything outside `permissions.allow`, which makes
-        # the settings blob below an allow-list rather than a denylist - the
-        # difference that matters, because the CLI's tool surface grows with
-        # every release and a denylist would be a losing race with it.
+        # See JSON_PERMISSION_MODE / RESEARCH_PERMISSION_MODE. Whichever mode
+        # is in force, `permissions.deny` below is absolute, so the settings
+        # blob - not the mode - is what keeps Bash and the outward-reaching
+        # tools away from untrusted email.
         #
-        # `--allowed-tools` alone is *not* enough: under `dontAsk` the CLI
-        # consults `permissions.allow`, and a real run had WebSearch denied
-        # despite being passed there. Both are sent; the settings blob is what
-        # actually grants.
-        "--permission-mode", "dontAsk",
+        # `--allowed-tools` alone is not enough under `dontAsk`: the CLI
+        # consults `permissions.allow`, so both are sent and the settings blob
+        # is what actually grants.
+        "--permission-mode", permission_mode,
         "--settings", json.dumps({
             "permissions": {
                 "allow": list(tools),
@@ -553,7 +570,8 @@ def _refuse(message, text):
 
 def run_cli(system_prompt, prompt, *, tools=(), schema=None,
             max_turns=DEFAULT_MAX_TURNS, timeout=None, model=None,
-            budget_usd=None, runner=None, binary=None):
+            budget_usd=None, runner=None, binary=None,
+            permission_mode=JSON_PERMISSION_MODE):
     """Run one headless invocation and return its parsed envelope.
 
     Summary:
@@ -576,6 +594,8 @@ def run_cli(system_prompt, prompt, *, tools=(), schema=None,
             the tests never spawn anything, the same reason the HTTP clients
             take a `poster`.
         binary (str | None): Executable path. Defaults to `binary_path()`.
+        permission_mode (str): See `JSON_PERMISSION_MODE` and
+            `RESEARCH_PERMISSION_MODE`.
 
     Returns:
         dict: The decoded result envelope, with `result`, `structured_output`,
@@ -598,6 +618,7 @@ def run_cli(system_prompt, prompt, *, tools=(), schema=None,
         max_turns=max_turns,
         budget_usd=(budget_usd if budget_usd is not None else max_budget_usd()),
         bare=bare,
+        permission_mode=permission_mode,
     )
 
     # Everything the model must follow goes on stdin, including the system
@@ -980,6 +1001,7 @@ class ClaudeCliResearchClient(_CliClient):
             tools=RESEARCH_TOOLS,
             schema=research_schema(),
             max_turns=RESEARCH_MAX_TURNS,
+            permission_mode=RESEARCH_PERMISSION_MODE,
         )
         payload = _research_payload(envelope)
 

@@ -203,6 +203,31 @@ class CommandLineTests(EnvIsolationMixin, unittest.TestCase):
         self.assertNotIn("WebSearch", rules["deny"])
         self.assertEqual(recorder.flag("--allowed-tools"), "WebSearch,WebFetch")
 
+    def test_the_permission_mode_differs_by_shape(self):
+        """Classification needs no tool, so nothing should be decidable.
+
+        Research does need tools, and `dontAsk` is the wrong shape there - it
+        wants a permission decision and headless has nobody to make one, which
+        is what showed up as WebSearch being refused. `auto` lets the CLI
+        decide; `permissions.deny` still binds above it either way.
+        """
+        client = claude_cli.ClaudeCliClient(binary="claude")
+        recorder = self.run_client(client)
+        client.complete_json([{"role": "user", "content": "hi"}],
+                             lambda text: text, "fallback")
+        self.assertEqual(recorder.flag("--permission-mode"),
+                         claude_cli.JSON_PERMISSION_MODE)
+        self.assertEqual(self.permissions(recorder)["allow"], [])
+
+        research = claude_cli.ClaudeCliResearchClient(binary="claude")
+        recorder = Recorder(stdout=envelope(structured={"company_summary": "x"}))
+        research.runner = recorder
+        research.research(_lead())
+        self.assertEqual(recorder.flag("--permission-mode"),
+                         claude_cli.RESEARCH_PERMISSION_MODE)
+        # The mode is not what protects the untrusted path; deny is.
+        self.assertIn("Bash", self.permissions(recorder)["deny"])
+
     def test_no_mcp_server_is_offered(self):
         """A real run had the model reach for a personal Indeed connector,
         including its `get_resume` tool. Local servers are excluded here; the
