@@ -858,8 +858,11 @@ class ModelStageSkipTests(PoolFixture):
         result = asyncio.run(self.cycle(pool)._model_stages(pool))
 
         self.assertEqual(result["retry_after"], 1800)
-        self.assertEqual(result["classified"], {})
         self.assertEqual(result["handled"], {})
+        # Classification is deliberately not here any more: the rule tier needs
+        # no provider, so it runs from `PipelineCycle.run` whatever the pool is
+        # doing. See `PipelineCycle.classify`.
+        self.assertNotIn("classified", result)
         self.assertEqual(self.groq.calls, 0, "nothing may be sent while cooling")
         self.assertEqual(self.gemini.calls, 0)
 

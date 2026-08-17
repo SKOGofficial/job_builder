@@ -10,11 +10,18 @@ Rows sit in one of three visible states. `new` means it has not cleared the
 relevance gate that keeps research spend proportional, `preparing` means the
 work is under way, and `ready` means it can be acted on now. A lead whose
 preparation failed stays out of `ready` and shows the reason.
+
+Ordering is by posting date, newest first, and open leads are deleted once the
+posting passes `LEAD_FRESHNESS_DAYS`. Both are the same judgement: applying
+early is most of what decides whether an application is read at all, so the
+freshest role belongs at the top, and a two-month-old posting on a to-apply
+list is not a task - it is a role that has already been filled.
 """
 
 import asyncio
 import logging
 import os
+import time
 
 from nicegui import ui
 
@@ -25,6 +32,7 @@ from pipeline.resolver import JobResolver
 from utilities.mailstore import (
     LEAD_APPLIED,
     LEAD_DISMISSED,
+    LEAD_FRESHNESS_DAYS,
     LEAD_NEW,
     LEAD_OPEN_STATUSES,
     LEAD_PREPARING,
@@ -65,6 +73,60 @@ def score_text(lead):
     return f"Relevance {lead['relevance_score']:.0%}"
 
 
+def posted_text(lead):
+    """How long ago the role was advertised.
+
+    Summary:
+        Describe a lead's posting age in words, for the row's metadata line.
+
+    Parameters:
+        lead (Mapping): The lead to describe.
+
+    Returns:
+        str: A phrase such as "Posted today" or "Posted 6 days ago", or an
+            empty string when the lead carries no posting date.
+
+    Note:
+        Age rather than a date, because the number that matters is the distance
+        from the freshness window - "12 days ago" says the row is about to be
+        dropped in a way "5 August" does not.
+    """
+    posted = _column(lead, "posted_ts")
+    if not posted:
+        return ""
+    days = max(0, int((time.time() - posted) // 86400))
+    if days == 0:
+        return "Posted today"
+    if days == 1:
+        return "Posted yesterday"
+    return f"Posted {days} days ago"
+
+
+def _column(row, name, default=None):
+    """Read a column that may predate the current schema.
+
+    Summary:
+        Read a possibly-absent column off a row.
+
+    Parameters:
+        row (Mapping): The row to read.
+        name (str): The column name.
+        default: Returned when the column is absent or empty.
+
+    Returns:
+        The column value, or `default`.
+
+    Note:
+        Same guard the orchestrator uses for `list_unsubscribe`: a `sqlite3.Row`
+        fetched through a statement cached before a migration comes back
+        without the new column and raises rather than returning None.
+    """
+    try:
+        return row[name] or default
+    except (IndexError, KeyError):
+        return default
+
+
 @ui.page("/leads")
 def leads_page():
     state = get_state()
@@ -73,8 +135,9 @@ def leads_page():
 
     with page_shell(
         "To apply",
-        "Roles found in job-board alerts. Ready rows have a tailored resume and "
-        "cover letter waiting to be downloaded.",
+        "Roles found in job-board alerts, newest posting first. Ready rows have a "
+        f"tailored resume and cover letter waiting. Anything still unapplied after "
+        f"{LEAD_FRESHNESS_DAYS} days is dropped automatically.",
         active="/leads",
     ):
 
@@ -148,10 +211,15 @@ def leads_page():
                     status_badge(lead["status"])
 
                 with ui.row().classes("items-center gap-3 flex-wrap"):
+                    posted = posted_text(lead)
+                    if posted:
+                        # First on the line, and the only one emphasised: the
+                        # list is sorted by it, so it is the number that
+                        # explains the row's position.
+                        ui.label(posted).classes("text-xs font-medium")
                     ui.label(score_text(lead)).classes("text-xs opacity-70")
                     if lead["board"]:
                         ui.label(f"via {lead['board']}").classes("text-xs opacity-60")
-                    ui.label(f"Seen {lead['created_at'][:10]}").classes("text-xs opacity-60")
 
                 if lead["relevance_reason"]:
                     ui.label(lead["relevance_reason"]).classes("text-xs opacity-60 italic")

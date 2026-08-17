@@ -14,7 +14,7 @@ calling thread and only network calls go to the executor.
 
 import logging
 
-from clients.llm_client import GroqRateLimited
+from clients.llm_client import GroqNotConfigured, GroqRateLimited
 from clients.providers.pool import THREAD_MAX_WAIT
 from pipeline.acknowledgements import AcknowledgementHandler
 from pipeline.alerts import AlertHandler
@@ -160,16 +160,21 @@ class PipelineCycle:
             result["synced"] = await self.sync.run(self.limits["sync"])
             result["filter"] = self.apply_filter()
             result["bodies"] = await self.bodies.run(self.limits["bodies"])
+            result["expired"] = self.mail.purge_stale_leads()
 
             pool = self._pool()
             if pool is not None:
                 pool.begin_cycle()
                 try:
+                    # Classification first and unconditionally: the rule tier
+                    # needs no provider, so a cooling-off pool must not stop
+                    # a mailbox of job-board digests being sorted.
+                    result["classified"] = await self.classify(pool)
                     result.update(await self._model_stages(pool))
                 finally:
                     pool.flush()
             else:
-                result["classified"] = {}
+                result["classified"] = await self.classify(None)
                 result["handled"] = {}
                 result["prepared"] = {}
 
@@ -183,8 +188,41 @@ class PipelineCycle:
         self.last_result = result
         return result
 
+    async def classify(self, pool):
+        """Label the unclassified backlog, with or without a provider.
+
+        Summary:
+            Run level-0 rules over pending mail and hand the residue to the
+            model when one is available.
+
+        Parameters:
+            pool (ProviderPool | None): The pool to draw a `route_email` client
+                from. None, or a pool with nothing available, still classifies
+                everything the rules can answer.
+
+        Returns:
+            dict[str, int]: Count per label assigned this cycle.
+
+        Note:
+            Deliberately outside `_model_stages`. Roughly seven messages in ten
+            are decided from the headers alone, and gating that on a provider
+            meant an exhausted free tier froze the to-apply list for the rest of
+            the day over work that costs nothing.
+        """
+        route = None
+        if pool is not None and pool.next_available_in() <= 0:
+            # Calls go through an executor, so the longer sleep budget applies -
+            # same reasoning as `dispatch`.
+            route = pool.for_task("route_email", max_wait=THREAD_MAX_WAIT)
+        router = MessageRouter(
+            self.mail,
+            client_factory=_resolved_factory(route),
+            executor=self.executor,
+        )
+        return await router.run(self.limits["classify"])
+
     async def _model_stages(self, pool):
-        """Classify, dispatch, and prepare - or skip the lot and say when.
+        """Dispatch and prepare - or skip the lot and say when.
 
         Summary:
             Run every stage that needs a model, unless no provider can take a
@@ -194,48 +232,31 @@ class PipelineCycle:
             pool (ProviderPool): The pool to draw task clients from.
 
         Returns:
-            dict: `classified`, `handled`, and `prepared`, plus `retry_after`
-                in seconds when the stages were skipped.
+            dict: `handled` and `prepared`, plus `retry_after` in seconds when
+                the stages were skipped.
 
         Note:
-            Asking the pool once, up front, replaces five stages each
+            Asking the pool once, up front, replaces four stages each
             discovering the same cooldown for itself and logging its own line
             about it. The cost was never the API - `candidates` filters a
             cooling provider without calling it - but an hour of cooldown at a
             ten-minute cadence still meant thirty log lines saying nothing.
 
-            Only the model stages are skipped. Sync, filtering, and body
-            fetching have already run by the time this is called, on purpose:
-            a rate-limited model must not stop new mail from reaching the
-            inbox view.
+            Only these stages are skipped. Sync, filtering, body fetching, and
+            rule-based classification have all already run by the time this is
+            called, on purpose: a rate-limited model must not stop new mail
+            reaching the inbox view or the to-apply list.
         """
         wait = pool.next_available_in()
         if wait > 0:
             log.info(
-                "Model stages skipped: no provider is available for about "
-                "%ds. Mail still synced; classification resumes when one frees "
-                "up.", int(wait),
+                "Handler stages skipped: no provider is available for about "
+                "%ds. Mail still synced and sorted by rule; extraction resumes "
+                "when one frees up.", int(wait),
             )
-            return {"classified": {}, "handled": {}, "prepared": {},
-                    "retry_after": int(wait)}
-
-        # Every model-calling stage runs its calls through an executor, so all
-        # of them may block for the longer budget. Passed explicitly rather
-        # than left to the pool's thread check, since here the answer is
-        # already known.
-        route = pool.for_task("route_email", max_wait=THREAD_MAX_WAIT)
-        if route is not None:
-            router = MessageRouter(
-                self.mail,
-                client_factory=lambda: route,
-                executor=self.executor,
-            )
-            classified = await router.run(self.limits["classify"])
-        else:
-            classified = {}
+            return {"handled": {}, "prepared": {}, "retry_after": int(wait)}
 
         return {
-            "classified": classified,
             "handled": await self.dispatch(pool),
             "prepared": await self.prepare(pool),
         }
@@ -349,6 +370,37 @@ class PipelineCycle:
             return {}
 
 
+def _resolved_factory(client):
+    """Adapt an already-resolved client to the factory the router expects.
+
+    Summary:
+        Wrap a client (or its absence) as a zero-argument factory.
+
+    Parameters:
+        client: The client to hand back, or None when none is available.
+
+    Returns:
+        Callable[[], object]: A factory returning `client`.
+
+    Raises:
+        GroqNotConfigured: From the returned factory when `client` is None.
+
+    Note:
+        None has to raise rather than return None, because that is the signal
+        the router already understands for "carry on without a model" - and
+        letting it fall through to its default `GroqClient.from_config` would
+        reach for an API key the pool has already decided against.
+    """
+    def factory():
+        if client is None:
+            raise GroqNotConfigured(
+                "No provider is available to classify the remaining mail."
+            )
+        return client
+
+    return factory
+
+
 def _labels(row):
     import json
 
@@ -381,6 +433,11 @@ def _summarise(result):
     handled = result.get("handled") or {}
     if handled.get("leads_created"):
         parts.append(f"{handled['leads_created']} new lead(s)")
+    # Worth a line of its own. Rows disappearing from the to-apply list with no
+    # explanation reads as data loss, which is exactly the wrong impression of
+    # a deliberate freshness window.
+    if result.get("expired"):
+        parts.append(f"{result['expired']} stale lead(s) dropped")
     # Said even when other parts exist: "3 new message(s)" with no mention of
     # classification reads as a pipeline that quietly stopped working.
     if result.get("retry_after"):

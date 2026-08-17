@@ -20,6 +20,7 @@ from utilities.migrations import (
     current_version,
     initialise,
     pending_migrations,
+    rebuild_table,
 )
 from utilities.schema import SCHEMA_VERSION, column_names
 
@@ -437,6 +438,202 @@ class TestSelectionsReplacePaths(unittest.TestCase):
                           "the old failure reason must not survive the requeue")
         # Only `ready` is affected - an application already sent is history.
         self.assertEqual(rows["KEY-APPLIED"]["status"], "applied")
+
+
+def rolled_back_to(version, table, column):
+    """A current database with one column removed and the version rewound.
+
+    Summary:
+        Build a database that looks like it predates a given migration.
+
+    Parameters:
+        version (int): The `user_version` to stamp, one below the migration
+            under test.
+        table (str): The table to remove a column from.
+        column (str): The column the migration adds.
+
+    Returns:
+        sqlite3.Connection: The rewound database, ready for rows and a second
+            `initialise`.
+
+    Note:
+        Built by bringing a fresh database fully up and then undoing one
+        column, rather than by pinning a copy of the old schema. `make_v0`
+        predates `messages` and `job_leads` entirely, so there is no earlier
+        state in which rows could be inserted at all.
+
+        Indexes over the column go first - sqlite refuses to drop a column an
+        index still references - and `initialise` rebuilds them on the way back
+        up, which is itself worth exercising.
+    """
+    conn = make_v0()
+    initialise(conn)
+    for (name,) in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? "
+        "AND sql LIKE ?", (table, f"%{column}%")
+    ).fetchall():
+        conn.execute(f"DROP INDEX {name}")
+    conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    conn.execute(f"PRAGMA user_version = {version}")
+    conn.commit()
+    return conn
+
+
+#: `messages` exactly as it stood before v5. Frozen, like `V0_SQL` - the point
+#: of a migration test is that it runs against the shape that really existed.
+PRE_V5_MESSAGES = """
+CREATE TABLE IF NOT EXISTS messages (
+    gmail_message_id TEXT PRIMARY KEY,
+    thread_id TEXT,
+    sender TEXT,
+    subject TEXT,
+    received_date TEXT,
+    received_ts INTEGER,
+    labels TEXT,
+    list_unsubscribe TEXT,
+    snippet TEXT,
+    body_text TEXT,
+    filter_verdict TEXT,
+    category TEXT,
+    category_confidence REAL,
+    category_reason TEXT,
+    category_model TEXT,
+    classified_at TEXT,
+    fetched_at TEXT NOT NULL,
+    body_fetched_at TEXT
+);
+"""
+
+PRE_V5_MESSAGE_COLUMNS = [
+    "gmail_message_id", "thread_id", "sender", "subject", "received_date",
+    "received_ts", "labels", "list_unsubscribe", "snippet", "body_text",
+    "filter_verdict", "category", "category_confidence", "category_reason",
+    "category_model", "classified_at", "fetched_at", "body_fetched_at",
+]
+
+
+def at_pre_v5_messages():
+    """A current database whose `messages` table predates v5.
+
+    Summary:
+        Build a database with the pre-v5 `messages` shape and the version
+        rewound to 4.
+
+    Returns:
+        sqlite3.Connection: Ready for rows and a second `initialise`.
+
+    Note:
+        Rebuilt rather than `DROP COLUMN`-ed. `handled_at` is the last column
+        in the live schema and carries a comment above it, so dropping it
+        leaves sqlite's stored DDL ending in a trailing comma followed by a
+        comment, which it then refuses to reparse. `rebuild_table` is the
+        project's own answer to structural changes and sidesteps that entirely.
+    """
+    conn = make_v0()
+    initialise(conn)
+    rebuild_table(conn, "messages", PRE_V5_MESSAGES, PRE_V5_MESSAGE_COLUMNS)
+    conn.execute("PRAGMA user_version = 4")
+    conn.commit()
+    return conn
+
+
+class TestHandledMarker(unittest.TestCase):
+    """v5: telling "tried and found nothing" from "not tried yet"."""
+
+    def test_the_column_arrives(self):
+        conn = make_v0()
+        initialise(conn)
+        self.assertIn("handled_at", column_names(conn, "messages"))
+
+    def test_already_linked_messages_are_backfilled(self):
+        """Otherwise the whole processed history goes round the handlers again.
+
+        A linked message demonstrably was handled, so leaving it NULL would put
+        every alert ever parsed back into the next cycle's backlog and re-spend
+        the entire history's worth of extraction.
+        """
+        conn = at_pre_v5_messages()
+        conn.execute(
+            "INSERT INTO messages (gmail_message_id, sender, subject, "
+            "classified_at, fetched_at) VALUES ('m1', 'a@b.test', 's', "
+            "'2026-01-02T00:00:00', '2026-01-01T00:00:00')"
+        )
+        conn.execute(
+            "INSERT INTO messages (gmail_message_id, sender, subject, "
+            "fetched_at) VALUES ('m2', 'a@b.test', 's', '2026-01-01T00:00:00')"
+        )
+        conn.execute(
+            "INSERT INTO message_links (gmail_message_id, identity_key, "
+            "link_type, created_at) VALUES ('m1', 'KEY', 'job_alert', "
+            "'2026-01-02T00:00:00')"
+        )
+        conn.commit()
+
+        initialise(conn)
+
+        rows = {r["gmail_message_id"]: r for r in
+                conn.execute("SELECT * FROM messages").fetchall()}
+        self.assertEqual(rows["m1"]["handled_at"], "2026-01-02T00:00:00")
+        # Unlinked stays NULL: it is the genuine backlog, and one more pass over
+        # it - now with the rule classifier having relabelled the board
+        # marketing among them - is what clears it properly.
+        self.assertIsNone(rows["m2"]["handled_at"])
+
+
+class TestPostingDate(unittest.TestCase):
+    """v6: when the role was advertised, not when we read the email."""
+
+    def _with_lead(self, source_message_id, received_ts=None,
+                   created_at="2026-08-03T02:18:46"):
+        conn = rolled_back_to(5, "job_leads", "posted_ts")
+        if received_ts is not None:
+            conn.execute(
+                "INSERT INTO messages (gmail_message_id, sender, subject, "
+                "received_ts, fetched_at) VALUES (?, 'a@b.test', 's', ?, ?)",
+                (source_message_id, received_ts, created_at),
+            )
+        conn.execute(
+            "INSERT INTO job_leads (identity_key, title, company, status, "
+            "source_message_id, created_at, updated_at) "
+            "VALUES ('KEY', 'Engineer', 'Acme', 'new', ?, ?, ?)",
+            (source_message_id, created_at, created_at),
+        )
+        conn.commit()
+        initialise(conn)
+        return conn.execute("SELECT * FROM job_leads").fetchone()
+
+    def test_the_column_arrives(self):
+        conn = make_v0()
+        initialise(conn)
+        self.assertIn("posted_ts", column_names(conn, "job_leads"))
+
+    def test_it_is_backfilled_from_the_source_alert_email(self):
+        """The correction this migration exists to make.
+
+        A backfill stamped 127 leads with one `created_at` even though the
+        postings behind them spanned three weeks. Ordering and expiry both key
+        on this column, and both would be meaningless taken from `created_at`.
+        """
+        lead = self._with_lead("msg-1", received_ts=1753660800)
+        self.assertEqual(lead["posted_ts"], 1753660800)
+
+    def test_a_lead_whose_source_message_is_gone_falls_back_to_created_at(self):
+        """Never NULL, because the expiry query cannot judge a dateless row.
+
+        Leaving it NULL would make the lead immortal, which is the one outcome
+        the freshness window exists to prevent. An approximate date is the
+        better failure.
+        """
+        lead = self._with_lead("msg-missing")
+        self.assertIsNotNone(lead["posted_ts"])
+        self.assertGreater(lead["posted_ts"], 0)
+
+    def test_the_index_exists(self):
+        conn = make_v0()
+        initialise(conn)
+        names = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'")}
+        self.assertIn("idx_leads_posted", names)
 
 
 if __name__ == "__main__":

@@ -269,21 +269,35 @@ Stages, one module each under `pipeline/`:
    `messages.list` when the stored history cursor has expired (Gmail keeps roughly a
    week). Headers only.
 2. **Rough filter** - drops mail that is confidently not from a job board or a company:
-   personal mail with no job wording, Social and Forums, and a denylist you build by
-   pressing "not job related". Everything else survives. It is deliberately permissive -
+   personal mail with no job wording, Social and Forums, and a denylist you build under
+   Settings → Blocked senders. Everything else survives. It is deliberately permissive -
    a filter tuned for precision silently loses the recruiter email that matches no
    keyword, and you never learn what you missed. Every verdict is recorded, so "why
    didn't I see that email" is answerable.
 3. **Bodies** - downloaded only for what got through.
-4. **Classify** - whichever model is routed to the job labels each message `job_alert`,
-   `job_update`, `job_acknowledgement`, or `irrelevant`. Most mail is irrelevant and the
-   prompt says so. The model that produced each label is recorded alongside it.
+4. **Classify** - each message becomes `job_alert`, `job_update`, `job_acknowledgement`,
+   or `irrelevant`. `pipeline/classify.py` answers first from the sender and subject
+   alone, which covers about seven messages in ten: the job boards send the same handful
+   of things from the same handful of addresses, and paying a model to rediscover that on
+   every message was both slower and less consistent than a rule. Whatever the rules
+   decline - "thank you for your interest in X" opens receipts and rejections in equal
+   measure, so no rule touches it - goes to whichever model is routed to the job. What
+   produced each label is recorded alongside it, `rules` included.
 5. **Resolve and link** - work out which role a message concerns, strongest signal first:
    the board's own job ID, then an exact identity match, then sender domain plus title
-   similarity. **When several roles remain plausible it links nothing** and the message
-   goes to a review queue. Guessing would attach a rejection to the wrong role.
+   similarity. **When several roles remain plausible it links nothing.** Guessing would
+   attach a rejection to the wrong role, and no link is a better answer than a wrong one.
 6. **Handle** - alerts become leads, acknowledgements promote leads into applications,
-   updates apply a status change when confident enough.
+   updates apply a status change when confident enough. Every message is stamped
+   `handled_at` afterwards, whatever the outcome - without it a digest carrying no
+   parseable posting is re-extracted at full cost on every cycle, for ever.
+
+The to-apply list is ordered by **posting date, newest first**, and open leads are
+deleted once the posting is more than 14 days old (`LEAD_FRESHNESS_DAYS`). The date comes
+from the alert email that carried the role, not from when the pipeline got round to
+reading it - a backfill collapses the second and preserves the first. Leads you have
+applied to or dismissed are never purged: the first is the record of an application, and
+deleting the second would let the next alert re-suggest a role you already turned down.
 
 Links point at a role's *identity*, not at a table row, so a lead that becomes an
 application keeps every email already attached to it. The alert that first surfaced a
@@ -303,8 +317,8 @@ Useful without the UI, and safe to run while the app is up (the database is in W
 ```
 
 `filter-stats` is the one to watch early on. If the denylist count is not growing, the
-"not job related" control is not being used and the model is being paid to reject the
-same newsletters every day.
+Settings → Blocked senders list is not being used and the model is being paid to reject
+the same newsletters every day.
 
 ### Storage and pruning
 

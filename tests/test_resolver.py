@@ -238,7 +238,14 @@ class TestLinking(unittest.TestCase):
 
         self.assertFalse(resolver.link("m1", result, CATEGORY_UPDATE))
 
-    def test_unresolved_message_reaches_the_review_queue(self):
+    def test_an_ambiguous_message_writes_no_link_at_all(self):
+        """Refusing has to mean refusing.
+
+        Two open roles at one company and an email that names neither is the
+        case the resolver exists to decline. Linking it anywhere would put a
+        status update on a job it may not be about, so the check is that
+        *nothing* was written - not that something plausible was.
+        """
         store, mail = make_stores()
         add_job(store, "Backend Engineer", "Stripe")
         add_job(store, "Product Designer", "Stripe")
@@ -250,26 +257,13 @@ class TestLinking(unittest.TestCase):
         resolver = JobResolver(store, mail)
         result = resolver.resolve({"sender": "careers@stripe.com",
                                    "subject": "An update"}, {})
-        resolver.link("m1", result, CATEGORY_UPDATE)
+        linked = resolver.link("m1", result, CATEGORY_UPDATE)
         mail.commit()
 
-        queued = mail.unlinked_messages()
-        self.assertEqual([r["gmail_message_id"] for r in queued], ["m1"])
-
-    def test_manual_link_clears_the_queue(self):
-        store, mail = make_stores()
-        job_id = add_job(store, "Backend Engineer", "Stripe")
-        job = store.job_by_identity(store.list_jobs()[0]["identity_key"])
-        mail.upsert_message({"id": "m1", "sender": "careers@stripe.com",
-                             "subject": "An update", "date": ""})
-        mail.record_category("m1", CATEGORY_UPDATE, 0.9, "status change")
-        mail.commit()
-
-        resolver = JobResolver(store, mail)
-        resolver.link_manually("m1", job["identity_key"], CATEGORY_UPDATE)
-
-        self.assertEqual(mail.count_unlinked(), 0)
-        self.assertEqual(len(mail.messages_for_identity(job["identity_key"])), 1)
+        self.assertFalse(result.resolved)
+        self.assertTrue(result.ambiguous)
+        self.assertFalse(linked)
+        self.assertEqual(mail.links_for_message("m1"), [])
 
 
 if __name__ == "__main__":

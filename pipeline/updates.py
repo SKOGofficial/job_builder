@@ -75,6 +75,16 @@ class UpdateHandler:
                 extract_update, dict(message), self.client)
 
         resolution = self.resolver.resolve(dict(message), extracted)
+        # Marked before the unresolved branch returns: an update about a role
+        # that is not in the applications list will never resolve, however many
+        # times it is retried, and retrying costs a model call each time.
+        #
+        # Unless there was no model to extract with. Then `extracted` is empty,
+        # the resolver had only the sender domain, and calling that a failed
+        # attempt would discard a status update because a provider was cooling
+        # off.
+        if resolution.resolved or self.client is not None:
+            self.mail.mark_handled(message["gmail_message_id"])
         if not resolution.resolved:
             outcome["ambiguous"] = resolution.ambiguous
             log.info("Update %s unresolved: %s",
@@ -175,13 +185,20 @@ class UpdateHandler:
                 "unresolved": unresolved}
 
     def _pending(self, limit):
-        return self.mail.conn.execute(
-            """
-            SELECT * FROM messages
-            WHERE category = ?
-              AND gmail_message_id NOT IN (SELECT gmail_message_id FROM message_links)
-            ORDER BY received_ts ASC
-            LIMIT ?
-            """,
-            (CATEGORY_UPDATE, limit),
-        ).fetchall()
+        """Update emails not yet processed, oldest first.
+
+        Summary:
+            List the update emails this handler still has to process.
+
+        Parameters:
+            limit (int): Most rows to return.
+
+        Returns:
+            list[sqlite3.Row]: Unhandled update messages.
+
+        Note:
+            Oldest first, so a sequence of updates on one job is applied in the
+            order it arrived rather than ending on the earliest status.
+        """
+        return self.mail.messages_awaiting_handling(
+            CATEGORY_UPDATE, limit, newest_first=False)

@@ -427,11 +427,102 @@ def migrate_v4(conn):
     )
 
 
+def migrate_v5(conn):
+    """Let a handler record that it tried, even when it found nothing.
+
+    Handlers selected their backlog as "in my category and linked to nothing".
+    A job-board digest that yields no parseable posting - a careers-site advert,
+    a "welcome to our job board" mail - never gets a link, so it matched that
+    query again on the next cycle, and the one after, and was re-extracted at
+    full model cost for ever. The same held for an acknowledgement the resolver
+    could not place.
+
+    Backfilled for messages that already have a link: those demonstrably were
+    handled, and leaving them NULL would send the whole processed history back
+    round the handlers once.
+
+    Summary:
+        Add `messages.handled_at` and backfill it for already-linked messages.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to migrate.
+
+    Raises:
+        sqlite3.Error: If the column check, the `ALTER TABLE`, or the backfill
+            fails.
+
+    Note:
+        Messages in a job category with no link stay NULL on purpose. They are
+        the genuine backlog, and one more pass over them - now with the rule
+        classifier having relabelled the board marketing among them - is what
+        clears them properly.
+    """
+    if "handled_at" in column_names(conn, "messages"):
+        return
+    conn.execute("ALTER TABLE messages ADD COLUMN handled_at TEXT")
+    conn.execute(
+        """
+        UPDATE messages
+        SET handled_at = COALESCE(classified_at, fetched_at)
+        WHERE gmail_message_id IN (SELECT gmail_message_id FROM message_links)
+        """
+    )
+
+
+def migrate_v6(conn):
+    """Record when a lead's posting was advertised, not when we read the email.
+
+    The to-apply list is ordered newest-first and drops anything older than a
+    fortnight, and `created_at` can support neither. It records when this
+    pipeline reached the alert email: a backfill stamped 127 leads with one
+    creation minute even though the postings behind them spanned three weeks,
+    which would order the list arbitrarily and then expire the whole thing in a
+    single day.
+
+    The alert email's own received time is the honest answer. It is not the
+    posting date exactly - a board may re-advertise an older role - but it is
+    the date the role was put in front of the user, which is what "still fresh
+    enough to be worth applying to" actually means.
+
+    Summary:
+        Add `job_leads.posted_ts` and backfill it from each lead's source alert
+        email.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to migrate.
+
+    Raises:
+        sqlite3.Error: If the column check, the `ALTER TABLE`, or the backfill
+            fails.
+
+    Note:
+        A lead whose source message has since been deleted falls back to
+        `created_at`, parsed as a timestamp. Leaving it NULL would make the row
+        immortal - the expiry query cannot judge a row with no date - and an
+        approximate date is a better failure than a lead that can never leave.
+    """
+    if "posted_ts" in column_names(conn, "job_leads"):
+        return
+    conn.execute("ALTER TABLE job_leads ADD COLUMN posted_ts INTEGER")
+    conn.execute(
+        """
+        UPDATE job_leads
+        SET posted_ts = COALESCE(
+            (SELECT m.received_ts FROM messages m
+             WHERE m.gmail_message_id = job_leads.source_message_id),
+            CAST(strftime('%s', created_at) AS INTEGER)
+        )
+        """
+    )
+
+
 MIGRATIONS = [
     (1, migrate_v1),
     (2, migrate_v2),
     (3, migrate_v3),
     (4, migrate_v4),
+    (5, migrate_v5),
+    (6, migrate_v6),
 ]
 
 

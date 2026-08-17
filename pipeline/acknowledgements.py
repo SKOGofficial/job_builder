@@ -95,6 +95,14 @@ class AcknowledgementHandler:
 
         resolution = self.resolver.resolve(dict(message), extracted)
         applied_on = application_date_from(dict(message))
+        # "Tried and could not place it" has to be distinguishable from "not
+        # tried", or the backlog query hands the same message back on every
+        # cycle for ever. But only a pass that had a model to extract with
+        # counts as having tried: without one, `extracted` is empty and the
+        # resolver has nothing but the sender domain to work from, so marking
+        # it handled would quietly discard the receipt.
+        if resolution.resolved or self.client is not None:
+            self.mail.mark_handled(message["gmail_message_id"])
 
         if resolution.resolved:
             key = resolution.identity_key
@@ -249,13 +257,24 @@ class AcknowledgementHandler:
         return counts
 
     def _pending(self, limit):
-        return self.mail.conn.execute(
-            """
-            SELECT * FROM messages
-            WHERE category = ?
-              AND gmail_message_id NOT IN (SELECT gmail_message_id FROM message_links)
-            ORDER BY received_ts ASC
-            LIMIT ?
-            """,
-            (CATEGORY_ACKNOWLEDGEMENT, limit),
-        ).fetchall()
+        """Acknowledgements not yet processed, oldest first.
+
+        Summary:
+            List the acknowledgement emails this handler still has to process.
+
+        Parameters:
+            limit (int): Most rows to return.
+
+        Returns:
+            list[sqlite3.Row]: Unhandled acknowledgement messages.
+
+        Note:
+            Oldest first, so the receipt that arrived first is the one that
+            promotes the lead and sets the application date.
+
+            Keyed on `handled_at` rather than the absence of a link: an
+            acknowledgement the resolver cannot place writes no link, and under
+            the old query that meant re-extracting it every cycle for ever.
+        """
+        return self.mail.messages_awaiting_handling(
+            CATEGORY_ACKNOWLEDGEMENT, limit, newest_first=False)

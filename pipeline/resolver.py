@@ -7,9 +7,10 @@ wrong attaches a rejection to the wrong role and marks the wrong job dead.
 
 So this refuses to guess. Resolution walks from strongest signal to weakest and
 stops at the first that is unambiguous; when several jobs remain plausible it
-returns unresolved *with* the candidates, and the message lands in the review
-queue for the user to place. That is the whole reason `unlinked_messages`
-exists.
+returns unresolved *with* the candidates, and the caller records that it tried
+and moves on. Refusing is the useful outcome here - an update email that cannot
+be placed leaves every job's status alone, which is right, whereas a coin flip
+marks one of them dead.
 
 No LLM here. Extraction of (title, company, location) from prose happens in
 `pipeline/extract.py`; this module is the matching logic, so it stays pure and
@@ -38,7 +39,6 @@ RESOLVED_BOARD_ID = "board_job_id"
 RESOLVED_IDENTITY = "exact_identity"
 RESOLVED_DOMAIN_TITLE = "domain+title"
 RESOLVED_DOMAIN_ONLY = "domain_sole_open"
-RESOLVED_MANUAL = "manual"
 
 #: Coverage above which a text is considered to name a role. Set high on
 #: purpose: "Backend Engineer" and "Frontend Engineer" share a token, and
@@ -73,8 +73,10 @@ class Resolution:
     """The outcome of trying to place a message against a job.
 
     `candidates` is populated when resolution failed *because* several jobs
-    were plausible - the review queue shows them so the user picks rather than
-    hunting.
+    were plausible, which is the difference between "this email is about a role
+    I do not track" and "it is about one of these three and I cannot say
+    which". Handlers report the distinction rather than treating both as a
+    blank failure.
     """
 
     def __init__(self, identity_key=None, confidence=0.0, resolved_by=None,
@@ -307,15 +309,6 @@ class JobResolver:
             confidence=resolution.confidence,
             resolved_by=resolution.resolved_by,
         )
-
-    def link_manually(self, message_id, identity_key, link_type):
-        """Place a message the resolver could not, from the review queue."""
-        linked = self.mail.link_message(
-            message_id, identity_key, link_type,
-            confidence=1.0, resolved_by=RESOLVED_MANUAL,
-        )
-        self.mail.commit()
-        return linked
 
 
 def identity_for(title, company, location=None):

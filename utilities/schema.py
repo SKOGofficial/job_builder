@@ -16,7 +16,7 @@ missing it. `SCHEMA_VERSION` must be bumped in lockstep.
 #: no migration entry, because `create_tables` runs `CREATE TABLE IF NOT
 #: EXISTS` unconditionally on every `initialise`, before the version gate. Only
 #: new columns on existing tables need a migration.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 -- Applications the user has actually applied to. -----------------------------
@@ -96,7 +96,14 @@ CREATE TABLE IF NOT EXISTS messages (
     category_model TEXT,
     classified_at TEXT,
     fetched_at TEXT NOT NULL,
-    body_fetched_at TEXT
+    body_fetched_at TEXT,
+    -- When a category handler finished with this message, whatever the
+    -- outcome. Handlers used to select their backlog as "in my category and
+    -- linked to nothing", which meant a digest containing no parseable posting
+    -- - "Welcome to MyGreenhouse", a careers-site advert - was picked up,
+    -- charged for, and found empty on every single cycle, for ever. This is
+    -- what makes "tried, nothing to link" distinguishable from "not tried".
+    handled_at TEXT
 );
 
 -- Which job(s) a message is about. --------------------------------------------
@@ -128,6 +135,12 @@ CREATE TABLE IF NOT EXISTS job_leads (
     board TEXT,
     board_job_id TEXT,
     source_message_id TEXT,
+    -- When the posting was advertised, taken from the received time of the
+    -- alert email that carried it. NOT `created_at`: that records when this
+    -- pipeline got round to the email, and a backfill gives a hundred leads
+    -- spanning three weeks of postings the same creation minute. Ordering and
+    -- expiry both key on this, so both would be meaningless without it.
+    posted_ts INTEGER,
     relevance_score REAL,
     relevance_reason TEXT,
     status TEXT NOT NULL DEFAULT 'new',
@@ -269,6 +282,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received_ts);
 CREATE INDEX IF NOT EXISTS idx_links_identity ON message_links(identity_key);
 CREATE INDEX IF NOT EXISTS idx_links_message ON message_links(gmail_message_id);
 CREATE INDEX IF NOT EXISTS idx_leads_status ON job_leads(status);
+CREATE INDEX IF NOT EXISTS idx_leads_posted ON job_leads(posted_ts);
 CREATE INDEX IF NOT EXISTS idx_email_matches_job_id ON email_matches(job_id);
 -- Every budget question is "how much has this provider spent since <time>",
 -- so the pair is the useful order.

@@ -392,12 +392,15 @@ class TestRateLimitStopsBatchesCleanly(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.calls, 1,
                          "must stop after the first 429, not retry each message")
 
-    async def test_alert_messages_stay_unlinked_so_they_retry(self):
+    async def test_rate_limited_alerts_stay_unhandled_so_they_retry(self):
         self._alert()
         await AlertHandler(self.store, self.mail, self.client, executor=immediate).run(limit=10)
-        # Unlinked is what makes the next cycle pick it up again.
+        # A rate limit must not look like "tried and found nothing". The
+        # message keeps a NULL `handled_at`, which is what puts it back in the
+        # next cycle's backlog.
         self.assertEqual(
-            [row["gmail_message_id"] for row in self.mail.unlinked_messages()],
+            [row["gmail_message_id"]
+             for row in self.mail.messages_awaiting_handling(CATEGORY_ALERT)],
             ["alert-1"],
         )
 
