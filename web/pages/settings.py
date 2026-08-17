@@ -308,8 +308,8 @@ def settings_page():
             with card():
                 ui.label("Blocked senders").classes("text-base font-semibold")
                 ui.label(
-                    "Domains dropped before classification. Marking a message as not job "
-                    "related in the review queue adds one here."
+                    "Domains dropped before classification. Add one here and its mail "
+                    "never reaches the classifier again."
                 ).classes("text-sm opacity-70")
 
                 with ui.row().classes("w-full items-end gap-3"):

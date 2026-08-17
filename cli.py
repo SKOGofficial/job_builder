@@ -54,7 +54,6 @@ def cmd_status(args):
     print("\nMailbox")
     print(f"  last sync   {mail.get_cursor(CURSOR_LAST_SYNC) or 'never'}")
     print(f"  history id  {mail.get_cursor(CURSOR_HISTORY_ID) or 'unset'}")
-    print(f"  unlinked    {mail.count_unlinked()}")
     print(f"  unclassified {mail.count_awaiting_classification()}")
 
     print("\nFilter verdicts")

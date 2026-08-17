@@ -2,6 +2,92 @@
 
 Use this file to record meaningful project changes, implementation decisions, and verification notes.
 
+## 2026-08-17 - Rule classification, no review queue, and a fresh to-apply list
+
+Measured first. The review queue held 312 messages, and 265 of them - 85% - were
+job-board digests from five senders: LinkedIn job alerts, Glassdoor, ZipRecruiter,
+Indeed match, Jobright. Each was shown beside a picker asking which of the user's
+applications a list of ten unrelated roles belonged to. That question has no answer, so
+the queue could only ever grow.
+
+Three causes, all fixed:
+
+- **Alerts were in the queue's definition at all.** `unlinked_messages()` selected every
+  job category with no link, and an alert is by definition *not* about a submitted
+  application. Removed with the rest of the feature.
+- **Handlers could not record a failed attempt.** They selected their backlog as "in my
+  category and linked to nothing". A digest carrying no parseable posting never gets a
+  link, so it came back every cycle and was re-extracted at full model cost, for ever.
+  New `messages.handled_at` (v5) makes "tried and found nothing" distinguishable from
+  "not tried".
+- **Nothing deterministic ran before the model.** Added `pipeline/classify.py`, a
+  sender-and-subject rule tier ahead of the router.
+
+The classifier was built against the stored mailbox rather than guessed at. Backtested
+over all 655 labelled messages: rules fire on 458 (70%) and agree with the model on 434.
+Of the 24 disagreements, all but two are the rules being right - the model labelled three
+identical Amazon receipts `job_acknowledgement` and a fourth `irrelevant`, and called
+"Welcome to MyGreenhouse" a job alert eleven times. A first draft included a tier
+labelling anything from a board domain as an alert; it was measured, found to produce
+four of the five genuine errors ("Terms of Service Updates", "Thank you for purchasing
+Premium"), and removed. Declining is free; a wrong confident label is permanent.
+
+Decisions worth keeping:
+
+- **Subject intent is settled before sender reputation.** `jobs-noreply@linkedin.com`
+  sends all three job categories, and `noreply@glassdoor.com` carries both job alerts and
+  a forum digest separated only by display name.
+- **"Thank you for your interest in X" gets no rule.** It opens acknowledgements and
+  rejections in equal measure; only the body separates them. Guessing would silently mark
+  live applications dead.
+- **`inmail-hit-reply@linkedin.com` is deliberately not noise.** It looks like network
+  chatter and is actually how a recruiter's approach arrives, carrying real roles.
+- **A cycle with no provider has not "tried".** Handlers only stamp `handled_at` when
+  they had a model to extract with, or when they resolved. Caught while dry-running
+  against a copy of the real database: without the guard, a cooling-off provider would
+  have permanently discarded parseable digests and real receipts.
+
+To-apply list, keyed on a new `job_leads.posted_ts` (v6) taken from the alert email's
+received time:
+
+- Ordered by posting date, newest first, ahead of both `ready` and relevance. Applying
+  early decides more than any signal that was outranking it.
+- Open leads past `LEAD_FRESHNESS_DAYS` (14) are deleted each cycle. `applied` and
+  `dismissed` are exempt - the first is the record of an application, and deleting the
+  second lets the next alert re-suggest a rejected role.
+- `created_at` could carry neither. It records when the pipeline read the email: a
+  backfill stamped 127 leads with one creation minute for postings spanning three weeks,
+  which would order the list arbitrarily and then expire all of it in a single day.
+
+Classification also moved out of the model-gated stages, since the rule tier needs no
+provider. An exhausted free tier used to freeze the to-apply list for the rest of the day
+over work that costs nothing.
+
+Verification:
+
+- 623 tests pass, up from 568. New suites: `test_classify.py` (rules, built from real
+  senders and subjects), `test_lead_freshness.py` (ordering, purge exemptions, the
+  `NULLIF` that stops two unknown dates collapsing to epoch 0), `test_handled_marker.py`
+  (the retry leak, backlog ordering, and the no-provider guard). Migration tests cover v5
+  and v6 including both backfills.
+- Migrations and the purge were exercised against a **copy** of
+  `job_applications.sqlite3`, never the file itself. On that copy: schema reaches v6, 365
+  leads all get a posting date, 180 stale open leads are purged, 118 remain, and the
+  applied and dismissed counts are untouched. UI verified against the same copy.
+- Stored labels are deliberately left alone. Re-running the rules over history would
+  relabel 24 messages, but every lead they would produce is already past the freshness
+  window, so it is churn for no gain.
+
+Known gaps:
+
+- `/settings` returns 500 when the database names a provider the running build does not
+  know about - reproducible today with the `claude_cli` fallback row written by the CLI
+  provider branch. Pre-existing and unrelated, but it breaks the very page you would use
+  to fix the setting.
+- The rules cover the boards in this mailbox. A new board falls through to the model,
+  which is the safe direction, but `MessageRouter.by_rule` is the number to watch: a
+  collapse means a sender or subject format changed.
+
 ## 2026-08-04 - Gemini as a second engine, and per-task model routing
 
 Groq's free tier was the throughput ceiling on the whole pipeline. A 429 ended a stage:

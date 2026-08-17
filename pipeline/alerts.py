@@ -26,6 +26,31 @@ from utilities.mailstore import CATEGORY_ALERT
 log = logging.getLogger(__name__)
 
 
+def _received_ts(message):
+    """The alert's received timestamp, or None.
+
+    Summary:
+        Read `received_ts` off a message row without assuming it is present.
+
+    Parameters:
+        message (Mapping): The message row or dict.
+
+    Returns:
+        int | None: The epoch seconds, or None when the column is absent or
+            empty.
+
+    Note:
+        A `sqlite3.Row` raises `IndexError` for an unknown column rather than
+        returning None, and a row fetched through a statement cached before a
+        migration can come back without one - the same guard the orchestrator
+        uses for `list_unsubscribe`.
+    """
+    try:
+        return message["received_ts"]
+    except (IndexError, KeyError):
+        return None
+
+
 class AlertHandler:
     """Turns alert emails into leads.
 
@@ -61,9 +86,27 @@ class AlertHandler:
         """
         postings = await self.executor(parse_alert, dict(message), self.client)
         if not postings:
+            if self.client is None:
+                # Not a real attempt. `parse_alert` gives up immediately when
+                # no deterministic parser claims the message and there is no
+                # model to fall back on, so marking this handled would discard
+                # a perfectly parseable digest because a provider happened to
+                # be cooling off. Left for a cycle that can actually try.
+                log.info("Alert %s left for a cycle with a model available",
+                         message["gmail_message_id"])
+                return 0, 0, 0
+            # Marked handled all the same. Plenty of board mail carries no
+            # posting at all, and without this the same empty digest is
+            # re-extracted at full model cost on every cycle for ever.
             log.info("No postings extracted from alert %s",
                      message["gmail_message_id"])
+            self.mail.mark_handled(message["gmail_message_id"])
+            self.mail.commit()
             return 0, 0, 0
+
+        # When the role was advertised. The alert's own received time, because
+        # boards do not put a posting date in the mail - see `migrate_v6`.
+        posted_ts = _received_ts(message)
 
         created = skipped = linked = 0
         for posting in postings:
@@ -88,6 +131,7 @@ class AlertHandler:
                 "board": posting.board,
                 "board_job_id": posting.board_job_id,
                 "source_message_id": message["gmail_message_id"],
+                "posted_ts": posted_ts,
             })
             created += int(is_new)
 
@@ -98,6 +142,7 @@ class AlertHandler:
                                       CATEGORY_ALERT, 1.0, "alert_parser"):
                 linked += 1
 
+        self.mail.mark_handled(message["gmail_message_id"])
         self.mail.commit()
         log.info("Alert %s produced %d new lead(s), %d already applied to",
                  message["gmail_message_id"], created, skipped)
@@ -139,13 +184,20 @@ class AlertHandler:
         return tuple(totals)
 
     def _pending(self, limit):
-        return self.mail.conn.execute(
-            """
-            SELECT * FROM messages
-            WHERE category = ?
-              AND gmail_message_id NOT IN (SELECT gmail_message_id FROM message_links)
-            ORDER BY received_ts DESC
-            LIMIT ?
-            """,
-            (CATEGORY_ALERT, limit),
-        ).fetchall()
+        """Alerts not yet extracted, newest first.
+
+        Summary:
+            List the alert emails this handler still has to process.
+
+        Parameters:
+            limit (int): Most rows to return.
+
+        Returns:
+            list[sqlite3.Row]: Unhandled alert messages.
+
+        Note:
+            Keyed on `handled_at`, not on the absence of a link. A digest whose
+            postings have all been applied to already links to nothing new, and
+            under the old query that made it permanently pending.
+        """
+        return self.mail.messages_awaiting_handling(CATEGORY_ALERT, limit)

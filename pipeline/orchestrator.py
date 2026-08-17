@@ -160,6 +160,7 @@ class PipelineCycle:
             result["synced"] = await self.sync.run(self.limits["sync"])
             result["filter"] = self.apply_filter()
             result["bodies"] = await self.bodies.run(self.limits["bodies"])
+            result["expired"] = self.mail.purge_stale_leads()
 
             pool = self._pool()
             if pool is not None:
@@ -432,6 +433,11 @@ def _summarise(result):
     handled = result.get("handled") or {}
     if handled.get("leads_created"):
         parts.append(f"{handled['leads_created']} new lead(s)")
+    # Worth a line of its own. Rows disappearing from the to-apply list with no
+    # explanation reads as data loss, which is exactly the wrong impression of
+    # a deliberate freshness window.
+    if result.get("expired"):
+        parts.append(f"{result['expired']} stale lead(s) dropped")
     # Said even when other parts exist: "3 new message(s)" with no mention of
     # classification reads as a pipeline that quietly stopped working.
     if result.get("retry_after"):

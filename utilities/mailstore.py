@@ -20,6 +20,7 @@ it.
 
 import json
 import logging
+import time
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 
@@ -55,6 +56,12 @@ LEAD_STATUSES = (LEAD_NEW, LEAD_PREPARING, LEAD_READY, LEAD_DISMISSED, LEAD_APPL
 #: Statuses the to-apply list shows by default. `ready` first - that is the
 #: state the user can actually act on.
 LEAD_OPEN_STATUSES = (LEAD_READY, LEAD_PREPARING, LEAD_NEW)
+
+#: How long a posting stays on the to-apply list. Two weeks after a board
+#: advertised a role, applying to it is mostly a way to feel busy - the posting
+#: has usually been filled or closed, and a to-apply list padded with those
+#: stops being a list of things to do.
+LEAD_FRESHNESS_DAYS = 14
 
 #: Marks a `prepare_error` that is a pause rather than a failure. The column
 #: holds free text and the Leads page renders it in red as "Preparation
@@ -605,8 +612,8 @@ class MailStore:
             link_type (str): What the message is to the job, for example the
                 acknowledgement or the rejection.
             confidence (float | None): Resolver confidence, when automatic.
-            resolved_by (str | None): What made the link - a resolver stage
-                name, or a marker for a manual link from the review queue.
+            resolved_by (str | None): What made the link - the name of the
+                resolver stage or parser responsible for it.
 
         Returns:
             bool: True when the link was created, False when it already
@@ -630,6 +637,64 @@ class MailStore:
         )
         return cursor.rowcount > 0
 
+    def mark_handled(self, gmail_message_id):
+        """Record that a category handler has finished with this message.
+
+        Summary:
+            Stamp `handled_at` so a handler does not pick the message up again.
+
+        Parameters:
+            gmail_message_id (str): The message the handler has processed.
+
+        Raises:
+            sqlite3.Error: If the update fails.
+
+        Note:
+            Does not commit. Called on **every** outcome, including the ones
+            that wrote no link. That is the point: a digest carrying no
+            parseable posting produced no link, so a backlog query keyed on
+            links alone re-extracted it at full model cost on every cycle, for
+            ever. Marking it handled is what makes "tried and found nothing"
+            different from "not tried yet".
+        """
+        self.conn.execute(
+            "UPDATE messages SET handled_at = ? WHERE gmail_message_id = ?",
+            (_now(), gmail_message_id),
+        )
+
+    def messages_awaiting_handling(self, category, limit=50, newest_first=True):
+        """A category handler's backlog.
+
+        Summary:
+            List classified messages in one category that no handler has
+            processed yet.
+
+        Parameters:
+            category (str): The category to select, from `CATEGORIES`.
+            limit (int): Most rows to return.
+            newest_first (bool): Newest first for alerts, where a fresh posting
+                matters more than an old one. Acknowledgements pass False -
+                they are processed oldest first so that a lead is promoted by
+                the receipt that actually came first.
+
+        Returns:
+            list[sqlite3.Row]: Unhandled messages in that category.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
+        order = "DESC" if newest_first else "ASC"
+        return self.conn.execute(
+            f"""
+            SELECT * FROM messages
+            WHERE category = ?
+              AND handled_at IS NULL
+            ORDER BY received_ts {order}
+            LIMIT ?
+            """,
+            (category, limit),
+        ).fetchall()
+
     def unlink_message(self, gmail_message_id, identity_key):
         """Undo a link. Needed because an auto-link can be wrong.
 
@@ -647,9 +712,10 @@ class MailStore:
             sqlite3.Error: If the delete or the commit fails.
 
         Note:
-            Commits. Unlinking returns the message to `unlinked_messages`, and
-            also makes it eligible for body pruning again if it is
-            `irrelevant` and old enough.
+            Commits. Unlinking also makes the message eligible for body pruning
+            again if it is `irrelevant` and old enough. It does not clear
+            `handled_at`, so no handler picks it back up - removing a wrong link
+            is not a request to re-run extraction.
         """
         cursor = self.conn.execute(
             "DELETE FROM message_links WHERE gmail_message_id = ? AND identity_key = ?",
@@ -715,62 +781,6 @@ class MailStore:
             (identity_key,),
         ).fetchall()
 
-    def unlinked_messages(self, limit=100):
-        """Job-related mail the resolver could not place.
-
-        The review queue. Without it these messages are classified, stored, and
-        attached to nothing - which looks exactly like the pipeline working.
-
-        Summary:
-            List job-related messages that are attached to no identity.
-
-        Parameters:
-            limit (int): Maximum rows to return. Defaults to 100.
-
-        Returns:
-            list[sqlite3.Row]: Messages in a job category with no link, newest
-                first.
-
-        Raises:
-            sqlite3.Error: If the query fails.
-
-        Note:
-            `irrelevant` messages are excluded - they are supposed to be
-            unlinked, so including them would bury the real queue.
-        """
-        marks = ", ".join("?" for _ in JOB_CATEGORIES)
-        return self.conn.execute(
-            f"""
-            SELECT * FROM messages
-            WHERE category IN ({marks})
-              AND gmail_message_id NOT IN (SELECT gmail_message_id FROM message_links)
-            ORDER BY received_ts DESC
-            LIMIT ?
-            """,
-            (*JOB_CATEGORIES, limit),
-        ).fetchall()
-
-    def count_unlinked(self):
-        """
-        Summary:
-            Count job-related messages the resolver could not place.
-
-        Returns:
-            int: The size of the review queue, shown as a navigation badge.
-
-        Raises:
-            sqlite3.Error: If the query fails.
-        """
-        marks = ", ".join("?" for _ in JOB_CATEGORIES)
-        return self.conn.execute(
-            f"""
-            SELECT COUNT(*) AS n FROM messages
-            WHERE category IN ({marks})
-              AND gmail_message_id NOT IN (SELECT gmail_message_id FROM message_links)
-            """,
-            JOB_CATEGORIES,
-        ).fetchone()["n"]
-
     # --- leads -------------------------------------------------------------
 
     def upsert_lead(self, lead):
@@ -789,8 +799,8 @@ class MailStore:
             lead (dict): The lead fields. `identity_key` and `title` are
                 required; `identity_scheme`, `company`, `location`,
                 `apply_url`, `tracking_url`, `board`, `board_job_id`,
-                `source_message_id`, and `status` are optional. `status`
-                defaults to `LEAD_NEW`.
+                `source_message_id`, `posted_ts`, and `status` are optional.
+                `status` defaults to `LEAD_NEW`.
 
         Returns:
             bool: True when a new lead was created, False when an existing one
@@ -801,11 +811,18 @@ class MailStore:
             sqlite3.Error: If the insert or update fails.
 
         Note:
-            Does not commit. On the refresh path only the two URLs and
-            `updated_at` are touched, and each is written with COALESCE so a
+            Does not commit. On the refresh path the two URLs, `updated_at` and
+            `posted_ts` are touched, and each is written with COALESCE so a
             None never erases a stored value. Status and relevance are never
             reset - doing so would resurrect a dismissed lead every time the
             posting was re-advertised.
+
+            `posted_ts` takes the **later** of the stored and incoming values,
+            so a role advertised again next week has its clock reset and gets
+            another fortnight. A board still pushing a posting is the best
+            evidence available that it is still open, and the alternative -
+            first sighting wins - would expire a live role while the alerts for
+            it were still arriving.
         """
         now = _now()
         cursor = self.conn.execute(
@@ -813,9 +830,9 @@ class MailStore:
             INSERT OR IGNORE INTO job_leads (
                 identity_key, identity_scheme, title, company, location,
                 apply_url, tracking_url, board, board_job_id, source_message_id,
-                status, created_at, updated_at
+                posted_ts, status, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 lead["identity_key"],
@@ -828,6 +845,7 @@ class MailStore:
                 lead.get("board"),
                 lead.get("board_job_id"),
                 lead.get("source_message_id"),
+                lead.get("posted_ts"),
                 lead.get("status", LEAD_NEW),
                 now,
                 now,
@@ -839,11 +857,16 @@ class MailStore:
                 UPDATE job_leads
                 SET apply_url = COALESCE(?, apply_url),
                     tracking_url = COALESCE(?, tracking_url),
+                    -- NULLIF puts the NULL back when both sides are absent;
+                    -- without it two unknowns would collapse to epoch 0 and
+                    -- the lead would be expired as fifty years stale.
+                    posted_ts = NULLIF(
+                        MAX(COALESCE(?, 0), COALESCE(posted_ts, 0)), 0),
                     updated_at = ?
                 WHERE identity_key = ?
                 """,
-                (lead.get("apply_url"), lead.get("tracking_url"), now,
-                 lead["identity_key"]),
+                (lead.get("apply_url"), lead.get("tracking_url"),
+                 lead.get("posted_ts"), now, lead["identity_key"]),
             )
         return cursor.rowcount > 0
 
@@ -885,10 +908,10 @@ class MailStore:
         ).fetchone()
 
     def list_leads(self, statuses=LEAD_OPEN_STATUSES):
-        """The to-apply list. Ready rows first, then newest.
+        """The to-apply list, newest posting first.
 
         Summary:
-            List leads, ordered so the ones the user can act on come first.
+            List leads with the most recently advertised roles at the top.
 
         Parameters:
             statuses (tuple[str, ...] | None): Statuses to include. Defaults
@@ -896,28 +919,86 @@ class MailStore:
                 of status, which is what the "show dismissed" view uses.
 
         Returns:
-            list[sqlite3.Row]: Matching leads. Filtered results are ordered
-                `ready` first, then by relevance score descending, then
-                newest. The unfiltered branch is newest-first only.
+            list[sqlite3.Row]: Matching leads, newest posting first, with
+                relevance breaking ties within a posting date.
 
         Raises:
             sqlite3.Error: If the query fails.
+
+        Note:
+            Posting date is the primary sort, ahead of both `ready` and
+            relevance. It used to be last, behind a `ready` bucket and the
+            relevance score, which meant the top of the list was whatever the
+            preparer had happened to finish - and a role advertised three weeks
+            ago outranked one posted this morning. Applying early is worth more
+            than any of the signals that were beating it, so the newest posting
+            wins and relevance only breaks ties.
+
+            `created_at` is the tiebreaker of last resort, never the sort key -
+            see `migrate_v6` for why it cannot carry this.
         """
+        order = (
+            "ORDER BY COALESCE(posted_ts, 0) DESC, "
+            "relevance_score DESC NULLS LAST, "
+            "created_at DESC"
+        )
         if statuses is None:
             return self.conn.execute(
-                "SELECT * FROM job_leads ORDER BY created_at DESC"
+                f"SELECT * FROM job_leads {order}"
             ).fetchall()
         marks = ", ".join("?" for _ in statuses)
         return self.conn.execute(
-            f"""
-            SELECT * FROM job_leads
-            WHERE status IN ({marks})
-            ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END,
-                     relevance_score DESC NULLS LAST,
-                     created_at DESC
-            """,
+            f"SELECT * FROM job_leads WHERE status IN ({marks}) {order}",
             tuple(statuses),
         ).fetchall()
+
+    def purge_stale_leads(self, older_than_days=LEAD_FRESHNESS_DAYS):
+        """Drop open leads whose posting has gone stale.
+
+        Summary:
+            Delete still-open leads advertised longer ago than the freshness
+            window.
+
+        Parameters:
+            older_than_days (int): Age in days past which an open lead is
+                deleted. Defaults to `LEAD_FRESHNESS_DAYS`.
+
+        Returns:
+            int: How many leads were deleted.
+
+        Raises:
+            sqlite3.Error: If the delete or the commit fails.
+
+        Note:
+            Only `new`, `preparing`, and `ready` are touched. `applied` leads
+            are the record that the user applied and are referenced by a real
+            application, and `dismissed` leads are the memory of a decision -
+            deleting those would let the next alert for the same role recreate
+            it, and a to-apply list that keeps re-suggesting roles the user has
+            already said no to is worse than one that is merely long.
+
+            The date falls back to `created_at` when `posted_ts` is missing.
+            Skipping dateless rows instead would make them permanent, which is
+            the one outcome this method exists to prevent.
+        """
+        cutoff = int(time.time()) - older_than_days * 86400
+        marks = ", ".join("?" for _ in LEAD_OPEN_STATUSES)
+        cursor = self.conn.execute(
+            f"""
+            DELETE FROM job_leads
+            WHERE status IN ({marks})
+              AND COALESCE(
+                    posted_ts,
+                    CAST(strftime('%s', created_at) AS INTEGER)
+                  ) < ?
+            """,
+            (*LEAD_OPEN_STATUSES, cutoff),
+        )
+        self.conn.commit()
+        if cursor.rowcount:
+            log.info("Purged %d lead(s) older than %d days",
+                     cursor.rowcount, older_than_days)
+        return cursor.rowcount
 
     def set_lead_status(self, lead_id, status, error=None):
         """

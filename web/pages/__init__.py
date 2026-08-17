@@ -11,7 +11,6 @@ from web.pages import (  # noqa: F401  (imported for the @ui.page side effect)
     experiences,
     jobs,
     leads,
-    review,
     settings,
     text_storage,
 )
@@ -21,7 +20,6 @@ __all__ = [
     "add_application",
     "dashboard",
     "leads",
-    "review",
     "email_matches",
     "experiences",
     "settings",

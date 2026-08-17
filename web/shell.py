@@ -33,7 +33,6 @@ NAV_TABS = [
 
 #: Everything else, reached from the drawer.
 DRAWER_ENTRIES = [
-    ("Review queue", "/review", "rule"),
     ("Email matches", "/email-matches", "mark_email_unread"),
     ("Experiences", "/experiences", "format_list_bulleted"),
     ("Settings", "/settings", "settings"),
@@ -92,8 +91,7 @@ def pending_counts(state):
     because a badge query blew up would be a poor trade.
 
     Summary:
-        Compute the drawer badge counts for the review queue and email
-        matches.
+        Compute the drawer badge count for email matches.
 
     Parameters:
         state (AppState): The shared app state to query.
@@ -106,12 +104,15 @@ def pending_counts(state):
     Note:
         Every query is wrapped so a failure here cannot break page rendering;
         failures are logged at debug level and silently drop that badge.
+
+        The review queue's badge used to sit here. It counted job mail the
+        resolver could not attach to an application, and in practice it counted
+        job-board digests - 265 of its 312 entries - each asking the user which
+        of their applications a list of ten unrelated roles belonged to. That
+        question has no answer, so the classifier now labels those alerts up
+        front and the alert handler turns them into leads.
     """
     counts = {}
-    try:
-        counts["/review"] = state.mail.count_unlinked()
-    except Exception:
-        log.debug("Unlinked count failed", exc_info=True)
     try:
         counts["/email-matches"] = len(state.store.pending_email_matches())
     except Exception:
