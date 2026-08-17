@@ -101,7 +101,9 @@ modules back into one file.
   the `SpendLimiter`), and `gemini_research.py` (Gemini with Google Search grounding). All
   take an injectable caller/executor so tests never reach the network.
 - `clients/providers/` holds the multi-provider machinery: `base.py` (the neutral
-  exceptions, `Pacer`, `estimate_tokens`), `gemini.py` (the Gemini transport), `budget.py`
+  exceptions, `Pacer`, `estimate_tokens`), `gemini.py` (the Gemini transport),
+  `claude_cli.py` (the Claude Code CLI driven headlessly as a subprocess, both shapes),
+  `budget.py`
   (per-day allowances and spread pacing), `routing.py` (the `TASKS` registry and chain
   resolution), and `pool.py` (`ProviderPool`, and the failover state machine). Three things
   here are load-bearing and easy to break:

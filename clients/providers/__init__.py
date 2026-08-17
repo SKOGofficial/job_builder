@@ -30,6 +30,7 @@ PROVIDER_MODULES = {
     "groq": "clients.llm_client",
     "gemini": "clients.providers.gemini",
     "anthropic": "clients.research_client",
+    "claude_cli": "clients.providers.claude_cli",
 }
 
 __all__ = [
