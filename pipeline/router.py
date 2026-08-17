@@ -6,6 +6,14 @@ what reaches this stage genuinely is ordinary marketing mail. The prompt says
 so explicitly - without that, the model strains to fit a shoe advert into one
 of the three job categories and the pipeline fills up with nonsense leads.
 
+`pipeline/classify.py` runs first and answers roughly seven messages in ten from
+the headers alone, so what reaches the model here is the residue: the mail whose
+label genuinely needs the body read. That ordering is not only a cost saving.
+Measured against the stored mailbox, the rules and the model disagree on 24
+messages and the rules are right on all but two of them - the model labelled
+three identical Amazon receipts as acknowledgements and a fourth as irrelevant,
+which is the kind of inconsistency a deterministic rule cannot have.
+
 The email is untrusted third-party text and so is the reply. The model may only
 choose from a fixed set; anything outside it becomes `irrelevant`, which is
 inert. An email that tries to instruct the classifier is labelled irrelevant
@@ -22,6 +30,7 @@ from clients.llm_client import (
     GroqNotConfigured,
     GroqRateLimited,
 )
+from pipeline.classify import RULE_MODEL, classify_message
 from utilities.mailstore import (
     CATEGORY_ACKNOWLEDGEMENT,
     CATEGORY_ALERT,
@@ -132,6 +141,10 @@ class MessageRouter:
         self.client_factory = client_factory or GroqClient.from_config
         self.executor = executor
         self.processed = 0
+        #: How many of `processed` the rules answered without a model call.
+        #: Reported so the split stays visible - a sudden collapse in this
+        #: number means a board changed its sender or its subject wording.
+        self.by_rule = 0
         self.by_category = {}
 
     async def _call(self, client, payload):
@@ -155,16 +168,30 @@ class MessageRouter:
         Stops cleanly on a rate limit rather than retrying - everything already
         classified is kept, and the next cycle resumes from the first
         unclassified row.
+
+        Summary:
+            Label the unclassified backlog, using the rules where they apply and
+            the model only where they do not.
+
+        Parameters:
+            limit (int | None): Most messages to classify in one pass. The limit
+                bounds the whole batch, not just the model's share of it.
+
+        Returns:
+            dict[str, int]: Count per label assigned in this pass.
+
+        Note:
+            The rules run over the whole batch before a client is asked for, so
+            a mailbox of nothing but job-board digests is classified in full
+            with no provider configured at all. That matters more than the cost:
+            a rate-limited or missing model used to stop classification dead,
+            and now it only stops the part that needs a model.
         """
         pending = self.mail.messages_awaiting_classification(limit)
         if not pending:
             return {}
 
-        try:
-            client = self.client_factory()
-        except GroqNotConfigured as exc:
-            log.warning("Router cannot run: %s", exc)
-            return {}
+        counts = {}
 
         # Plain dicts across the thread boundary - handing a worker a sqlite
         # Row would tempt it into touching a connection it does not own.
@@ -178,7 +205,71 @@ class MessageRouter:
             for row in pending
         ]
 
-        counts = {}
+        undecided = []
+        for payload in payloads:
+            result = classify_message(payload)
+            if result is None:
+                undecided.append(payload)
+                continue
+            self._record(payload, result, RULE_MODEL, counts)
+            self.by_rule += 1
+
+        if undecided:
+            await self._route_with_model(undecided, counts)
+
+        self.mail.commit()
+        self.by_category = counts
+        if self.by_rule:
+            log.info("Rules classified %d message(s); %d needed the model",
+                     self.by_rule, len(undecided))
+        return counts
+
+    def _record(self, payload, result, model, counts):
+        """Write one label and tally it.
+
+        Summary:
+            Store a classification result against its message.
+
+        Parameters:
+            payload (dict): The message being classified.
+            result (dict): `label`, `confidence`, and `reason`.
+            model (str | None): What produced the label, for attribution.
+            counts (dict): Tally to increment in place.
+        """
+        self.mail.record_category(
+            payload["gmail_message_id"],
+            result["label"],
+            result["confidence"],
+            result["reason"],
+            model,
+        )
+        counts[result["label"]] = counts.get(result["label"], 0) + 1
+        self.processed += 1
+
+    async def _route_with_model(self, payloads, counts):
+        """Ask the model about the messages no rule could place.
+
+        Summary:
+            Classify the residue with a provider, stopping cleanly if one is
+            unavailable or rate limited.
+
+        Parameters:
+            payloads (list[dict]): Messages the rules declined.
+            counts (dict): Tally to increment in place.
+
+        Note:
+            An unconfigured provider is a log line, not a failure. The rules
+            have already written their share by the time this is reached, so
+            the messages left here simply stay unclassified and are retried on
+            the next cycle.
+        """
+        try:
+            client = self.client_factory()
+        except GroqNotConfigured as exc:
+            log.warning("Rules classified what they could; the rest needs a "
+                        "model and none is configured: %s", exc)
+            return
+
         for payload in payloads:
             try:
                 result = await self._call(client, payload)
@@ -193,16 +284,5 @@ class MessageRouter:
             # `getattr` rather than an attribute access: every test double is
             # a bare stub with no such attribute, and NULL is exactly right
             # for one of those.
-            self.mail.record_category(
-                payload["gmail_message_id"],
-                result["label"],
-                result["confidence"],
-                result["reason"],
-                getattr(client, "last_model", None),
-            )
-            counts[result["label"]] = counts.get(result["label"], 0) + 1
-            self.processed += 1
-
-        self.mail.commit()
-        self.by_category = counts
-        return counts
+            self._record(payload, result, getattr(client, "last_model", None),
+                         counts)
