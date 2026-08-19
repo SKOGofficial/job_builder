@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 
 from utilities.durations import spell_duration
+from utilities.identity import company_slug
 
 log = logging.getLogger(__name__)
 
@@ -1795,6 +1796,318 @@ class MailStore:
             row["domain"]
             for row in self.conn.execute("SELECT domain FROM sender_denylist")
         }
+
+    # --- contacts and referrals --------------------------------------------
+    #
+    # People worth asking for a referral. The matching surface is
+    # `company_slug`, not the display name: a lead says "Stripe" and the user
+    # typed "Stripe, Inc.", and only the reduced form brings the two together.
+    # It is computed on the way in rather than at every read, so a company
+    # renamed on the contact cannot silently stop matching.
+
+    OUTREACH_DRAFTED = "drafted"
+    OUTREACH_SENT = "sent"
+    OUTREACH_SKIPPED = "skipped"
+
+    def save_contact(self, contact):
+        """Create a contact, or update the one whose id is given.
+
+        Summary:
+            Insert or update one referral contact, deriving its match slug.
+
+        Parameters:
+            contact (dict): `name` and `company` are required. `id`, `email`,
+                `role`, `careers_url`, and `notes` are optional. An `id` that
+                is present and not None updates that row; its absence inserts.
+
+        Returns:
+            int: The contact's row id, whether inserted or updated.
+
+        Raises:
+            KeyError: If `name` or `company` is absent.
+            ValueError: If the company reduces to an empty match key, which
+                would match every lead with an unnamed company rather than
+                none of them.
+            sqlite3.Error: If the write or the commit fails.
+
+        Note:
+            Commits, because this is a direct user edit rather than part of a
+            batched pipeline pass - the surrounding methods that skip the
+            commit all belong to the ingest stages.
+
+            `last_checked_ts` and `archived` are deliberately not writable
+            here. They are state the app maintains, and letting an edit of the
+            name reset "what have I already seen" would silently repopulate the
+            morning list.
+        """
+        now = _now()
+        slug = company_slug(contact["company"])
+        if not slug:
+            raise ValueError(
+                "Company %r reduces to an empty match key." % (contact["company"],)
+            )
+        values = (
+            contact["name"].strip(),
+            (contact.get("email") or "").strip() or None,
+            contact["company"].strip(),
+            slug,
+            (contact.get("role") or "").strip() or None,
+            (contact.get("careers_url") or "").strip() or None,
+            (contact.get("notes") or "").strip() or None,
+        )
+        contact_id = contact.get("id")
+        if contact_id:
+            self.conn.execute(
+                """
+                UPDATE contacts
+                SET name = ?, email = ?, company = ?, company_slug = ?,
+                    role = ?, careers_url = ?, notes = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (*values, now, contact_id),
+            )
+        else:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO contacts (
+                    name, email, company, company_slug, role, careers_url,
+                    notes, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (*values, now, now),
+            )
+            contact_id = cursor.lastrowid
+        self.conn.commit()
+        return contact_id
+
+    def contact(self, contact_id):
+        """
+        Summary:
+            Fetch one contact by row id.
+
+        Parameters:
+            contact_id (int): The `contacts.id` to read.
+
+        Returns:
+            sqlite3.Row | None: The contact, or None when the id is unknown.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+        """
+        return self.conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (contact_id,)
+        ).fetchone()
+
+    def list_contacts(self, include_archived=False):
+        """
+        Summary:
+            List referral contacts, alphabetically by company then name.
+
+        Parameters:
+            include_archived (bool): True to include archived contacts.
+                Defaults to False, which is what the morning list wants.
+
+        Returns:
+            list[sqlite3.Row]: Matching contacts.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Ordered by company rather than by how recently they were added, so
+            two people at the same company sit together - the pair share every
+            match, and separating them would show the same postings twice in
+            two distant places on the page.
+        """
+        where = "" if include_archived else "WHERE archived = 0"
+        return self.conn.execute(
+            f"SELECT * FROM contacts {where} "
+            "ORDER BY company COLLATE NOCASE, name COLLATE NOCASE"
+        ).fetchall()
+
+    def set_contact_archived(self, contact_id, archived=True):
+        """
+        Summary:
+            Archive or restore a contact.
+
+        Parameters:
+            contact_id (int): The `contacts.id` to update.
+            archived (bool): True to archive, False to restore.
+
+        Raises:
+            sqlite3.Error: If the update or the commit fails.
+
+        Note:
+            Archiving rather than deleting, so the outreach history stays
+            meaningful. Deleting the person you asked in March would leave a
+            drafted email attached to nobody.
+        """
+        self.conn.execute(
+            "UPDATE contacts SET archived = ?, updated_at = ? WHERE id = ?",
+            (1 if archived else 0, _now(), contact_id),
+        )
+        self.conn.commit()
+
+    def delete_contact(self, contact_id):
+        """
+        Summary:
+            Delete a contact and every referral draft written for them.
+
+        Parameters:
+            contact_id (int): The `contacts.id` to remove.
+
+        Returns:
+            int: How many contact rows were deleted - 0 for an unknown id.
+
+        Raises:
+            sqlite3.Error: If either delete or the commit fails.
+
+        Note:
+            Takes the outreach rows with it, since they are meaningless without
+            the person. `set_contact_archived` is the non-destructive option
+            and the one the page offers by default.
+        """
+        self.conn.execute(
+            "DELETE FROM referral_outreach WHERE contact_id = ?", (contact_id,)
+        )
+        cursor = self.conn.execute(
+            "DELETE FROM contacts WHERE id = ?", (contact_id,)
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def mark_contact_checked(self, contact_id, ts=None):
+        """Record that the user has seen this contact's current matches.
+
+        Summary:
+            Stamp a contact's last-checked time.
+
+        Parameters:
+            contact_id (int): The `contacts.id` to stamp.
+            ts (int | None): Unix seconds to record. None uses now.
+
+        Raises:
+            sqlite3.Error: If the update or the commit fails.
+
+        Note:
+            This is what the "new" count is measured against, so it is the one
+            write on this table that changes what the badge says. A posting
+            advertised *after* this moment counts as new; everything at or
+            before it has been seen.
+        """
+        self.conn.execute(
+            "UPDATE contacts SET last_checked_ts = ?, updated_at = ? WHERE id = ?",
+            (int(ts if ts is not None else time.time()), _now(), contact_id),
+        )
+        self.conn.commit()
+
+    def record_outreach(self, contact_id, identity_key, subject, body,
+                        model=None):
+        """Store a drafted referral email, replacing any earlier draft.
+
+        Summary:
+            Save the referral email drafted for one contact about one role.
+
+        Parameters:
+            contact_id (int): Who the email is to.
+            identity_key (str): The role it is about. Keyed on identity rather
+                than on a lead id so the record survives the lead being
+                promoted to a real application.
+            subject (str): The drafted subject line.
+            body (str): The drafted body.
+            model (str | None): Which model wrote it.
+
+        Returns:
+            int: The `referral_outreach.id` of the stored draft.
+
+        Raises:
+            sqlite3.Error: If the write or the commit fails.
+
+        Note:
+            A redraft overwrites the text but **keeps the status and
+            `sent_at`**. Redrafting an email already marked sent must not make
+            the app forget it was sent - that would put the ask back on the
+            morning list and risk a duplicate message to a real person.
+        """
+        now = _now()
+        self.conn.execute(
+            """
+            INSERT INTO referral_outreach (
+                contact_id, identity_key, subject, body, model, status,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(contact_id, identity_key) DO UPDATE SET
+                subject = excluded.subject,
+                body = excluded.body,
+                model = excluded.model
+            """,
+            (contact_id, identity_key, subject, body, model,
+             self.OUTREACH_DRAFTED, now),
+        )
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT id FROM referral_outreach "
+            "WHERE contact_id = ? AND identity_key = ?",
+            (contact_id, identity_key),
+        ).fetchone()
+        return row["id"]
+
+    def outreach_for_contact(self, contact_id):
+        """
+        Summary:
+            Every referral draft written for one contact, keyed by role.
+
+        Parameters:
+            contact_id (int): The `contacts.id` to read.
+
+        Returns:
+            dict[str, sqlite3.Row]: Identity key to outreach row.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            A mapping rather than a list, because the page's question is always
+            "has this particular role been asked about", once per rendered row.
+        """
+        return {
+            row["identity_key"]: row
+            for row in self.conn.execute(
+                "SELECT * FROM referral_outreach WHERE contact_id = ?",
+                (contact_id,),
+            )
+        }
+
+    def set_outreach_status(self, outreach_id, status):
+        """
+        Summary:
+            Move a referral draft to a new status.
+
+        Parameters:
+            outreach_id (int): The `referral_outreach.id` to update.
+            status (str): `drafted`, `sent`, or `skipped`.
+
+        Raises:
+            ValueError: If the status is not one of the three.
+            sqlite3.Error: If the update or the commit fails.
+
+        Note:
+            Moving to `sent` stamps `sent_at`; moving away from it clears the
+            stamp, so an accidental click is fully reversible rather than
+            leaving a date behind that says an email went out when none did.
+        """
+        allowed = (self.OUTREACH_DRAFTED, self.OUTREACH_SENT,
+                   self.OUTREACH_SKIPPED)
+        if status not in allowed:
+            raise ValueError("Unknown outreach status: %r" % (status,))
+        self.conn.execute(
+            "UPDATE referral_outreach SET status = ?, sent_at = ? WHERE id = ?",
+            (status, _now() if status == self.OUTREACH_SENT else None,
+             outreach_id),
+        )
+        self.conn.commit()
 
     # --- cursors -----------------------------------------------------------
     #
