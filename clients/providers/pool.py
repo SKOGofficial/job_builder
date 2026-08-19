@@ -1101,3 +1101,32 @@ class ResearchTaskClient:
             TASKS[self.task].max_tokens,
             max_wait=self.max_wait,
         )
+
+    def find_openings(self, contact):
+        """
+        Summary:
+            Check one company for current openings through whichever provider
+            can take it.
+
+        Parameters:
+            contact (dict | sqlite3.Row): The contact whose employer to check.
+
+        Returns:
+            tuple: `(openings, input_tokens, output_tokens)`.
+
+        Raises:
+            ProviderBudgetExhausted: When every provider has spent its ceiling.
+            ProviderRateLimited: When no provider could take the call.
+
+        Note:
+            Projected at the task's declared `max_tokens` for the same reason
+            `research` is: there is no chat payload to measure, and the reply is
+            the expensive half.
+        """
+        return self.pool.call(
+            self.task,
+            SHAPE_RESEARCH,
+            lambda client: client.find_openings(contact),
+            TASKS[self.task].max_tokens,
+            max_wait=self.max_wait,
+        )
