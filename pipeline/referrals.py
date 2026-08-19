@@ -26,6 +26,7 @@ as well as from the page.
 import asyncio
 import logging
 import time
+from datetime import datetime
 
 from utilities.identity import company_slug, identity_key, identity_scheme
 from utilities.mailstore import LEAD_OPEN_STATUSES
@@ -138,6 +139,38 @@ def matches_for(mail, contacts=None):
     return results
 
 
+def lead_timestamp(lead):
+    """When a lead arrived, however the row can answer that.
+
+    Summary:
+        Read a lead's posting time, falling back to when it was recorded.
+
+    Parameters:
+        lead (Mapping): The lead to date.
+
+    Returns:
+        int | None: Epoch seconds, or None when the row can offer neither
+            date.
+
+    Note:
+        The same fallback `purge_stale_leads` applies, and for the same reason.
+        `posted_ts` is missing on leads written before it existed and on any
+        path that had no alert email to date them from; keying only on it would
+        make those rows permanently undateable. There they would be immortal;
+        here they would be permanently new, which is the badge equivalent.
+    """
+    posted = _value(lead, "posted_ts")
+    if posted:
+        return int(posted)
+    created = _value(lead, "created_at")
+    if not created:
+        return None
+    try:
+        return int(datetime.fromisoformat(created).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
 def is_new_for(contact, lead):
     """Whether a posting arrived after the user last looked at this contact.
 
@@ -146,7 +179,7 @@ def is_new_for(contact, lead):
 
     Parameters:
         contact (Mapping): The contact, carrying `last_checked_ts`.
-        lead (Mapping): The lead, carrying `posted_ts`.
+        lead (Mapping): The lead, carrying `posted_ts` or `created_at`.
 
     Returns:
         bool: True when the posting is newer than the last check.
@@ -154,17 +187,21 @@ def is_new_for(contact, lead):
     Note:
         A contact never checked has *every* match new, which is what makes the
         badge appear the moment a contact is added at a company that already
-        has openings. A lead with no posting date is treated as new for the
-        same reason: the freshness window means it cannot be old, and silently
-        hiding a posting is a worse failure than showing one twice.
+        has openings.
+
+        A lead that can offer no date at all is treated as new, because
+        silently hiding a posting is a worse failure than showing one twice.
+        That is the *last* resort rather than the behaviour for any undated
+        posting, though: a badge that cannot be cleared stops being read, and
+        then it hides everything.
     """
     checked = _value(contact, "last_checked_ts")
     if not checked:
         return True
-    posted = _value(lead, "posted_ts")
-    if not posted:
+    arrived = lead_timestamp(lead)
+    if arrived is None:
         return True
-    return posted > checked
+    return arrived > checked
 
 
 def new_match_count(mail):

@@ -33,6 +33,7 @@ NAV_TABS = [
 
 #: Everything else, reached from the drawer.
 DRAWER_ENTRIES = [
+    ("Referrals", "/referrals", "handshake"),
     ("Email matches", "/email-matches", "mark_email_unread"),
     ("Experiences", "/experiences", "format_list_bulleted"),
     ("Settings", "/settings", "settings"),
@@ -91,7 +92,7 @@ def pending_counts(state):
     because a badge query blew up would be a poor trade.
 
     Summary:
-        Compute the drawer badge count for email matches.
+        Compute the drawer badge counts for email matches and referrals.
 
     Parameters:
         state (AppState): The shared app state to query.
@@ -99,7 +100,9 @@ def pending_counts(state):
     Returns:
         dict[str, int]: Route path to count, for whichever queries succeeded.
             A route is absent from the dict rather than present at 0 if its
-            query failed.
+            query failed. Counts `/email-matches` (replies waiting on a
+            decision) and `/referrals` (postings at a contact's company that
+            arrived since it was last checked).
 
     Note:
         Every query is wrapped so a failure here cannot break page rendering;
@@ -117,6 +120,15 @@ def pending_counts(state):
         counts["/email-matches"] = len(state.store.pending_email_matches())
     except Exception:
         log.debug("Pending match count failed", exc_info=True)
+    try:
+        # Imported here rather than at module scope: `web/shell.py` is imported
+        # by every page, and the pipeline package should not be pulled in just
+        # to draw a header.
+        from pipeline.referrals import new_match_count
+
+        counts["/referrals"] = new_match_count(state.mail)
+    except Exception:
+        log.debug("Referral match count failed", exc_info=True)
     return counts
 
 
