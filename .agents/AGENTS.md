@@ -108,6 +108,11 @@ modules back into one file.
   - **`GroqRateLimited` is an *alias* of `ProviderRateLimited`, not a subclass.** Six
     pipeline modules catch it by name to stop a batch cleanly. Subclassing would mean those
     catches missed a second provider's 429 - the exact opposite of what is needed.
+  - **A task's `max_tokens` must cover the model's *thinking*, not just its answer.**
+    Gemini's flash models reason before replying and `maxOutputTokens` caps both together,
+    so a budget sized to the output arrives truncated mid-JSON and the parser returns its
+    empty fallback. `draft_referral` declares 2000 for a 200-token email for this reason;
+    measured, 700 was cut off after the subject line.
   - **`ProviderState` has one budget, cooldown and pacer per *provider*, not per client.**
     Gemini holds two clients because grounded research and JSON-mode classification cannot
     share a request body, but they spend one project quota.
@@ -118,6 +123,17 @@ modules back into one file.
   `generate`, `prepare`, `orchestrator`, `scheduler`, plus board parsers under
   `pipeline/parsers/` registered in its `__init__.py`. Nothing here imports a UI framework, so
   the whole pipeline runs from `cli.py` as well as the app.
+- `pipeline/referrals.py` and `pipeline/referral_email.py` serve `web/pages/referrals.py`.
+  They are not scheduler stages: matching runs at page load and costs nothing, and
+  `OpeningsChecker` runs only when the user presses a button. Three things there are
+  deliberate:
+  - **Matching is read-time, never stamped on a lead.** Contacts are added and edited after
+    leads arrive, and a flag written at lead creation would need a backfill on every edit.
+  - **`is_new_for` falls back from `posted_ts` to `created_at`**, the same fallback
+    `purge_stale_leads` uses. Undated rows are immortal there and would be permanently new
+    here, and a badge that cannot be cleared stops being read.
+  - **`score_bullet` picks the evidence, not the model** - the `cover_letter.py` rule, and
+    it matters more here, because the reader knows the applicant personally.
 - Schema lives in `utilities/schema.py` (current shape, `SCHEMA_VERSION`) and
   `utilities/migrations.py` (`PRAGMA user_version` gate, upgrade steps, pre-migration backup).
   `JobStore.init_db` delegates to them. `utilities/identity.py` owns the (title, company,

@@ -19,6 +19,7 @@ button and a `mailto:` link, and the send is yours.
 """
 
 import asyncio
+import json
 import logging
 import time
 from urllib.parse import quote
@@ -69,6 +70,35 @@ def posted_age(lead):
     if days == 1:
         return "yesterday"
     return f"{days} days ago"
+
+
+def stored_research(mail, identity_key):
+    """Whatever research already exists for a role, or nothing.
+
+    Summary:
+        Read the stored research payload for one identity.
+
+    Parameters:
+        mail (MailStore): The store to read from.
+        identity_key (str): The role to look up.
+
+    Returns:
+        dict: The payload, or an empty dict when the role has never been
+            researched or the stored JSON will not parse.
+
+    Note:
+        Absence is the normal case rather than an error. A lead only has
+        research once it has cleared the relevance gate and been prepared, and
+        a referral email is worth sending long before that - it just has one
+        less thing to say about the company.
+    """
+    row = mail.research_for(identity_key)
+    if row is None or not row["payload"]:
+        return {}
+    try:
+        return json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return {}
 
 
 def mailto_link(email, subject, body):
@@ -246,15 +276,7 @@ def referrals_page():
                 )
                 return
 
-            research_row = mail.research_for(lead["identity_key"])
-            research = {}
-            if research_row is not None and research_row["payload"]:
-                import json
-
-                try:
-                    research = json.loads(research_row["payload"])
-                except ValueError:
-                    research = {}
+            research = stored_research(mail, lead["identity_key"])
 
             profile_text = RelevanceScorer(store, mail).profile_text()
             bullets = supporting_bullets(mail.list_experiences(), lead, research)

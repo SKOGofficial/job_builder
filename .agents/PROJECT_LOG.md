@@ -2,6 +2,79 @@
 
 Use this file to record meaningful project changes, implementation decisions, and verification notes.
 
+## 2026-08-19 - Referral contacts, and the morning list of who to ask
+
+The tracker knew about a thousand postings and nothing about the five people who could
+get an application read. This adds the missing side: who you know, where they work, and
+what their employers are advertising right now.
+
+Two new tables, `contacts` and `referral_outreach`. Neither needed a migration - whole
+tables are created by `create_tables` on every `initialise`, before the version gate - so
+`SCHEMA_VERSION` stays at 6. `company_slug` is stored on the contact rather than derived
+per query, because it is the join key: a lead says "Capital One" and the user types
+"Capital One, Inc.".
+
+Cost is the axis the design is built on:
+
+- **Matching is free** and runs on every page render. One `list_leads` call, bucketed by
+  slug in Python, joined to contacts. Read-time rather than stamped onto a lead at
+  creation, because the first thing anyone does here is add five contacts and expect to
+  see the postings already in the list.
+- **`Check now` spends a grounded search**, for one company, only when pressed. New
+  `check_openings` task on the same chain as `research`, with `find_openings` added to
+  both research clients (their `_call` takes an optional system prompt now; the injected
+  `caller` still takes the prompt alone, so no test double changed). What it finds becomes
+  an ordinary lead tagged `board=careers-check`, inheriting scoring, research and document
+  generation. Openings with no URL are dropped by the parser: these come from a model
+  reading the web rather than from mail the user received, and a role that cannot be
+  verified is not one to spend a real favour on.
+- **Drafting** follows `cover_letter.py`'s rule - `score_bullet` picks the supporting
+  evidence before the model sees anything. The stakes are higher here than for a covering
+  letter: an invented project lands in front of someone who knows the applicant.
+
+Nothing is sent by the app. Gmail stays `gmail.readonly`; a draft gets a copy button and a
+`mailto:` link.
+
+Three bugs found while verifying, all real:
+
+- **The badge could never clear for an undated lead.** `is_new_for` keyed only on
+  `posted_ts`, which is absent on rows written before it existed. Now falls back to
+  `created_at`, the same fallback `purge_stale_leads` uses - undated rows are immortal
+  there and were permanently new here.
+- **A task's token budget has to cover the model's thinking.** `draft_referral` at 700
+  tokens returned JSON truncated after the subject line: `gemini-3.6-flash` reasons before
+  answering and `maxOutputTokens` caps both together. Raised to 2000 and documented in
+  `routing.py` and `AGENTS.md`. **`write_cover_letter` at 1200 may have the same problem
+  and was left alone** - it is existing behaviour and changing it is a separate decision.
+- **The page tests would have made live billed calls.** Pressing `Check now` under test
+  reached the real pool, and the developer machine has real keys in `.env`. The referral
+  page tests now install a stub pool on `state._pool`.
+
+Verification:
+
+- 669 tests pass, up from 623. New `tests/test_referrals.py` (39) covers contact storage,
+  slug matching across differently-written company names, the new/checked boundary
+  including both date fallbacks, openings parsing (fenced, prose-wrapped, unlinked,
+  garbage), the checker's dedupe and already-applied guards, and the draft prompt and
+  parser. Seven page tests in `test_web_pages.py` cover the route end to end.
+- Exercised by hand against a `VACUUM INTO` copy of the real database, never the database
+  itself. A contact entered as "Capital One, Inc." matched all 11 open Capital One leads;
+  `Mark checked` cleared the count and the drawer badge; a real draft came back complete
+  after the budget fix, citing only stored bullets and inventing no relationship for a
+  contact with no notes. Checked in both themes.
+
+Noted while verifying, not changed:
+
+- **`GROQ_MODEL=llama-3.3-70b-versatile` in `.env` is decommissioned** - Groq returns HTTP
+  404 for every request. Groq is the primary for `route_email`, `extract_alert`,
+  `extract_update`, `extract_acknowledgement`, `score_relevance` and `classify_reply`, so
+  all of those are currently falling through to Gemini.
+- **An HTTP 503 does not fail over.** `ProviderPool.call` fails over on rate limits,
+  budget exhaustion and misconfiguration, but a 503 raises `RuntimeError` and stops there.
+  Gemini returned 503 repeatedly during verification and the Groq fallback was never
+  tried. Changing this alters failover semantics for every task, so it is left as a
+  finding.
+
 ## 2026-08-17 - Rule classification, no review queue, and a fresh to-apply list
 
 Measured first. The review queue held 312 messages, and 265 of them - 85% - were

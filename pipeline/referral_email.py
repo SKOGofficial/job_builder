@@ -19,6 +19,7 @@ produces text; the send is the user's, from their own mail client.
 import json
 import logging
 
+from clients.providers.routing import TASKS
 from pipeline.generate import score_bullet
 from pipeline.relevance import MAX_PROFILE_CHARS
 
@@ -30,7 +31,9 @@ log = logging.getLogger(__name__)
 SUPPORTING_BULLETS = 3
 
 #: Words. A referral ask that runs long is asking for the reader's time before
-#: it has asked for anything else.
+#: it has asked for anything else. Unrelated to the task's token budget in
+#: `routing.py`, which has to be far larger because a thinking model spends the
+#: same ceiling on its reasoning.
 MAX_WORDS = 150
 
 EMPTY_DRAFT = {"subject": "", "body": ""}
@@ -229,4 +232,5 @@ def draft_referral(client, profile_text, contact, lead, bullets,
         {"role": "user", "content": build_prompt(profile_text, contact, lead,
                                                  bullets, research)},
     ]
-    return client.complete_json(messages, parse_draft, dict(EMPTY_DRAFT), 700)
+    return client.complete_json(messages, parse_draft, dict(EMPTY_DRAFT),
+                                TASKS["draft_referral"].max_tokens)

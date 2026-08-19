@@ -48,8 +48,12 @@ first on their own.
   See "The ingest pipeline" below.
 - Company research and tailored resume/CV generation for leads, using Gemini with Google
   Search grounding and falling back to Claude. See "Research and resume generation" below.
+- Referral tracking: store the people you know and where they work, see what their
+  employers are advertising each morning, and draft the email asking for a referral.
+  See "Referrals" below.
 - Dark and light mode with a restrained, color-blind-friendly palette.
 - Hamburger menu with:
+  - Referrals
   - Settings, including Gmail connect and disconnect
   - Email matches
   - Profile
@@ -354,6 +358,37 @@ than LaTeX because it is a single static binary instead of a multi-gigabyte inst
 This needs structured experience bullets rather than the free-text resume field - a resume
 cannot be tailored from a prose blob. Add them on the Resume page.
 
+## Referrals
+
+A referral is the highest-value thing in the pipeline and the shortest-lived. This page is
+the morning sweep: the people you know, their employers, and what those employers are
+advertising right now.
+
+**Matching is free.** Leads already arrive from board alerts, so the page groups them by
+company and joins to your contacts on every render. Nothing is scheduled and nothing is
+spent. It reduces both sides with `utilities/identity.py`'s `company_slug`, so the company
+as you typed it and the company as the board wrote it still meet.
+
+A posting counts as **new** when it was advertised after you last checked that contact.
+`Mark checked` stamps the contact and clears its badge; the roles stay listed, because they
+are still open and still worth asking about.
+
+**`Check now` costs money.** It searches one company's careers page with the grounded
+`check_openings` task, and runs only when you press it - never on a timer, because the
+mailbox usually answers the same question for nothing. Openings it finds become ordinary
+leads tagged `board=careers-check`, so they pick up relevance scoring, research, and a
+tailored resume like anything else, and their provenance stays visible on the card. An
+opening the model cannot produce a link for is discarded rather than listed.
+
+**Drafting.** `Draft referral email` writes the ask. The supporting experience is chosen by
+`score_bullet` before the model sees anything - the same function that orders a resume - so
+the email cannot credit you with a project you never worked on in front of someone who
+knows you. The note you store about how you know the contact is the only thing it may say
+about your relationship; leave it blank and the prompt tells the model to say nothing.
+
+**Nothing is sent by the app.** Gmail is still `gmail.readonly`. A draft opens in a dialog,
+editable, with a copy button and a `mailto:` link. You send it.
+
 ## Tests
 
 ```powershell
@@ -431,6 +466,11 @@ key than the tracking wrapper around it.
 - `job_leads` - the to-apply list, unique on `identity_key`.
 - `job_research`, `job_artifacts` - research payloads and generated files, both keyed on
   `identity_key` so they survive a lead being promoted.
+- `contacts` - people worth asking for a referral. `company_slug` is the match key, so
+  "Stripe, Inc." on a contact meets "Stripe" on a lead; `last_checked_ts` is what "new
+  since you last looked" is measured against.
+- `referral_outreach` - referral emails drafted per contact and role, unique on the pair
+  and keyed on `identity_key` for the same reason `job_research` is.
 - `experiences` - structured resume bullets with tags.
 - `sender_denylist` - domains you have marked as never job related.
 - `profile` - key/value store for profile text, settings, and sync cursors.

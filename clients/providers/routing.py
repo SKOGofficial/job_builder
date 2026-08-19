@@ -102,8 +102,14 @@ TASKS = {
     # output a real person reads in the applicant's own voice. Groq rather than
     # Anthropic behind it, because Claude is registered for SHAPE_RESEARCH only
     # and a chain naming it here would be unroutable.
+    # 2000 for an email of about 200 tokens, and the gap is not slack. Gemini's
+    # flash models think before they answer, and `maxOutputTokens` is the
+    # ceiling on thinking *and* answer together - so a budget sized to the
+    # email is spent reasoning about it, and the reply arrives truncated
+    # mid-JSON. Measured: 700 cut off after the subject line; 2500 completed
+    # with room to spare.
     "draft_referral": Task(
-        "Draft a referral request", SHAPE_JSON, 700, ("gemini", "groq"),
+        "Draft a referral request", SHAPE_JSON, 2000, ("gemini", "groq"),
         "Writes the short email asking someone you know to refer you for a "
         "specific opening at their company.",
     ),
