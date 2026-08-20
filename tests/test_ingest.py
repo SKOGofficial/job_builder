@@ -14,7 +14,11 @@ import asyncio
 import unittest
 from unittest import mock
 
-from clients.gmail_client import GmailHistoryExpired
+from clients.gmail_client import (
+    GmailHistoryExpired,
+    GmailMessageGone,
+    list_history,
+)
 from pipeline.parsers import indeed, linkedin, parse_alert, parser_for
 from pipeline.parsers.base import split_company_location, strip_tags
 from pipeline.router import build_router_messages, parse_route
@@ -133,6 +137,34 @@ class TestIncrementalSync(unittest.TestCase):
         self.assertTrue(mail.has_message("good"))
         self.assertFalse(mail.has_message("bad"), "retried on the next run")
 
+    def test_a_deleted_message_is_skipped_without_a_traceback(self):
+        """Mail deleted between the history page and the fetch is routine.
+
+        Spam auto-purges and people clear a morning of digests by hand, so this
+        is an expected outcome rather than a failure, and it must not abort the
+        pass or fill the log with tracebacks.
+        """
+        store, mail = make_mail()
+        mail.set_cursor(CURSOR_HISTORY_ID, "1000")
+
+        def flaky(message_id, creds):
+            if message_id == "deleted":
+                raise GmailMessageGone("gone")
+            return header(message_id)
+
+        with mock.patch("pipeline.sync.gmail_client") as gmail:
+            gmail.list_history.return_value = (["deleted", "good"], "1100")
+            gmail.get_message_headers.side_effect = flaky
+            sync = MailboxSync(mail, executor=immediate,
+                               credential_loader=lambda: "creds")
+            stored = asyncio.run(sync.run())
+
+        self.assertEqual(stored, 1)
+        self.assertTrue(mail.has_message("good"))
+        self.assertFalse(mail.has_message("deleted"))
+        # The cursor still advances, so the deleted id is never asked for again.
+        self.assertEqual(mail.get_cursor(CURSOR_HISTORY_ID), "1100")
+
     def test_no_credentials_is_reported_not_raised(self):
         store, mail = make_mail()
 
@@ -176,6 +208,115 @@ class TestBodyFetcher(unittest.TestCase):
 
         self.assertEqual(mail.message("m1")["body_text"], "")
         self.assertEqual(len(mail.messages_awaiting_body()), 0)
+
+    def test_a_deleted_message_leaves_the_queue(self):
+        """The loop this closes: `messages_awaiting_body` selects on
+        `body_text IS NULL` alone, so a row skipped on a fetch failure comes
+        back every cycle for ever, spending an API call each time to be told
+        again that the message is gone.
+        """
+        store, mail = make_mail()
+        mail.upsert_message(header("m1"))
+        mail.set_filter_verdict("m1", VERDICT_PASSED)
+        mail.commit()
+
+        with mock.patch("pipeline.sync.gmail_client") as gmail:
+            gmail.get_message_body.side_effect = GmailMessageGone("gone")
+            fetched = asyncio.run(BodyFetcher(
+                mail, executor=immediate, credential_loader=lambda: "c").run())
+
+        self.assertEqual(fetched, 0)
+        self.assertEqual(mail.message("m1")["body_text"], "")
+        self.assertEqual(len(mail.messages_awaiting_body()), 0)
+
+    def test_an_unexpected_failure_is_still_retried(self):
+        """Only a confirmed deletion is written off; anything else comes back."""
+        store, mail = make_mail()
+        mail.upsert_message(header("m1"))
+        mail.set_filter_verdict("m1", VERDICT_PASSED)
+        mail.commit()
+
+        with mock.patch("pipeline.sync.gmail_client") as gmail:
+            gmail.get_message_body.side_effect = RuntimeError("Gmail is down")
+            asyncio.run(BodyFetcher(mail, executor=immediate,
+                                    credential_loader=lambda: "c").run())
+
+        self.assertIsNone(mail.message("m1")["body_text"])
+        self.assertEqual(len(mail.messages_awaiting_body()), 1)
+
+
+class TestHistoryDeletions(unittest.TestCase):
+    """`list_history` has to subtract what it is told was deleted.
+
+    Without this the caller is handed ids Gmail has already reported gone, and
+    every one becomes a failed fetch.
+    """
+
+    def build(self, pages):
+        """A fake Gmail service returning canned history pages."""
+        calls = {"n": 0}
+
+        class Execute:
+            def execute(self_inner):
+                page = pages[calls["n"]]
+                calls["n"] += 1
+                return page
+
+        class History:
+            def list(self_inner, **kwargs):
+                return Execute()
+
+        class Users:
+            def history(self_inner):
+                return History()
+
+        service = mock.Mock()
+        service.users.return_value = Users()
+        return service
+
+    def run_history(self, pages):
+        with mock.patch("clients.gmail_client._service",
+                        return_value=self.build(pages)):
+            return list_history("1000", creds="c")
+
+    def test_a_message_added_then_deleted_is_dropped(self):
+        ids, cursor = self.run_history([{
+            "history": [
+                {"messagesAdded": [{"message": {"id": "kept"}}]},
+                {"messagesAdded": [{"message": {"id": "purged"}}]},
+                {"messagesDeleted": [{"message": {"id": "purged"}}]},
+            ],
+            "historyId": "1100",
+        }])
+        self.assertEqual(ids, ["kept"])
+        self.assertEqual(cursor, "1100")
+
+    def test_a_deletion_on_a_later_page_still_counts(self):
+        ids, _ = self.run_history([
+            {"history": [{"messagesAdded": [{"message": {"id": "purged"}}]},
+                         {"messagesAdded": [{"message": {"id": "kept"}}]}],
+             "historyId": "1050", "nextPageToken": "p2"},
+            {"history": [{"messagesDeleted": [{"message": {"id": "purged"}}]}],
+             "historyId": "1100"},
+        ])
+        self.assertEqual(ids, ["kept"])
+
+    def test_duplicates_across_pages_are_collapsed(self):
+        ids, _ = self.run_history([
+            {"history": [{"messagesAdded": [{"message": {"id": "m1"}}]}],
+             "historyId": "1050", "nextPageToken": "p2"},
+            {"history": [{"messagesAdded": [{"message": {"id": "m1"}}]}],
+             "historyId": "1100"},
+        ])
+        self.assertEqual(ids, ["m1"])
+
+    def test_a_deletion_for_something_never_added_is_harmless(self):
+        ids, _ = self.run_history([{
+            "history": [{"messagesDeleted": [{"message": {"id": "old"}}]},
+                        {"messagesAdded": [{"message": {"id": "new"}}]}],
+            "historyId": "1100",
+        }])
+        self.assertEqual(ids, ["new"])
 
 
 class TestRouterParsing(unittest.TestCase):

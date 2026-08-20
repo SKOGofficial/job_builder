@@ -24,7 +24,7 @@ import logging
 from datetime import date, timedelta
 
 from clients import gmail_client
-from clients.gmail_client import GmailHistoryExpired
+from clients.gmail_client import GmailHistoryExpired, GmailMessageGone
 
 log = logging.getLogger(__name__)
 
@@ -123,20 +123,33 @@ class MailboxSync:
         if max_messages:
             unseen = unseen[:max_messages]
 
-        stored = 0
+        stored = gone = 0
         for message_id in unseen:
             try:
                 header = await self.executor(
                     gmail_client.get_message_headers, message_id, creds)
+            except GmailMessageGone:
+                # Routine, so no traceback: the message was deleted between
+                # Gmail listing it and this fetch. `list_history` already drops
+                # the deletions it can see, and this is the remainder of that
+                # race. Nothing to store and nothing to retry - the history
+                # cursor moves past it either way.
+                gone += 1
+                continue
             except Exception:
-                # One unreadable message must not abort the pass; it will be
-                # retried on the next run because it never got stored.
+                # One unreadable message must not abort the pass. This one is
+                # worth a traceback, because unlike a deletion it is not
+                # expected, and the message stays unstored so a later run
+                # picks it up again.
                 log.warning("Could not fetch headers for %s", message_id,
                             exc_info=True)
                 continue
             if self.mail.upsert_message(header):
                 stored += 1
         self.mail.commit()
+        if gone:
+            log.info("%d message(s) were deleted before they could be "
+                     "mirrored", gone)
         return stored
 
     def _stamp(self):
@@ -169,13 +182,27 @@ class BodyFetcher:
                 log.warning("Body fetch skipped: %s", exc)
                 return 0
 
-        fetched = 0
+        fetched = gone = 0
         for row in pending:
             message_id = row["gmail_message_id"]
             try:
                 payload = await self.executor(
                     gmail_client.get_message_body, message_id, creds)
+            except GmailMessageGone:
+                # The message was mirrored and has since been deleted, so the
+                # body is never coming. Store an empty one rather than skipping.
+                #
+                # Skipping would be a permanent loop: `messages_awaiting_body`
+                # selects on `body_text IS NULL` alone, so a row left NULL comes
+                # back on every cycle for ever, spending an API call each time
+                # to be told again that the message is gone. Same reasoning as
+                # the empty-body case below - it is the NULL that has to go.
+                self.mail.store_body(message_id, "", row["snippet"])
+                gone += 1
+                continue
             except Exception:
+                # Not expected, so it keeps its traceback, and the row is left
+                # NULL deliberately: this one really should be retried.
                 log.warning("Could not fetch body for %s", message_id,
                             exc_info=True)
                 continue
@@ -186,4 +213,7 @@ class BodyFetcher:
             fetched += 1
         self.mail.commit()
         log.info("Fetched %d message bod%s", fetched, "y" if fetched == 1 else "ies")
+        if gone:
+            log.info("%d mirrored message(s) have since been deleted; stored "
+                     "an empty body so they are not re-fetched", gone)
         return fetched
