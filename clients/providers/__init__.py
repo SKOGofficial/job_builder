@@ -20,6 +20,7 @@ from clients.providers.base import (
     ProviderBudgetExhausted,
     ProviderNotConfigured,
     ProviderRateLimited,
+    ProviderRequestTooLarge,
     estimate_tokens,
     retry_after_seconds,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "ProviderBudgetExhausted",
     "ProviderNotConfigured",
     "ProviderRateLimited",
+    "ProviderRequestTooLarge",
     "estimate_tokens",
     "provider_module",
     "retry_after_seconds",

@@ -19,9 +19,10 @@ from clients.gmail_client import (
     GmailMessageGone,
     list_history,
 )
+from clients.llm_client import GroqRateLimited
 from pipeline.parsers import indeed, linkedin, parse_alert, parser_for
 from pipeline.parsers.base import split_company_location, strip_tags
-from pipeline.router import build_router_messages, parse_route
+from pipeline.router import MessageRouter, build_router_messages, parse_route
 from pipeline.sync import CURSOR_HISTORY_ID, BodyFetcher, MailboxSync
 from utilities.mailstore import (
     CATEGORY_ALERT,
@@ -398,6 +399,73 @@ class TestHistoryDeletions(unittest.TestCase):
             "historyId": "1100",
         }])
         self.assertEqual(ids, ["new"])
+
+
+class TestRouterKeepsGoing(unittest.TestCase):
+    """One unclassifiable message must not stop the queue behind it.
+
+    This was real: a single June email whose payload no provider would take sat
+    at the head of the queue and left 187 messages behind it unclassified,
+    every cycle, for weeks. A rate limit still stops the pass - that one really
+    does apply to everything behind it - but nothing else should.
+    """
+
+    def prepare(self, mail, count):
+        for index in range(count):
+            message_id = "m%d" % index
+            mail.upsert_message(header(message_id, subject="s%d" % index))
+            mail.set_filter_verdict(message_id, VERDICT_PASSED)
+            mail.store_body(message_id, "body %d" % index)
+        mail.commit()
+
+    def test_a_failing_message_is_skipped_not_fatal(self):
+        store, mail = make_mail()
+        self.prepare(mail, 3)
+
+        class Breaks:
+            """Fails on the first message it is given, then behaves."""
+
+            last_model = "test-model"
+
+            def __init__(self):
+                self.calls = 0
+
+            def complete_json(self, messages, parser, fallback, max_tokens=200):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("Groq returned HTTP 413")
+                return {"label": CATEGORY_IRRELEVANT, "confidence": 0.9,
+                        "reason": "not job related"}
+
+        client = Breaks()
+        router = MessageRouter(mail, client_factory=lambda: client)
+        asyncio.run(router.run(limit=10))
+
+        self.assertEqual(client.calls, 3, "every message must be attempted")
+        classified = [mail.message("m%d" % i)["category"] for i in range(3)]
+        self.assertEqual(classified.count(None), 1, "only the bad one is left")
+        self.assertEqual(classified.count(CATEGORY_IRRELEVANT), 2)
+
+    def test_a_rate_limit_still_stops_the_pass(self):
+        """The one failure that genuinely applies to every message behind it."""
+        store, mail = make_mail()
+        self.prepare(mail, 3)
+
+        class Limited:
+            last_model = "test-model"
+
+            def __init__(self):
+                self.calls = 0
+
+            def complete_json(self, messages, parser, fallback, max_tokens=200):
+                self.calls += 1
+                raise GroqRateLimited("slow down", retry_after=30)
+
+        client = Limited()
+        router = MessageRouter(mail, client_factory=lambda: client)
+        asyncio.run(router.run(limit=10))
+
+        self.assertEqual(client.calls, 1, "a rate limit ends the pass")
 
 
 class TestPrunedBodiesStayOut(unittest.TestCase):

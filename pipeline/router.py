@@ -270,6 +270,7 @@ class MessageRouter:
                         "model and none is configured: %s", exc)
             return
 
+        failed = 0
         for payload in payloads:
             try:
                 result = await self._call(client, payload)
@@ -278,11 +279,31 @@ class MessageRouter:
                          "retry in about %ss", self.processed, exc.retry_after)
                 break
             except Exception:
-                log.exception("Router failed on %s", payload["gmail_message_id"])
-                break
+                # `continue`, not `break`. A failure that is specific to one
+                # message - a payload no provider will take, a malformed body -
+                # used to end the whole pass, so that message sat at the head
+                # of the queue and every message behind it stayed unclassified
+                # for as long as it took to notice. One email from June blocked
+                # 187 others this way. Whatever is wrong with this one, it is
+                # not a reason to stop reading the others.
+                #
+                # A rate limit is still `break` above, because that one really
+                # does apply to every message behind it.
+                log.exception("Router failed on %s; skipping it and "
+                              "continuing", payload["gmail_message_id"])
+                failed += 1
+                continue
 
             # `getattr` rather than an attribute access: every test double is
             # a bare stub with no such attribute, and NULL is exactly right
             # for one of those.
             self._record(payload, result, getattr(client, "last_model", None),
                          counts)
+
+        if failed:
+            # Said plainly rather than left to the tracebacks above. These
+            # messages are still unclassified and will be tried again next
+            # cycle; the count is what makes a permanent failure visible as a
+            # number that does not go down.
+            log.warning("%d message(s) could not be classified this pass and "
+                        "remain unclassified", failed)

@@ -113,6 +113,12 @@ modules back into one file.
     so a budget sized to the output arrives truncated mid-JSON and the parser returns its
     empty fallback. `draft_referral` declares 2000 for a 200-token email for this reason;
     measured, 700 was cut off after the subject line.
+  - **`ProviderRequestTooLarge` fails over; it never cools a provider down.** It means
+    "this payload is too big for me", not "I am unavailable", and the next message may be a
+    tenth the size. It is an *alias target* for `GroqRequestTooLarge` under the same rule as
+    `GroqRateLimited`, and it is deliberately **not** a rate limit: Groq sends HTTP 413 both
+    for a payload the model will not take and for a request whose prompt plus `max_tokens`
+    exceeds the whole per-minute token allowance, and neither improves by waiting.
   - **`ProviderState` has one budget, cooldown and pacer per *provider*, not per client.**
     Gemini holds two clients because grounded research and JSON-mode classification cannot
     share a request body, but they spend one project quota.
@@ -164,6 +170,15 @@ simpler version and are not:
   A fetch that fails must therefore either write the timestamp or leave the row genuinely
   retryable - `GmailMessageGone` writes an empty body for exactly this reason, and any
   other error deliberately does not.
+
+## Pipeline Stage Rule
+
+**A failure specific to one item may never end the pass.** `break` in a stage loop is
+reserved for conditions that genuinely apply to everything behind it - a rate limit, an
+exhausted budget. Anything else is `continue`, because the alternative is a head-of-line
+block: the bad item returns to the front of the queue next cycle and stops the same work
+again, indefinitely and silently. The router had exactly this, and one email from June left
+187 messages unclassified for weeks.
 
 ## Concurrency Contract
 

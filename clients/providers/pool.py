@@ -37,6 +37,7 @@ from clients.providers.base import (
     ProviderBudgetExhausted,
     ProviderNotConfigured,
     ProviderRateLimited,
+    ProviderRequestTooLarge,
     estimate_tokens,
 )
 from clients.providers.budget import Budget, BudgetLedger
@@ -747,6 +748,12 @@ class ProviderPool:
                 of them frees up, so the handler's log line stays useful.
             ProviderBudgetExhausted: When every provider that could serve a
                 research task has spent its ceiling.
+
+        Note:
+            `ProviderRequestTooLarge` is a failover trigger rather than an
+            error, and deliberately does not cool the provider down. It says
+            "this payload is too big for me", not "I am unavailable", and the
+            very next message may be a tenth the size.
         """
         budget_s = self.sleep_budget(max_wait)
         now = self._clock()
@@ -769,6 +776,17 @@ class ProviderPool:
                             model=self._model_of(state, shape))
                 blocked.append((state.name, "spend ceiling reached", 0.0))
                 exhausted = exc
+                continue
+            except ProviderRequestTooLarge as exc:
+                # This payload, not this provider. No cooldown and no client
+                # removed: the next message may be a tenth the size and this
+                # provider is the right one for it. Just move along the chain,
+                # which is the one thing that can actually serve the request -
+                # the fallback usually has a far larger allowance.
+                state.last_error = str(exc)
+                self.record(state.name, task, "error",
+                            model=self._model_of(state, shape))
+                blocked.append((state.name, "request too large", 0.0))
                 continue
             except ProviderNotConfigured as exc:
                 state.clients.pop(shape, None)

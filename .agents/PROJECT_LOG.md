@@ -2,6 +2,60 @@
 
 Use this file to record meaningful project changes, implementation decisions, and verification notes.
 
+## 2026-08-19 - Groq 413s, and the head-of-line block behind them
+
+Reported as `HTTP 413 Request Entity Too Large` from Groq on two stages. The prompts were
+not the problem and were not touched: the router already caps a body at 2,000 characters
+and alert extraction at 6,000, and the two requests that failed were 3.7 KB and 7.3 KB -
+roughly 1,000 and 2,000 tokens.
+
+Reproduced against the API with the exact stored payloads. `groq/compound` returns 413 for
+the 7.3 KB request while accepting a 10-character one, and `openai/gpt-oss-20b` and
+`openai/gpt-oss-120b` both serve the identical payload in about a second, parse cleanly
+through this project's own `parse_route` and `parse_extraction`, and return the correct
+postings. `groq/compound` is an agentic system routed over `openai/gpt-oss-120b` - its
+advertised 131k context does not describe what it will accept in one request. The model in
+`.env` is a configuration matter and was left to the user.
+
+The useful finding was what the 413 exposed in the pipeline. Two things, both worse than
+the error itself:
+
+- **The router stopped the whole pass on any unexpected error.** `except Exception: break`.
+  So one message whose payload no provider would take sat at the head of the queue and
+  every message behind it stayed unclassified - measured at the time: 188 messages backed
+  up behind a single email from 2 June. Now `continue`, with a count logged; a rate limit
+  is still `break`, because that one really does apply to everything behind it.
+- **A 413 did not fail over.** `ProviderPool.call` fails over on a rate limit, an exhausted
+  budget and a misconfiguration, but a 413 arrived as a bare `RuntimeError` and stopped the
+  call dead - with Gemini sitting behind it in the chain, with room to spare. Now raised as
+  `ProviderRequestTooLarge` and treated as grounds to try the next provider. It
+  deliberately does **not** cool the provider down: the payload was too big, the provider
+  is fine, and the next message may be a tenth the size.
+
+Measured while diagnosing, and worth recording because it decides whether the prompt caps
+need to change - they do not:
+
+- Every task's worst case fits under the 8,000 tokens-per-minute ceiling these models
+  report. Alert extraction is the largest at roughly 1,800 prompt tokens plus 1,500
+  completion, about 3,300 of 8,000.
+- Both `gpt-oss` models returned `completion_tokens` exactly equal to `max_tokens` on the
+  extraction call. They reason before answering, so the reply fit with nothing to spare -
+  the same trap `draft_referral` hit on Gemini. A digest carrying many more postings could
+  truncate. Left alone, since raising it is a judgement about spend.
+- `TOKENS_PER_MINUTE` in `providers/base.py` defaults to 12,000 while these models report
+  8,000, so the pacer will overshoot until `GROQ_TOKENS_PER_MINUTE` is set.
+
+Verification:
+
+- 689 tests pass, up from 682. Five new in `test_provider_pool.py` covering the failover,
+  the absence of a cooldown, the client surviving, and the exception not being a rate
+  limit; two new in `test_ingest.py` covering the router skipping a bad message and still
+  stopping on a rate limit.
+- Each was run against the unfixed code and confirmed to fail there. The first attempt at
+  that check was itself wrong - the revert matched an earlier `ProviderNotConfigured` and
+  duplicated code instead of removing the handler, so the tests passed and appeared to
+  prove nothing was being tested. Redone precisely, three of the five fail as they should.
+
 ## 2026-08-19 - Gmail 404s, and two quieter bugs behind them
 
 Started from repeated warnings in the log: `HttpError 404` fetching headers for two message

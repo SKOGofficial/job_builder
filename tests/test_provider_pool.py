@@ -16,6 +16,7 @@ from clients.providers.base import (
     ProviderBudgetExhausted,
     ProviderNotConfigured,
     ProviderRateLimited,
+    ProviderRequestTooLarge,
 )
 from clients.providers.budget import Budget
 from clients.providers.pool import LOOP_MAX_WAIT, THREAD_MAX_WAIT, ProviderPool
@@ -298,6 +299,78 @@ class FailoverTests(PoolFixture):
                                          results=["only-one-left"]), "Gemini"),
         })
         self.assertEqual(self.call(pool), "only-one-left")
+
+
+class RequestTooLargeTests(PoolFixture):
+    """A payload one provider will not take is what a fallback chain is for.
+
+    Groq answers HTTP 413 both for a payload larger than the model accepts and
+    for a request whose prompt plus `max_tokens` exceeds the account's whole
+    per-minute token allowance. Neither improves by waiting, and both were
+    previously a bare RuntimeError that stopped the call dead - with a provider
+    sitting right behind it that had room to spare.
+    """
+
+    def test_an_oversized_request_moves_to_the_next_provider(self):
+        pool = self.two_providers(
+            groq_error=ProviderRequestTooLarge("Request Entity Too Large"))
+        self.gemini.results = ["took it"]
+
+        client = pool.for_task("route_email", max_wait=THREAD_MAX_WAIT)
+        result = client.complete_json([{"role": "user", "content": "x"}],
+                                      lambda t: t, "fallback")
+
+        self.assertEqual(result, "took it")
+        self.assertEqual(self.groq.calls, 1)
+        self.assertEqual(self.gemini.calls, 1)
+
+    def test_it_does_not_cool_the_provider_down(self):
+        """It is the payload that was too big, not the provider that is unwell.
+
+        Cooling Groq off here would send every following message - most of them
+        a tenth the size - to the fallback for no reason.
+        """
+        pool = self.two_providers(
+            groq_error=ProviderRequestTooLarge("too large"))
+        self.gemini.results = ["took it"]
+        client = pool.for_task("route_email", max_wait=THREAD_MAX_WAIT)
+        client.complete_json([{"role": "user", "content": "x"}],
+                             lambda t: t, "f")
+
+        self.assertFalse(pool.providers["groq"].cooling_down(self.now))
+        self.assertEqual(pool.next_available_in(), 0)
+
+    def test_the_client_is_kept_for_the_next_message(self):
+        """Unlike a misconfiguration, this says nothing about the client."""
+        pool = self.two_providers(
+            groq_error=ProviderRequestTooLarge("too large"))
+        self.gemini.results = ["a", "b"]
+        client = pool.for_task("route_email", max_wait=THREAD_MAX_WAIT)
+        client.complete_json([{"role": "user", "content": "x"}],
+                             lambda t: t, "f")
+
+        self.assertIsNotNone(pool.providers["groq"].client_for(SHAPE_JSON))
+
+    def test_it_is_not_mistaken_for_a_rate_limit(self):
+        """A rate limit pauses the batch; this one must not.
+
+        Collapsing the two would make the pipeline wait out a retry_after for
+        a condition that never clears.
+        """
+        self.assertFalse(issubclass(ProviderRequestTooLarge,
+                                    ProviderRateLimited))
+        self.assertFalse(issubclass(ProviderRateLimited,
+                                    ProviderRequestTooLarge))
+
+    def test_every_provider_refusing_surfaces_rather_than_silently_failing(self):
+        pool = self.two_providers(
+            groq_error=ProviderRequestTooLarge("too large"),
+            gemini_error=ProviderRequestTooLarge("too large"))
+        client = pool.for_task("route_email", max_wait=THREAD_MAX_WAIT)
+
+        with self.assertRaises(Exception):
+            client.complete_json([{"role": "user", "content": "x"}],
+                                 lambda t: t, "f")
 
 
 class TaskAvailabilityTests(PoolFixture):
