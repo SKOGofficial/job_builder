@@ -146,6 +146,25 @@ modules back into one file.
   `test_lifecycle.py`, `test_ingest.py`, and `test_generation.py` are unittest;
   `test_web_pages.py` is pytest with NiceGUI user simulation. `pytest` runs all of them.
 
+## Sync Invariants
+
+Three things in `pipeline/sync.py` and its store methods look interchangeable with a
+simpler version and are not:
+
+- **The history cursor may only advance when the whole window was covered.** A capped pass
+  holds it. Advancing regardless silently discarded every message past `max_messages` in
+  that window - never fetched, and never listable again.
+- **`MailboxSync._gone` is what stops a held cursor stalling.** A deleted message can never
+  be stored, so it stays "unseen" for ever; without remembering it, a capped batch refills
+  with the same dead ids every pass and never reaches the live mail behind them. Cleared
+  when the cursor advances, which is also what bounds it.
+- **`messages_awaiting_body` keys on `body_fetched_at`, never on `body_text IS NULL`.**
+  `prune_bodies` sets `body_text` back to NULL by design, so the simpler predicate hands
+  every pruned message back to the fetcher to be downloaded and pruned again, for ever.
+  A fetch that fails must therefore either write the timestamp or leave the row genuinely
+  retryable - `GmailMessageGone` writes an empty body for exactly this reason, and any
+  other error deliberately does not.
+
 ## Concurrency Contract
 
 Load-bearing, and easy to break by accident:

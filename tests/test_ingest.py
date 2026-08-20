@@ -165,6 +165,87 @@ class TestIncrementalSync(unittest.TestCase):
         # The cursor still advances, so the deleted id is never asked for again.
         self.assertEqual(mail.get_cursor(CURSOR_HISTORY_ID), "1100")
 
+    def test_a_capped_pass_holds_the_cursor(self):
+        """Advancing past unfetched ids loses them permanently.
+
+        The window is re-listed next pass, so holding the cursor is what makes
+        the cap a pause rather than a deletion.
+        """
+        store, mail = make_mail()
+        mail.set_cursor(CURSOR_HISTORY_ID, "1000")
+
+        with mock.patch("pipeline.sync.gmail_client") as gmail:
+            gmail.list_history.return_value = (["m1", "m2", "m3"], "1100")
+            gmail.get_message_headers.side_effect = lambda mid, creds: header(mid)
+            sync = MailboxSync(mail, executor=immediate,
+                               credential_loader=lambda: "creds")
+            stored = asyncio.run(sync.run(max_messages=2))
+
+        self.assertEqual(stored, 2)
+        self.assertEqual(mail.get_cursor(CURSOR_HISTORY_ID), "1000",
+                         "cursor must not move past the message left behind")
+
+    def test_the_next_pass_picks_up_the_remainder(self):
+        store, mail = make_mail()
+        mail.set_cursor(CURSOR_HISTORY_ID, "1000")
+
+        with mock.patch("pipeline.sync.gmail_client") as gmail:
+            gmail.list_history.return_value = (["m1", "m2", "m3"], "1100")
+            gmail.get_message_headers.side_effect = lambda mid, creds: header(mid)
+            sync = MailboxSync(mail, executor=immediate,
+                               credential_loader=lambda: "creds")
+            asyncio.run(sync.run(max_messages=2))
+            stored = asyncio.run(sync.run(max_messages=2))
+
+        self.assertEqual(stored, 1)
+        for message_id in ("m1", "m2", "m3"):
+            self.assertTrue(mail.has_message(message_id))
+        # Everything covered, so the cursor is free to move.
+        self.assertEqual(mail.get_cursor(CURSOR_HISTORY_ID), "1100")
+
+    def test_an_uncapped_pass_advances_as_before(self):
+        store, mail = make_mail()
+        mail.set_cursor(CURSOR_HISTORY_ID, "1000")
+
+        with mock.patch("pipeline.sync.gmail_client") as gmail:
+            gmail.list_history.return_value = (["m1", "m2"], "1100")
+            gmail.get_message_headers.side_effect = lambda mid, creds: header(mid)
+            sync = MailboxSync(mail, executor=immediate,
+                               credential_loader=lambda: "creds")
+            asyncio.run(sync.run(max_messages=50))
+
+        self.assertEqual(mail.get_cursor(CURSOR_HISTORY_ID), "1100")
+
+    def test_deleted_ids_cannot_stall_a_held_cursor(self):
+        """The trap in the obvious version of the fix.
+
+        A deleted message is never stored, so it stays unseen for ever. Without
+        remembering it, a capped batch would refill with the same dead ids
+        every pass and never reach the live mail behind them.
+        """
+        store, mail = make_mail()
+        mail.set_cursor(CURSOR_HISTORY_ID, "1000")
+
+        def flaky(message_id, creds):
+            if message_id in ("d1", "d2"):
+                raise GmailMessageGone("gone")
+            return header(message_id)
+
+        with mock.patch("pipeline.sync.gmail_client") as gmail:
+            gmail.list_history.return_value = (["d1", "d2", "live"], "1100")
+            gmail.get_message_headers.side_effect = flaky
+            sync = MailboxSync(mail, executor=immediate,
+                               credential_loader=lambda: "creds")
+            # Pass one: the cap is spent entirely on the two dead ids.
+            asyncio.run(sync.run(max_messages=2))
+            self.assertEqual(mail.get_cursor(CURSOR_HISTORY_ID), "1000")
+            # Pass two: they are remembered, so the live one is reached.
+            stored = asyncio.run(sync.run(max_messages=2))
+
+        self.assertEqual(stored, 1)
+        self.assertTrue(mail.has_message("live"))
+        self.assertEqual(mail.get_cursor(CURSOR_HISTORY_ID), "1100")
+
     def test_no_credentials_is_reported_not_raised(self):
         store, mail = make_mail()
 
@@ -317,6 +398,38 @@ class TestHistoryDeletions(unittest.TestCase):
             "historyId": "1100",
         }])
         self.assertEqual(ids, ["new"])
+
+
+class TestPrunedBodiesStayOut(unittest.TestCase):
+    """`prune_bodies` sets `body_text` back to NULL on purpose.
+
+    A fetch queue defined by that column would hand every pruned message
+    straight back to the fetcher, to be downloaded and pruned again for ever -
+    undoing the retention pass and paying Gmail for the privilege.
+    """
+
+    def test_a_pruned_message_is_not_queued_again(self):
+        store, mail = make_mail()
+        mail.upsert_message(header("m1"))
+        mail.set_filter_verdict("m1", VERDICT_PASSED)
+        mail.store_body("m1", "some body text")
+        mail.record_category("m1", CATEGORY_IRRELEVANT, 0.9, "not job related")
+        mail.commit()
+        self.assertEqual(len(mail.messages_awaiting_body()), 0)
+
+        cleared = mail.prune_bodies(older_than_days=0)
+
+        self.assertEqual(cleared, 1)
+        self.assertIsNone(mail.message("m1")["body_text"])
+        self.assertEqual(len(mail.messages_awaiting_body()), 0,
+                         "a pruned body must not look like an unfetched one")
+
+    def test_a_genuinely_unfetched_message_is_still_queued(self):
+        store, mail = make_mail()
+        mail.upsert_message(header("m1"))
+        mail.set_filter_verdict("m1", VERDICT_PASSED)
+        mail.commit()
+        self.assertEqual(len(mail.messages_awaiting_body()), 1)
 
 
 class TestRouterParsing(unittest.TestCase):

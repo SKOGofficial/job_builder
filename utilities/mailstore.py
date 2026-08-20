@@ -323,11 +323,20 @@ class MailStore:
         Note:
             Newest first here, unlike `messages_awaiting_classification`.
             Recent mail is the mail worth acting on quickly.
+
+            Keyed on `body_fetched_at`, **not** on `body_text IS NULL`. The two
+            look interchangeable and are not: `prune_bodies` deliberately sets
+            `body_text` back to NULL on old irrelevant mail, so a queue defined
+            by that column would hand every pruned message straight back to the
+            fetcher, to be downloaded and pruned again for ever. What this asks
+            is "has it been fetched", and only the timestamp answers that -
+            which is what `store_body` and `prune_bodies` have always claimed
+            in their own docstrings.
         """
         return self.conn.execute(
             """
             SELECT * FROM messages
-            WHERE filter_verdict = ? AND body_text IS NULL
+            WHERE filter_verdict = ? AND body_fetched_at IS NULL
             ORDER BY received_ts DESC
             LIMIT ?
             """,

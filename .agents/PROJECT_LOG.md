@@ -2,6 +2,66 @@
 
 Use this file to record meaningful project changes, implementation decisions, and verification notes.
 
+## 2026-08-19 - Gmail 404s, and two quieter bugs behind them
+
+Started from repeated warnings in the log: `HttpError 404` fetching headers for two message
+ids, each with a full traceback. Confirmed against the real mailbox first - both ids return
+404 from `users.messages.get`, and neither is trashed, since a trashed message still
+fetches. They were permanently deleted.
+
+Cause: `list_history` asked for `historyTypes=["messageAdded"]` alone. Gmail filters those
+records server-side, so a message that arrived and was deleted again inside one history
+window was reported as added with the deletion invisible. It now asks for `messageDeleted`
+too and applies both in the order the records arrive. That narrows the race without closing
+it - a message can still be deleted after the last page is generated - so the remainder is
+named: `GmailMessageGone`, following `GmailHistoryExpired`'s precedent that a routine
+outcome deserves a class rather than an HTTP status parsed at the call site.
+
+Impact of the original 404s was log noise only. The cursor advances past them either way,
+which was checked rather than assumed. But reading that path turned up two things that were
+not noise:
+
+- **The body fetcher could loop for ever.** It skipped a failed fetch and left `body_text`
+  NULL, and `messages_awaiting_body` selected on that column alone, so a mirrored message
+  that was later deleted would return on every cycle, spending an API call each time to be
+  told again that it is gone. A confirmed deletion now stores an empty body.
+- **`messages_awaiting_body` contradicted two docstrings.** Both `store_body` and
+  `prune_bodies` claim the queue is governed by `body_fetched_at`; the query used
+  `body_text IS NULL`. Since `prune_bodies` deliberately nulls `body_text` on old
+  irrelevant mail, every pruned message was eligible for re-fetch - downloaded again,
+  pruned again, indefinitely, undoing the retention pass. The predicate now matches what
+  the docstrings always said.
+
+Separately, **the incremental path could lose mail.** `_store_headers` capped its batch at
+`max_messages` but `_incremental` advanced the cursor regardless, so anything past the cap
+in one window was never fetched and could never be listed again. The cursor is now held on
+a capped pass. The obvious version of that fix stalls - a deleted id is never stored, stays
+unseen for ever, and would refill every subsequent batch - so confirmed deletions are
+remembered in `MailboxSync._gone` and the set is cleared when the cursor advances, which
+also bounds it.
+
+Measured before changing anything:
+
+- 580 messages had passed the filter with no body. All 580 had `body_fetched_at` NULL and
+  no category, so they were a genuine unfetched backlog rather than a stuck loop - an
+  earlier guess that `prune_bodies` was feeding them back was wrong, and the data said so.
+  It drains at 60 a cycle; it was 520 an hour later.
+- `body_text` and `body_fetched_at` were perfectly consistent across all 1,696 rows - no
+  row set one without the other - so switching the queue predicate changed nothing about
+  today's behaviour, only tomorrow's.
+
+Verification:
+
+- 682 tests pass, up from 669. Twelve new ones in `tests/test_ingest.py` cover deletion
+  subtraction in `list_history` (same page, later page, duplicates, a deletion for
+  something never added), the deleted-message paths on both fetchers, the held cursor and
+  its resumption, the stall the naive fix would have introduced, and a pruned body staying
+  out of the queue.
+- Each new test was checked against the unfixed code and confirmed to fail there, so none
+  of them is passing vacuously.
+- `list_history` was called against the real mailbox with the new `historyTypes` to confirm
+  the API accepts it. Nothing had changed since the stored cursor, so it returned zero ids.
+
 ## 2026-08-19 - Referral contacts, and the morning list of who to ask
 
 The tracker knew about a thousand postings and nothing about the five people who could
