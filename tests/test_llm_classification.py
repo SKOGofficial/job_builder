@@ -15,6 +15,7 @@ import unittest
 
 import app
 import clients.llm_client as llm
+from clients.providers.base import ProviderUnavailable
 from utilities import credentials
 
 
@@ -472,10 +473,16 @@ class ClientTests(unittest.TestCase):
             client.classify(self.payload())
         self.assertEqual(caught.exception.retry_after, 42)
 
-    def test_server_error_raises(self):
+    def test_server_error_raises_a_named_unavailable(self):
+        """Named, so a caller can tell "not served" from "nothing to report".
+
+        A bare exception here is what let `parse_alert` report a failed call as
+        an empty digest, which the alert handler then marked handled for ever.
+        """
         client, _calls = self.client(FakeResponse(status_code=500, text="boom"))
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(ProviderUnavailable) as caught:
             client.classify(self.payload())
+        self.assertEqual(caught.exception.status, 500)
 
     def test_empty_choices_becomes_unclear(self):
         client, _calls = self.client(FakeResponse(payload={"choices": []}))

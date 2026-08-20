@@ -12,7 +12,11 @@ import os
 import unittest
 
 import clients.providers.gemini as gemini
-from clients.providers.base import ProviderNotConfigured, ProviderRateLimited
+from clients.providers.base import (
+    ProviderNotConfigured,
+    ProviderRateLimited,
+    ProviderUnavailable,
+)
 from utilities import credentials
 
 
@@ -333,11 +337,19 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(llm.GroqRateLimited):
             client.complete_json(self.messages(), lambda t: t, "f")
 
-    def test_other_http_errors_raise_runtime_error(self):
+    def test_other_http_errors_are_named_not_bare(self):
+        """A failed call has to be distinguishable from an empty answer.
+
+        It used to raise a bare `RuntimeError`, which `parse_alert` swallowed
+        as though the model had answered with no postings - and the alert
+        handler then retired the message permanently. The exception carries the
+        status so a caller can tell a transient 5xx from a dead model name.
+        """
         client, _calls = self.client(FakeResponse(500, text="upstream boom"))
-        with self.assertRaises(RuntimeError) as caught:
+        with self.assertRaises(ProviderUnavailable) as caught:
             client.complete_json(self.messages(), lambda t: t, "f")
         self.assertIn("500", str(caught.exception))
+        self.assertEqual(caught.exception.status, 500)
 
     def test_the_key_never_reaches_the_url_or_an_error(self):
         """A credential in the URL ends up in tracebacks and logs."""
@@ -352,7 +364,7 @@ class ClientTests(unittest.TestCase):
             key=secret, pacer=gemini.Pacer(sleep=lambda _s: None)
         )
         client.poster = poster
-        with self.assertRaises(RuntimeError) as caught:
+        with self.assertRaises(ProviderUnavailable) as caught:
             client.complete_json(self.messages(), lambda t: t, "f")
 
         self.assertNotIn(secret, calls[0][0])

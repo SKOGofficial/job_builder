@@ -22,6 +22,7 @@ import asyncio
 import logging
 
 from clients.llm_client import GroqRateLimited
+from clients.providers.base import ProviderUnavailable
 from pipeline.extract import STATUS_UNCLEAR, extract_update
 from utilities.mailstore import CATEGORY_UPDATE
 
@@ -171,6 +172,18 @@ class UpdateHandler:
         for message in self._pending(limit):
             try:
                 outcome = await self.handle(message)
+            except ProviderUnavailable as exc:
+                # Not a rate limit and not a parse failure: the request never
+                # reached a model. Stop the pass and leave every message in it
+                # untouched - crucially *without* `mark_handled`, because
+                # nothing was tried, and a retry is exactly what these need.
+                log.warning(
+                    "Update handling stopped after %d message(s): no provider could "
+                    "serve the request (%s). Nothing was marked handled, so the batch "
+                    "retries next cycle.",
+                    processed, exc,
+                )
+                break
             except GroqRateLimited as exc:
                 log.info(
                     "Update handling paused by the rate limit after %d "

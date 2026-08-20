@@ -19,6 +19,7 @@ import asyncio
 import logging
 
 from clients.llm_client import GroqRateLimited
+from clients.providers.base import ProviderUnavailable
 from pipeline.parsers import parse_alert
 from utilities.identity import identity_key, identity_scheme
 from utilities.mailstore import CATEGORY_ALERT
@@ -171,6 +172,18 @@ class AlertHandler:
         for message in self._pending(limit):
             try:
                 created, skipped, linked = await self.handle(message)
+            except ProviderUnavailable as exc:
+                # Not a rate limit and not a parse failure: the request never
+                # reached a model. Stop the pass and leave every message in it
+                # untouched - crucially *without* `mark_handled`, because
+                # nothing was tried, and a retry is exactly what these need.
+                log.warning(
+                    "Alert handling stopped after %d lead(s): no provider could serve "
+                    "the request (%s). Nothing was marked handled, so the whole batch "
+                    "retries next cycle.",
+                    totals[0], exc,
+                )
+                break
             except GroqRateLimited as exc:
                 log.info(
                     "Alert handling paused by the rate limit after %d lead(s); "

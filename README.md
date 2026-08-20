@@ -290,7 +290,12 @@ Stages, one module each under `pipeline/`:
 6. **Handle** - alerts become leads, acknowledgements promote leads into applications,
    updates apply a status change when confident enough. Every message is stamped
    `handled_at` afterwards, whatever the outcome - without it a digest carrying no
-   parseable posting is re-extracted at full cost on every cycle, for ever.
+   parseable posting is re-extracted at full cost on every cycle, for ever. With one
+   exception, learned the hard way: **a call that never reached a model is not an
+   attempt.** A provider that cannot serve raises `ProviderUnavailable`, the pass stops,
+   and nothing is marked. Conflating that with an empty digest once retired 70 real job
+   alerts because a model name in `.env` had been decommissioned. `cli.py requeue` puts
+   back anything marked handled that produced no link.
 
 The to-apply list is ordered by **posting date, newest first**, and open leads are
 deleted once the posting is more than 14 days old (`LEAD_FRESHNESS_DAYS`). The date comes
