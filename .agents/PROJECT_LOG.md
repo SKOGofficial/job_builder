@@ -188,6 +188,71 @@ Noted while verifying, not changed:
   Gemini returned 503 repeatedly during verification and the Groq fallback was never
   tried. Changing this alters failover semantics for every task, so it is left as a
   finding.
+## 2026-08-20 - A failed model call is not an attempt
+
+A real data loss, caused by the `handled_at` marker added three days earlier
+meeting a provider outage.
+
+`GROQ_MODEL` in `.env` named `llama-3.3-70b-versatile`, which Groq had
+decommissioned, so every extraction call returned HTTP 404. That arrived as a
+bare `RuntimeError`; `parse_alert` caught it under `except Exception` and
+returned no postings; `AlertHandler` read "no postings" as "this digest
+contains nothing" and stamped `handled_at`, which permanently removes a message
+from the backlog. **70 real job alerts were retired that way** - Disney, Best
+Buy, Cherokee Federal, Etched, Cintas - each carrying postings that were never
+turned into leads.
+
+The guard written with `handled_at` covered `client is None`. It did not cover
+a client that exists and cannot serve, which is the more common failure.
+
+What was wrong, and what replaces it:
+
+- **A bare exception cannot be reasoned about.** `ProviderUnavailable` now names
+  "the provider could not serve this request", carrying the HTTP status. Groq
+  and Gemini both raise it instead of `RuntimeError`.
+- **`parse_alert` swallowed it.** It already re-raised `GroqRateLimited` with a
+  comment saying a rate limit is not a parse failure. A provider failure is not
+  one either, and now both propagate. A genuine parse bug is still swallowed -
+  that one is specific to a message, and blocking the queue on it would be the
+  worse failure.
+- **Handlers now stop the pass on it**, without marking anything. All three -
+  alerts, acknowledgements, updates - treat it the way they treat a rate limit.
+- **The pool now fails over on it.** It failed over for rate limits, spend
+  ceilings and misconfiguration, but a 404 stopped the whole call with Gemini
+  sitting idle behind it in the chain. A dead model name took the pipeline down
+  while a working provider went unasked. Cooled down for 5 minutes as well as
+  skipped, since the common causes are persistent and rediscovering them once
+  per message costs a round trip each time. Not the daily window a spend
+  ceiling earns - a 5xx may well be over in a second.
+
+The rule, stated once: **a call that never reached a model is not an attempt,
+and nothing may be recorded as tried.**
+
+Repair: `cli.py requeue` clears `handled_at` on messages marked handled that
+produced no link. Dry by default. It is deliberately blunt - it puts back
+genuinely empty digests along with the damaged ones, costing one wasted
+extraction each. That asymmetry is the right way round: a wasted call is a
+fraction of a cent, a lost alert is a job never seen. On this database all 70
+affected rows classify as real alerts and none as board marketing, so the
+bluntness cost nothing.
+
+Verification:
+
+- 667 tests pass, up from 660. New suite
+  `tests/test_provider_failure_is_not_an_attempt.py`; its four load-bearing
+  tests were run against the unfixed code and confirmed to fail there.
+- The suite pins both directions, because the fix sits next to the retry leak
+  it must not resurrect: an honestly empty digest is still marked handled and
+  still not re-extracted on the next cycle.
+- Three existing tests asserted the bare `RuntimeError` and were updated to the
+  named exception; they now also assert the status is carried.
+
+Noted, not acted on:
+
+- `.env` has since been moved to `openai/gpt-oss-20b`, so the outage itself is
+  over. The failover change is what stops the next one costing anything.
+- `/settings` still returns 500 when the database names a provider the running
+  build does not know about. Unrelated, still outstanding.
 
 ## 2026-08-17 - Rule classification, no review queue, and a fresh to-apply list
 

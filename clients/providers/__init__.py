@@ -21,6 +21,7 @@ from clients.providers.base import (
     ProviderNotConfigured,
     ProviderRateLimited,
     ProviderRequestTooLarge,
+    ProviderUnavailable,
     estimate_tokens,
     retry_after_seconds,
 )
@@ -31,6 +32,7 @@ PROVIDER_MODULES = {
     "groq": "clients.llm_client",
     "gemini": "clients.providers.gemini",
     "anthropic": "clients.research_client",
+    "claude_cli": "clients.providers.claude_cli",
 }
 
 __all__ = [
@@ -44,6 +46,7 @@ __all__ = [
     "ProviderNotConfigured",
     "ProviderRateLimited",
     "ProviderRequestTooLarge",
+    "ProviderUnavailable",
     "estimate_tokens",
     "provider_module",
     "retry_after_seconds",

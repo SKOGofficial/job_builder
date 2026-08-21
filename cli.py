@@ -171,6 +171,56 @@ def cmd_prepare(args):
         store.close()
 
 
+def cmd_requeue(args):
+    """Put back messages a handler retired without ever really trying.
+
+    Summary:
+        Clear `handled_at` on classified mail that was marked handled but
+        produced no link, so the handlers pick it up again.
+
+    Parameters:
+        args (argparse.Namespace): Carries `db`, `apply`, and `category`.
+
+    Returns:
+        int: Process exit status, 0 on success.
+
+    Note:
+        Written for a specific incident and kept because the shape recurs.
+        `GROQ_MODEL` named a decommissioned model, so extraction returned 404
+        on every call; `parse_alert` reported that as an empty digest and the
+        alert handler stamped `handled_at`, permanently retiring 70 real job
+        alerts. The code path is fixed - a failed call no longer counts as an
+        attempt - but the rows it already wrote need putting back.
+
+        Dry by default. Clearing `handled_at` is safe in itself (the worst
+        case is one wasted extraction on a digest that really was empty), but
+        it is still a write to the user's database, so it takes an explicit
+        `--apply`.
+    """
+    store, mail = open_stores(args.db)
+    rows = mail.messages_handled_without_result(args.category)
+    if not rows:
+        print("Nothing to requeue: every handled message produced a link.")
+        store.close()
+        return 0
+
+    print(f"{len(rows)} message(s) marked handled but linked to nothing:")
+    for row in rows[:20]:
+        print(f"  {row['handled_at']}  {(row['subject'] or '(no subject)')[:64]}")
+    if len(rows) > 20:
+        print(f"  ... and {len(rows) - 20} more")
+
+    if not args.apply:
+        print("\nDry run. Re-run with --apply to clear handled_at on these.")
+        store.close()
+        return 0
+
+    cleared = mail.requeue_handled_without_result(args.category)
+    print(f"\nRequeued {cleared} message(s). The next cycle will process them.")
+    store.close()
+    return 0
+
+
 def cmd_deny(args):
     store, mail = open_stores(args.db)
     mail.deny_sender(args.domain, args.reason)
@@ -211,6 +261,16 @@ def build_parser():
     prepare.add_argument("--lead", type=int, help="prepare one lead, skipping the gate")
     prepare.add_argument("--max", type=int, default=5)
     prepare.set_defaults(func=cmd_prepare)
+
+    requeue = sub.add_parser(
+        "requeue",
+        help="put back mail marked handled that produced nothing",
+    )
+    requeue.add_argument("--category", default="job_alert",
+                         help="category to requeue (default: job_alert)")
+    requeue.add_argument("--apply", action="store_true",
+                         help="actually clear handled_at (default: dry run)")
+    requeue.set_defaults(func=cmd_requeue)
 
     deny = sub.add_parser("deny", help="mark a sender domain as not job related")
     deny.add_argument("domain")

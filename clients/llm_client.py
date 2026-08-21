@@ -54,6 +54,7 @@ from clients.providers.base import (
     ProviderNotConfigured,
     ProviderRateLimited,
     ProviderRequestTooLarge,
+    ProviderUnavailable,
     describe_rate_limit,
     estimate_tokens,
     rate_limit_snapshot,
@@ -379,7 +380,8 @@ class GroqClient:
         Raises:
             GroqRateLimited: On HTTP 429, carrying the retry-after hint so the
                 caller can stop its batch cleanly.
-            RuntimeError: On any other HTTP error at or above 400.
+            ProviderUnavailable: On any other HTTP error at or above 400,
+                meaning the request was not served at all.
 
         Note:
             Pacing is booked from the real size of this request rather than a
@@ -429,9 +431,15 @@ class GroqClient:
                 f"{getattr(response, 'text', '')[:200]}"
             )
         if response.status_code >= 400:
-            raise RuntimeError(
+            # Named, not a bare RuntimeError. A caller has to be able to tell
+            # "the call never happened" from "the model answered and there was
+            # nothing in it" - see ProviderUnavailable for what conflating the
+            # two cost.
+            raise ProviderUnavailable(
                 f"Groq returned HTTP {response.status_code}: "
-                f"{getattr(response, 'text', '')[:200]}"
+                f"{getattr(response, 'text', '')[:200]}",
+                provider=DISPLAY_NAME,
+                status=response.status_code,
             )
 
         payload = response.json()

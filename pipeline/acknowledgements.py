@@ -24,6 +24,7 @@ import logging
 from datetime import date, datetime
 
 from clients.llm_client import GroqRateLimited
+from clients.providers.base import ProviderUnavailable
 from pipeline.extract import extract_acknowledgement
 from utilities.identity import identity_key, identity_scheme
 from utilities.mailstore import (
@@ -246,6 +247,18 @@ class AcknowledgementHandler:
         for message in self._pending(limit):
             try:
                 result = await self.handle(message)
+            except ProviderUnavailable as exc:
+                # Not a rate limit and not a parse failure: the request never
+                # reached a model. Stop the pass and leave every message in it
+                # untouched - crucially *without* `mark_handled`, because
+                # nothing was tried, and a retry is exactly what these need.
+                log.warning(
+                    "Acknowledgement handling stopped: no provider could serve the "
+                    "request (%s). Nothing was marked handled, so the batch retries "
+                    "next cycle.",
+                    exc,
+                )
+                break
             except GroqRateLimited as exc:
                 log.info(
                     "Acknowledgement handling paused by the rate limit after "

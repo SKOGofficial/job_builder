@@ -672,6 +672,81 @@ class MailStore:
             (_now(), gmail_message_id),
         )
 
+    def messages_handled_without_result(self, category=CATEGORY_ALERT):
+        """Messages marked handled that produced no link at all.
+
+        Summary:
+            List messages in one category stamped `handled_at` but attached to
+            no identity.
+
+        Parameters:
+            category (str): The category to inspect. Defaults to
+                `CATEGORY_ALERT`, the one an outage actually damaged.
+
+        Returns:
+            list[sqlite3.Row]: Matching messages, oldest stamp first.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Two very different things land here. A board digest that genuinely
+            advertised nothing is *supposed* to look like this - that is the
+            retry leak `handled_at` exists to close. So is an alert whose
+            extraction call failed and was wrongly recorded as an attempt.
+            Only a human can tell them apart, which is why this reports rather
+            than repairs; `cli.py requeue` prints the list before touching it.
+        """
+        return self.conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE category = ?
+              AND handled_at IS NOT NULL
+              AND gmail_message_id NOT IN (SELECT gmail_message_id FROM message_links)
+            ORDER BY handled_at ASC
+            """,
+            (category,),
+        ).fetchall()
+
+    def requeue_handled_without_result(self, category=CATEGORY_ALERT):
+        """Clear `handled_at` on messages that were retired producing nothing.
+
+        Summary:
+            Return messages in one category to the handler backlog.
+
+        Parameters:
+            category (str): The category to requeue. Defaults to
+                `CATEGORY_ALERT`.
+
+        Returns:
+            int: How many messages were requeued.
+
+        Raises:
+            sqlite3.Error: If the update or the commit fails.
+
+        Note:
+            Commits. Deliberately the blunt version: it puts back genuinely
+            empty digests along with the damaged ones, costing one wasted
+            extraction each. That asymmetry is the right way round - a wasted
+            call is a fraction of a cent, and a lost alert is a job the user
+            never sees.
+        """
+        cursor = self.conn.execute(
+            """
+            UPDATE messages
+            SET handled_at = NULL
+            WHERE category = ?
+              AND handled_at IS NOT NULL
+              AND gmail_message_id NOT IN (SELECT gmail_message_id FROM message_links)
+            """,
+            (category,),
+        )
+        self.conn.commit()
+        if cursor.rowcount:
+            log.info("Requeued %d %s message(s) that produced no link",
+                     cursor.rowcount, category)
+        return cursor.rowcount
+
     def messages_awaiting_handling(self, category, limit=50, newest_first=True):
         """A category handler's backlog.
 

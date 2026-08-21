@@ -74,23 +74,39 @@ class ProviderRateLimited(Exception):
         self.limits = limits or {}
 
 
-class ProviderRequestTooLarge(Exception):
-    """Raised when a provider refuses a request as too big to serve.
+class ProviderUnavailable(Exception):
+    """Raised when a provider could not serve a request at all.
 
-    Distinct from `ProviderRateLimited`, and the distinction is the whole
-    point: a rate limit clears on its own, so the right response is to wait and
-    send the same request again. This never clears. Retrying the identical
-    payload against the same provider fails identically for ever, so the only
-    useful responses are to send it somewhere with more room or to give up on
-    it - which is why the pool treats this as grounds to fail over rather than
-    to pause.
+    An HTTP error that is not a rate limit: a decommissioned model, a revoked
+    key, a 5xx, a connection that never opened. The call did not happen, and
+    that is the whole point of giving it a name.
 
-    Groq answers HTTP 413 for two different situations that both fit this:
-    a payload larger than the model will accept at all, and a single request
-    whose prompt plus `max_tokens` exceeds the account's per-minute token
-    allowance. The second is limit-shaped but is not a rate limit - waiting
-    does not help, because the request is bigger than the whole minute's budget.
+    It used to arrive as a bare `RuntimeError`, and a bare exception is
+    indistinguishable from a parse failure. `pipeline/parsers/__init__.py`
+    swallowed it and returned no postings, `AlertHandler` read "no postings"
+    as "this digest contains nothing", and stamped `handled_at` - permanently
+    retiring a perfectly good alert because a model name in `.env` had been
+    decommissioned. 70 alerts were lost that way before it was caught.
+
+    So the rule this class exists to enforce: **a failed call is not an
+    attempt.** Anything that reaches a handler through this exception must
+    leave the message exactly as it found it.
+
+    Parameters:
+        message (str): Human-readable reason, surfaced in the log.
+        provider (str): Display name of the provider that could not serve.
+            Empty when a test double raises.
+        status (int): The HTTP status, or 0 when the failure was not an HTTP
+            response at all.
+
+    Summary:
+        Signal that a provider could not serve a request, so nothing was tried.
     """
+
+    def __init__(self, message, provider="", status=0):
+        super().__init__(message)
+        self.provider = provider
+        self.status = status
 
 
 class ProviderBudgetExhausted(Exception):

@@ -65,8 +65,15 @@ TASKS = {
         "Read acknowledgements", SHAPE_JSON, 400, ("groq", "gemini"),
         "Reads which role a 'thanks for applying' email confirms.",
     ),
+    # 800, not 200. The reply is two short fields, so 200 looked generous -
+    # but Gemini 3.x spends output budget on reasoning before it emits any
+    # text, and this prompt carries the whole profile. Measured against a
+    # filled-in profile, 200 returned `{"score": 0` and nothing else, which
+    # `parse_score` correctly rejected as invalid JSON, which left the lead
+    # unscored and silently ungated. Groq never showed it: it does not reason
+    # into the output budget, so the fault only appeared on failover.
     "score_relevance": Task(
-        "Score lead relevance", SHAPE_JSON, 200, ("groq", "gemini"),
+        "Score lead relevance", SHAPE_JSON, 800, ("groq", "gemini"),
         "Scores a lead against your profile. The gate that decides which "
         "leads are worth researching.",
     ),

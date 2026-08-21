@@ -38,6 +38,7 @@ from clients.providers.base import (
     ProviderNotConfigured,
     ProviderRateLimited,
     ProviderRequestTooLarge,
+    ProviderUnavailable,
     estimate_tokens,
 )
 from clients.providers.budget import Budget, BudgetLedger
@@ -72,6 +73,13 @@ THREAD_MAX_WAIT = 45.0
 #: Without it a zero retry-after would let the same provider be retried
 #: immediately, which is what the cooldown exists to prevent.
 MIN_COOLDOWN = 5.0
+
+#: How long a provider sits out after failing to serve a request at all.
+#: Long enough that a decommissioned model or a revoked key is not re-tried
+#: once per message for a whole batch, short enough that a transient 5xx costs
+#: one cycle rather than a day. Deliberately not the daily window that a spend
+#: ceiling earns - this may well be over in a second.
+UNAVAILABLE_COOLDOWN = 300.0
 
 
 def _build_groq(_mail):
@@ -130,6 +138,51 @@ def _build_anthropic(mail):
     return {SHAPE_RESEARCH: ResearchClient.from_config(limiter=limiter)}, "Claude", 0
 
 
+def _build_claude_cli(_mail):
+    """Both shapes over the local `claude` binary.
+
+    Summary:
+        Build the Claude Code CLI's classification and research clients.
+
+    Parameters:
+        _mail: Unused, deliberately. See the note.
+
+    Returns:
+        tuple: `(clients_by_shape, display, daily_limit)`.
+
+    Raises:
+        ProviderNotConfigured: When no binary resolves.
+
+    Note:
+        No `SpendLimiter`, following `_build_gemini` rather than
+        `_build_anthropic`. The limiter reads `job_research` through the
+        MailStore's connection, and a client is called from an executor
+        thread, so checking it there raises `sqlite3.ProgrammingError` -
+        sqlite connections belong to the thread that made them. Anthropic has
+        the same wiring and has simply never been configured, so it has never
+        fired.
+
+        Nothing is lost by dropping it here: `--max-budget-usd` caps a single
+        run inside the CLI, and `CLAUDE_CLI_REQUESTS_PER_DAY` gives the pool's
+        own `Budget` a daily ceiling, which is read and written on the thread
+        that owns the connection.
+    """
+    from clients.providers import claude_cli
+
+    # Resolved once, here, so a missing binary raises ProviderNotConfigured
+    # before either client is constructed - the same "one check, then build"
+    # shape the key-based builders get from `api_key()`.
+    binary = claude_cli.binary_path()
+    model = claude_cli.model_name()
+    clients = {
+        SHAPE_JSON: claude_cli.ClaudeCliClient(model=model, binary=binary),
+        SHAPE_RESEARCH: claude_cli.ClaudeCliResearchClient(
+            model=model, binary=binary,
+            timeout=claude_cli.timeout_seconds(claude_cli.RESEARCH_TIMEOUT)),
+    }
+    return clients, claude_cli.DISPLAY_NAME, claude_cli.requests_per_day()
+
+
 #: Provider name -> the function that builds it. Construction knowledge lives
 #: here rather than in the provider modules so those stay unaware of the pool,
 #: and so the modules keep working standalone (`cli.py`, the Settings test
@@ -140,6 +193,7 @@ BUILDERS = {
     "groq": _build_groq,
     "gemini": _build_gemini,
     "anthropic": _build_anthropic,
+    "claude_cli": _build_claude_cli,
 }
 
 #: What each provider *could* do, independent of whether it is configured.
@@ -150,6 +204,10 @@ PROVIDER_SHAPES = {
     "groq": frozenset({SHAPE_JSON}),
     "gemini": frozenset({SHAPE_JSON, SHAPE_RESEARCH}),
     "anthropic": frozenset({SHAPE_RESEARCH}),
+    # Both, so any task can be pointed at it from Settings. Nothing routes
+    # here by default: an agent loop takes tens of seconds where Groq takes
+    # under one, so which work is worth that is the operator's call.
+    "claude_cli": frozenset({SHAPE_JSON, SHAPE_RESEARCH}),
 }
 
 #: What to call each provider in the UI. Declared here as well as returned by
@@ -160,6 +218,7 @@ PROVIDER_DISPLAY = {
     "groq": "Groq",
     "gemini": "Gemini",
     "anthropic": "Claude",
+    "claude_cli": "Claude Code",
 }
 
 
@@ -792,6 +851,23 @@ class ProviderPool:
                 state.clients.pop(shape, None)
                 state.last_error = str(exc)
                 blocked.append((state.name, "not configured", 0.0))
+                continue
+            except ProviderUnavailable as exc:
+                # The request was not served: a decommissioned model, a revoked
+                # key, a 5xx. Before this it arrived as a bare exception and
+                # stopped the whole call with the next provider in the chain
+                # sitting idle behind it - a dead model name in `.env` took the
+                # pipeline down while a working provider went unasked.
+                #
+                # Cooled down as well as skipped, because the common causes are
+                # persistent and re-discovering them once per message costs a
+                # round trip each time.
+                state.cool_down(self._clock() + UNAVAILABLE_COOLDOWN, str(exc))
+                state.last_error = str(exc)
+                self.record(state.name, task, "error",
+                            model=self._model_of(state, shape))
+                blocked.append((state.name, f"unavailable ({exc.status or 'no response'})",
+                                UNAVAILABLE_COOLDOWN))
                 continue
 
         return self._default_and_wait(

@@ -181,6 +181,9 @@ takes the call. Otherwise the next one does.
 | Classify matched replies | Groq, then Gemini |
 | Research a company and role | Gemini, then Claude |
 
+A fourth provider, **Claude Code**, is available for every task but is in no default order —
+see [below](#using-the-claude-code-cli-as-a-provider).
+
 Edit these in **Settings -> Task routing**, or set `LLM_ROUTE_<TASK>` in `.env`. A task with
 no saved choice follows `.env`, so changing that file keeps working; **Reset** on a row
 deletes the saved choice rather than freezing today's default into the database.
@@ -205,6 +208,44 @@ Rate limits:
 - Free-tier limits are per project and move. Google publishes yours in AI Studio rather
   than in the docs; `GEMINI_REQUESTS_PER_MINUTE`, `GEMINI_TOKENS_PER_MINUTE` and
   `GEMINI_REQUESTS_PER_DAY` start conservative and are meant to be raised.
+
+### Using the Claude Code CLI as a provider
+
+If the `claude` CLI is installed and signed in, it can serve any task. It is not an HTTP
+client: it runs `claude -p` as a subprocess with the prompt on stdin and reads a JSON
+envelope back. Configuration is discovery rather than secrets — install it, run `claude`
+once, and Settings shows it as available.
+
+Nothing routes to it by default, because one call is an agent loop taking tens of seconds
+where Groq answers in under a second. Pointing `Route incoming email` at it turns a
+twenty-message batch into twenty agent invocations.
+
+**Classification works; grounded research depends on your account.** Classification is
+verified end to end. Research asks the CLI for `WebSearch` and `WebFetch`, and some
+accounts refuse both in headless mode regardless of the permissions passed. When that
+happens the model correctly declines to invent facts and returns empty fields, so the
+provider treats an all-empty result as a failure and hands the lead to the next provider in
+the chain rather than caching emptiness against it. You will see one warning naming the
+refused tools. Try it before routing research here permanently.
+
+Two things are deliberate and worth knowing before you turn it on:
+
+- **It runs in an empty directory, not in this project.** Without `--bare` the CLI loads
+  `CLAUDE.md`, hooks and MCP configuration from wherever it starts. Started here, every
+  classification would quietly inherit this repo's `.claude/CLAUDE.md` as context.
+  `CLAUDE_CLI_WORKDIR` moves it; the default is `~/.job_builder/claude_cli`.
+- **It gets no tools except web access, and only for research.** The CLI is an agent with
+  Bash, Read and Edit available, and the text being classified is untrusted email. The
+  permission mode denies everything not explicitly allowed, so the list is an allowlist
+  rather than a denylist and future tools are closed by default. This is not theoretical:
+  during testing the model reached for a personal Indeed connector on the account —
+  including its "get my resume" tool — from a job-research prompt. Every one was refused.
+
+On authentication: as configured it uses your signed-in subscription. Anthropic's
+[legal and compliance documentation](https://code.claude.com/docs/en/legal-and-compliance)
+asks developers building on the Agent SDK to use API-key authentication, and states that
+Pro and Max limits assume ordinary individual use. Setting `CLAUDE_CLI_BARE=1` with
+`ANTHROPIC_API_KEY` runs it that way instead.
 
 How your data is handled:
 
@@ -253,7 +294,12 @@ Stages, one module each under `pipeline/`:
 6. **Handle** - alerts become leads, acknowledgements promote leads into applications,
    updates apply a status change when confident enough. Every message is stamped
    `handled_at` afterwards, whatever the outcome - without it a digest carrying no
-   parseable posting is re-extracted at full cost on every cycle, for ever.
+   parseable posting is re-extracted at full cost on every cycle, for ever. With one
+   exception, learned the hard way: **a call that never reached a model is not an
+   attempt.** A provider that cannot serve raises `ProviderUnavailable`, the pass stops,
+   and nothing is marked. Conflating that with an empty digest once retired 70 real job
+   alerts because a model name in `.env` had been decommissioned. `cli.py requeue` puts
+   back anything marked handled that produced no link.
 
 The to-apply list is ordered by **posting date, newest first**, and open leads are
 deleted once the posting is more than 14 days old (`LEAD_FRESHNESS_DAYS`). The date comes
