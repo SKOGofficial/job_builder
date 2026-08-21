@@ -61,9 +61,14 @@ def card(padding="p-6"):
 def page_timer(interval, callback):
     """A repeating timer that stops when its client goes away.
 
-    A plain ui.timer keeps firing after the user navigates off the page, and
-    NiceGUI then raises "The parent slot of Timer has been deleted" on every
-    tick. Cancelling on disconnect keeps the log clean and stops the work.
+    A plain ui.timer keeps firing after the user navigates off the page, doing
+    work for a page nobody is looking at. Cancelling on disconnect stops that.
+
+    It does *not* stop the "parent slot of Timer has been deleted" traceback,
+    which this docstring used to claim. `Timer._run_in_loop` evaluates its
+    context before consulting `_should_stop()`, so the element is already gone
+    by the time the cancel flag is read. That noise is filtered in `app.py`
+    instead - see `_TimerTeardownNoise`.
 
     Summary:
         Create a `ui.timer` that cancels itself when its client disconnects.
