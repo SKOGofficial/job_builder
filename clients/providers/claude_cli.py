@@ -44,6 +44,7 @@ from clients.providers.base import (
     ProviderBudgetExhausted,
     ProviderNotConfigured,
     ProviderRateLimited,
+    ProviderUnavailable,
 )
 
 try:
@@ -516,10 +517,16 @@ def _refuse(message, text):
 
     - A spend ceiling is `ProviderBudgetExhausted`, which `pipeline/prepare.py`
       already treats as "stop the stage" rather than "this lead failed".
-    - Everything else is `ProviderRateLimited`, including crashes and timeouts.
-      That looks odd until you notice that any *other* exception leaves
-      `ProviderPool.call` without being caught, taking the whole stage down
-      with no failover. A hung subprocess should move the work to Gemini.
+    - Everything else is `ProviderUnavailable`: a crash, a timeout, output that
+      will not decode, tools the CLI refused. None of those is a rate limit,
+      and calling them one made the pool cool the provider down as though
+      waiting would help, while `provider_usage` recorded "rate_limited" for
+      runs that never hit a limit.
+      They were `ProviderRateLimited` for a real reason - it was the only
+      exception `ProviderPool.call` caught, so anything else took the whole
+      stage down with no failover. `ProviderUnavailable` is now caught there
+      too and fails over the same way, so the workaround has outlived its
+      cause.
     - An auth failure is emphatically not `ProviderNotConfigured`: the pool
       responds to that by deleting the client for the rest of the process,
       which is far too final for an expired token.
@@ -533,7 +540,11 @@ def _refuse(message, text):
 
     Raises:
         ProviderBudgetExhausted: When a spend ceiling stopped the run.
-        ProviderRateLimited: In every other case.
+        ProviderRateLimited: On a genuine rate limit, and on an auth failure -
+            which is deliberately not `ProviderNotConfigured`, because the pool
+            answers that by deleting the client for the rest of the process.
+        ProviderUnavailable: On a crash, a timeout, undecodable output, or
+            refused tools.
     """
     detail = (text or "").strip()[:300]
     if _BUDGET_PATTERN.search(detail) and not _LIMIT_PATTERN.search(detail):
@@ -560,12 +571,7 @@ def _refuse(message, text):
             scope="minute",
         )
     log.warning("Claude Code CLI call failed: %s", detail)
-    raise ProviderRateLimited(
-        f"{message}: {detail}",
-        retry_after=int(TRANSIENT_COOLDOWN),
-        provider=DISPLAY_NAME,
-        scope="minute",
-    )
+    raise ProviderUnavailable(f"{message}: {detail}", provider=DISPLAY_NAME)
 
 
 def run_cli(system_prompt, prompt, *, tools=(), schema=None,
