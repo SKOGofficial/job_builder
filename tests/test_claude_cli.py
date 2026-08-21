@@ -26,6 +26,7 @@ from clients.providers.base import (
     ProviderBudgetExhausted,
     ProviderNotConfigured,
     ProviderRateLimited,
+    ProviderUnavailable,
 )
 
 
@@ -501,13 +502,18 @@ class FailureMappingTests(EnvIsolationMixin, unittest.TestCase):
         return client.complete_json([{"role": "user", "content": "hi"}],
                                     json.loads, "fallback")
 
-    def test_a_timeout_is_a_rate_limit_and_not_a_runtime_error(self):
-        """A RuntimeError escapes pool.call uncaught and kills the stage."""
+    def test_a_timeout_fails_over_instead_of_killing_the_stage(self):
+        """A hung subprocess must move the work, not take the stage down.
+
+        This used to be `ProviderRateLimited`, because that was the only
+        exception `ProviderPool.call` caught - a bare RuntimeError escaped it
+        and killed the stage. `ProviderUnavailable` is caught there now and
+        fails over the same way, without claiming a limit that was never hit.
+        """
         client = self.client(
             raises=subprocess.TimeoutExpired(cmd="claude", timeout=90))
-        with self.assertRaises(ProviderRateLimited) as caught:
+        with self.assertRaises(ProviderUnavailable):
             self.call(client)
-        self.assertGreater(caught.exception.retry_after, 0)
 
     def test_a_usage_limit_carries_the_wait_it_named(self):
         client = self.client(stdout=envelope(
@@ -538,13 +544,22 @@ class FailureMappingTests(EnvIsolationMixin, unittest.TestCase):
 
     def test_unparseable_output_fails_over_rather_than_crashing(self):
         client = self.client(stdout="not json at all", returncode=0)
-        with self.assertRaises(ProviderRateLimited):
+        with self.assertRaises(ProviderUnavailable):
             self.call(client)
 
     def test_a_non_zero_exit_with_no_output_fails_over(self):
         client = self.client(stdout="", stderr="boom", returncode=2)
-        with self.assertRaises(ProviderRateLimited):
+        with self.assertRaises(ProviderUnavailable):
             self.call(client)
+
+    def test_a_real_usage_limit_is_still_a_rate_limit(self):
+        """The distinction the change turns on: only limits are limits."""
+        client = self.client(stdout=envelope(
+            "Usage limit reached. Try again in 2 hours.",
+            is_error=True, subtype="error_during_execution"))
+        with self.assertRaises(ProviderRateLimited) as caught:
+            self.call(client)
+        self.assertGreater(caught.exception.retry_after, 0)
 
     def test_a_vanished_binary_is_a_configuration_problem(self):
         client = self.client(raises=OSError("No such file"))

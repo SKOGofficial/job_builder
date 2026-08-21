@@ -866,6 +866,15 @@ class ProviderPool:
                 state.last_error = str(exc)
                 self.record(state.name, task, "error",
                             model=self._model_of(state, shape))
+                # Logged, not just recorded. `provider_usage` stores the
+                # outcome but not the reason, so without this line a provider
+                # failing on every cycle shows up as a row saying "error" and
+                # nothing anywhere says what it returned - which is exactly the
+                # position this left the pipeline in for an hour.
+                log.warning(
+                    "%s could not serve %s and is cooling down for %ds: %s",
+                    state.name, task, int(UNAVAILABLE_COOLDOWN), exc,
+                )
                 blocked.append((state.name, f"unavailable ({exc.status or 'no response'})",
                                 UNAVAILABLE_COOLDOWN))
                 continue

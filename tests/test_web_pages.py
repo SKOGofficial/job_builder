@@ -495,13 +495,24 @@ async def test_routing_choice_is_saved_and_reaches_the_pool(user, state):
     assert state.pool.chain("route_email") == ("gemini", "groq")
 
 
-async def test_resetting_a_route_returns_it_to_the_default(user, state):
+async def test_resetting_a_route_returns_it_to_the_default(user, state, monkeypatch):
+    """Reset drops the saved row and falls back to the declared default.
+
+    The environment is cleared first, and that is the point of the test rather
+    than setup noise: `.env` may carry an `LLM_ROUTE_*` override, and this used
+    to assert the declared default while silently depending on the developer's
+    machine not having one. Routing the CLI in `.env` is what exposed it.
+    """
     state.mail.set_provider_route("route_email", "gemini", None)
     await user.open("/settings")
     user.find("Reset").click()
     await user.should_see("Reset to the default")
 
     assert "route_email" not in state.mail.provider_routes()
+
+    # Cleared here rather than at the top: rendering the page reloads `.env`,
+    # which would put the override straight back.
+    monkeypatch.delenv("LLM_ROUTE_ROUTE_EMAIL", raising=False)
     assert state.pool.chain("route_email") == ("groq", "gemini")
 
 

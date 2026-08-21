@@ -39,11 +39,13 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import datetime, timedelta
 
 from clients.providers.base import (
     ProviderBudgetExhausted,
     ProviderNotConfigured,
     ProviderRateLimited,
+    ProviderUnavailable,
 )
 
 try:
@@ -371,9 +373,30 @@ def is_configured():
 
 
 #: Patterns that mean "come back later" rather than "this call was bad".
+#: What the CLI says when it will not serve because a limit is spent.
+#:
+#: `session limit` is here because it was missing, and the omission mattered:
+#: a real "You've hit your session limit - resets 12:10pm" fell through to the
+#: catch-all and was reported as a crash rather than a limit, so the wait it
+#: named was thrown away and the provider was cooled for a flat 300s instead.
+#: The subscription plans phrase their ceilings as session and weekly limits,
+#: which is exactly the case the CLI provider exists to serve.
 _LIMIT_PATTERN = re.compile(
-    r"rate limit|usage limit|limit reached|quota|too many requests", re.I
+    r"rate limit|usage limit|session limit|weekly limit|limit reached|"
+    r"hit your .{0,24}limit|quota|too many requests",
+    re.I,
 )
+
+#: "resets 12:10pm", "resets at 9am". A clock time rather than a duration, which
+#: is how the subscription limits phrase themselves.
+_RESET_AT_PATTERN = re.compile(
+    r"reset[s]?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", re.I
+)
+
+#: Longest wait a parsed clock time is allowed to produce. A reset time read in
+#: the wrong timezone - the CLI names one, and it need not be the machine's -
+#: would otherwise park a provider for most of a day on a misreading.
+MAX_PARSED_RESET = 6 * 3600.0
 _AUTH_PATTERN = re.compile(
     r"not logged in|log in|unauthorized|authentication|invalid api key|"
     r"credit balance", re.I
@@ -383,7 +406,7 @@ _DURATION_PATTERN = re.compile(r"(\d+)\s*(second|minute|hour)s?", re.I)
 _SECONDS_PER = {"second": 1, "minute": 60, "hour": 3600}
 
 
-def parse_retry_after(text, default=DEFAULT_LIMIT_COOLDOWN):
+def parse_retry_after(text, default=DEFAULT_LIMIT_COOLDOWN, now=None):
     """Read a wait out of a refusal message.
 
     Summary:
@@ -392,16 +415,65 @@ def parse_retry_after(text, default=DEFAULT_LIMIT_COOLDOWN):
     Parameters:
         text (str): The CLI's message.
         default (float): Used when nothing parses.
+        now (datetime | None): Current local time, for reading a clock-time
+            reset. Injectable so the behaviour is testable without waiting for
+            a particular hour.
 
     Returns:
         float: Seconds. The largest duration mentioned, because a message
             naming both a window and a reset names the reset second.
+
+    Note:
+        Durations first, then a clock time. "Try again in 3 hours" is
+        unambiguous; "resets 12:10pm" has to be read against a clock and the
+        CLI names a timezone that need not be the machine's, so a clock reading
+        is capped by `MAX_PARSED_RESET` and falls back to `default` when it
+        lands outside that. Being an hour early costs one wasted retry; being
+        five hours late costs the rest of the day.
     """
     found = [
         int(value) * _SECONDS_PER[unit.lower()]
         for value, unit in _DURATION_PATTERN.findall(text or "")
     ]
-    return float(max(found)) if found else float(default)
+    if found:
+        return float(max(found))
+    seconds = _seconds_until_reset(text, now=now)
+    return float(seconds) if seconds is not None else float(default)
+
+
+def _seconds_until_reset(text, now=None):
+    """Seconds until a clock time named in a refusal, or None.
+
+    Summary:
+        Read "resets 12:10pm" as a wait, in local time.
+
+    Parameters:
+        text (str): The CLI's message.
+        now (datetime | None): Current local time. Injectable for tests.
+
+    Returns:
+        float | None: Seconds until the next occurrence of that time, or None
+            when nothing parses or the result exceeds `MAX_PARSED_RESET`.
+    """
+    match = _RESET_AT_PATTERN.search(text or "")
+    if match is None:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = (match.group(3) or "").lower()
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    now = now or datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    seconds = (target - now).total_seconds()
+    return seconds if 0 < seconds <= MAX_PARSED_RESET else None
 
 
 def subprocess_env(bare=False, environ=None):
@@ -516,10 +588,16 @@ def _refuse(message, text):
 
     - A spend ceiling is `ProviderBudgetExhausted`, which `pipeline/prepare.py`
       already treats as "stop the stage" rather than "this lead failed".
-    - Everything else is `ProviderRateLimited`, including crashes and timeouts.
-      That looks odd until you notice that any *other* exception leaves
-      `ProviderPool.call` without being caught, taking the whole stage down
-      with no failover. A hung subprocess should move the work to Gemini.
+    - Everything else is `ProviderUnavailable`: a crash, a timeout, output that
+      will not decode, tools the CLI refused. None of those is a rate limit,
+      and calling them one made the pool cool the provider down as though
+      waiting would help, while `provider_usage` recorded "rate_limited" for
+      runs that never hit a limit.
+      They were `ProviderRateLimited` for a real reason - it was the only
+      exception `ProviderPool.call` caught, so anything else took the whole
+      stage down with no failover. `ProviderUnavailable` is now caught there
+      too and fails over the same way, so the workaround has outlived its
+      cause.
     - An auth failure is emphatically not `ProviderNotConfigured`: the pool
       responds to that by deleting the client for the rest of the process,
       which is far too final for an expired token.
@@ -533,7 +611,11 @@ def _refuse(message, text):
 
     Raises:
         ProviderBudgetExhausted: When a spend ceiling stopped the run.
-        ProviderRateLimited: In every other case.
+        ProviderRateLimited: On a genuine rate limit, and on an auth failure -
+            which is deliberately not `ProviderNotConfigured`, because the pool
+            answers that by deleting the client for the rest of the process.
+        ProviderUnavailable: On a crash, a timeout, undecodable output, or
+            refused tools.
     """
     detail = (text or "").strip()[:300]
     if _BUDGET_PATTERN.search(detail) and not _LIMIT_PATTERN.search(detail):
@@ -560,12 +642,7 @@ def _refuse(message, text):
             scope="minute",
         )
     log.warning("Claude Code CLI call failed: %s", detail)
-    raise ProviderRateLimited(
-        f"{message}: {detail}",
-        retry_after=int(TRANSIENT_COOLDOWN),
-        provider=DISPLAY_NAME,
-        scope="minute",
-    )
+    raise ProviderUnavailable(f"{message}: {detail}", provider=DISPLAY_NAME)
 
 
 def run_cli(system_prompt, prompt, *, tools=(), schema=None,
