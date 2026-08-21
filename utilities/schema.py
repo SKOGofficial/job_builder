@@ -267,6 +267,59 @@ CREATE TABLE IF NOT EXISTS provider_settings (
     fallback_provider TEXT,
     updated_at TEXT NOT NULL
 );
+
+-- People worth asking for a referral, and where they work. ---------------------
+--
+-- `company_slug` is stored rather than derived per query because it is the join
+-- key: leads carry whatever the board wrote ("Stripe", "Stripe, Inc.") and the
+-- contact carries whatever the user typed, so both sides have to be reduced by
+-- `utilities.identity.company_slug` before they can meet. Storing it also means
+-- the match survives a rename of the display name.
+--
+-- `last_checked_ts` is what "new since you last looked" keys on. Without it the
+-- morning list has no way to distinguish a posting that arrived overnight from
+-- one that has been sitting there a week, which is the entire question the page
+-- exists to answer.
+CREATE TABLE IF NOT EXISTS contacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT,
+    company TEXT NOT NULL,
+    company_slug TEXT NOT NULL,
+    role TEXT,
+    careers_url TEXT,
+    notes TEXT,
+    last_checked_ts INTEGER,
+    archived INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Referral emails drafted for a contact about a role. -------------------------
+--
+-- Keyed on `identity_key` rather than a lead row id, for the same reason
+-- `job_research` is: a lead that gets promoted to a real application keeps its
+-- identity, so the record of having already asked someone survives the promotion
+-- rather than being orphaned by it.
+--
+-- Unique on the pair, so the page can tell "not asked yet" from "asked on
+-- Tuesday". A morning list that keeps re-offering an ask you already made is
+-- worse than one that shows nothing.
+CREATE TABLE IF NOT EXISTS referral_outreach (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contact_id INTEGER NOT NULL,
+    identity_key TEXT NOT NULL,
+    subject TEXT,
+    body TEXT,
+    -- Which model wrote it. Same rule as every other model output in the
+    -- schema: without this there is no attributing a bad draft afterwards.
+    model TEXT,
+    -- 'drafted' | 'sent' | 'skipped'
+    status TEXT NOT NULL DEFAULT 'drafted',
+    created_at TEXT NOT NULL,
+    sent_at TEXT,
+    UNIQUE(contact_id, identity_key)
+);
 """
 
 INDEX_SQL = """
@@ -287,6 +340,10 @@ CREATE INDEX IF NOT EXISTS idx_email_matches_job_id ON email_matches(job_id);
 -- Every budget question is "how much has this provider spent since <time>",
 -- so the pair is the useful order.
 CREATE INDEX IF NOT EXISTS idx_provider_usage_at ON provider_usage(provider, at);
+-- The morning lookup is "every company I am watching", so the archived flag
+-- belongs in the index rather than as a filter over its results.
+CREATE INDEX IF NOT EXISTS idx_contacts_slug ON contacts(company_slug, archived);
+CREATE INDEX IF NOT EXISTS idx_outreach_contact ON referral_outreach(contact_id);
 """
 
 

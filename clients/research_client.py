@@ -303,6 +303,135 @@ def parse_research(text):
     }
 
 
+OPENINGS_SYSTEM_PROMPT = """You check one company for jobs it is currently \
+advertising, on behalf of someone who knows an employee there and wants to ask \
+for a referral.
+
+Search the web. Read the company's own careers page first; it is the only \
+authoritative source for what is open today. Aggregators lag by weeks and list \
+roles that have been filled.
+
+Report only openings you actually found a link to. Every opening must carry the \
+URL of its own posting - not the careers index, not a search page. An opening \
+you cannot link to is one the reader cannot apply to, so leave it out.
+
+An empty list is a correct and useful answer. Inventing a role wastes a real \
+favour from a real person, which is worse than reporting nothing.
+
+Reply with JSON only, in this exact shape:
+{
+  "openings": [
+    {
+      "title": "<the role title, as the posting words it>",
+      "location": "<location or remote arrangement, empty if unstated>",
+      "url": "<direct link to this posting>",
+      "posted": "<YYYY-MM-DD the posting states, empty if it states none>"
+    }
+  ]
+}"""
+
+
+def build_openings_prompt(contact):
+    """
+    Summary:
+        Assemble the user half of a careers-page check.
+
+    Parameters:
+        contact (Mapping): The contact whose employer to check. Needs
+            `company`; `careers_url` and `role` are used when present.
+
+    Returns:
+        str: The prompt body.
+
+    Note:
+        The careers URL is passed through when the user stored one, which is
+        what authorises the fetch tool to read it - the tool only retrieves
+        URLs already present in the conversation.
+    """
+    parts = ["Company: %s" % (contact["company"],)]
+    careers_url = contact.get("careers_url") if hasattr(contact, "get") \
+        else contact["careers_url"]
+    if careers_url:
+        parts.append("Careers page: %s" % (careers_url,))
+    return (
+        "\n".join(parts)
+        + "\n\nFind the roles this company is advertising now, then reply "
+          "with the JSON described."
+    )
+
+
+def _posted_epoch(value):
+    """A stated posting date as epoch seconds.
+
+    Summary:
+        Convert a model-reported date string to a timestamp.
+
+    Parameters:
+        value: The reported date, expected as `YYYY-MM-DD`.
+
+    Returns:
+        int | None: Epoch seconds, or None when nothing usable was given.
+            None is normal: most careers pages state no date at all.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return int(datetime.strptime(value.strip()[:10], "%Y-%m-%d").timestamp())
+    except ValueError:
+        return None
+
+
+def parse_openings(text):
+    """Validate a careers-check reply into a list of openings. Never raises.
+
+    Summary:
+        Turn a model reply into the openings it reported.
+
+    Parameters:
+        text (str): The model's raw reply, possibly fenced or wrapped in prose.
+
+    Returns:
+        list[dict]: `title`, `location`, `url`, and `posted_ts` per opening.
+            Capped at 25.
+
+    Note:
+        **An entry without a title or a URL is dropped.** That is the whole
+        guard on this path: these postings are reported by a model reading the
+        web rather than extracted from mail the user actually received, and a
+        role with no link is one nothing can verify and nobody can apply to.
+    """
+    if not text:
+        return []
+    data = _json_object(text)
+    if data is None:
+        log.debug("Openings reply was not valid JSON")
+        return []
+
+    entries = data.get("openings")
+    if not isinstance(entries, list):
+        return []
+
+    openings = []
+    for entry in entries[:25]:
+        if not isinstance(entry, dict):
+            continue
+        title = entry.get("title")
+        url = entry.get("url")
+        if not isinstance(title, str) or not title.strip():
+            continue
+        if not isinstance(url, str) or not url.strip().startswith("http"):
+            continue
+        location = entry.get("location")
+        openings.append({
+            "title": title.strip()[:200],
+            "location": location.strip()[:120]
+                if isinstance(location, str) and location.strip() else None,
+            "url": url.strip()[:1000],
+            "posted_ts": _posted_epoch(entry.get("posted")),
+        })
+    return openings
+
+
 class ResearchClient:
     """Claude with web search, wrapped for one job at a time.
 
@@ -323,8 +452,27 @@ class ResearchClient:
             raise ResearchNotConfigured(MISSING_PACKAGES_HINT)
         return cls(key=api_key(), model=model_name(), limiter=limiter)
 
-    def _call(self, prompt):
-        """One request. Returns `(text, input_tokens, output_tokens)`."""
+    def _call(self, prompt, system=None):
+        """One request. Returns `(text, input_tokens, output_tokens)`.
+
+        Summary:
+            Send one web-search request and return its text and usage.
+
+        Parameters:
+            prompt (str): The user-side prompt.
+            system (str | None): The system prompt. None uses
+                `RESEARCH_SYSTEM_PROMPT`, so the research path is unchanged.
+
+        Returns:
+            tuple[str, int, int]: Reply text, input tokens, output tokens.
+
+        Note:
+            `system` is a parameter rather than a second client because the two
+            jobs differ only in what is asked for: both want the same model,
+            the same tools, and the same tolerance for a prose-wrapped reply.
+            The injected `caller` still takes the prompt alone, so every
+            existing test double keeps working.
+        """
         if self._caller is not None:
             return self._caller(prompt)
 
@@ -334,7 +482,7 @@ class ResearchClient:
         response = self._client.messages.create(
             model=self.model,
             max_tokens=4096,
-            system=RESEARCH_SYSTEM_PROMPT,
+            system=system or RESEARCH_SYSTEM_PROMPT,
             tools=[WEB_SEARCH_TOOL, WEB_FETCH_TOOL],
             messages=[{"role": "user", "content": prompt}],
         )
@@ -355,3 +503,28 @@ class ResearchClient:
             self.limiter.check()
         text, input_tokens, output_tokens = self._call(build_research_prompt(lead))
         return parse_research(text), input_tokens, output_tokens
+
+    def find_openings(self, contact):
+        """Check one company for what it is advertising now.
+
+        Summary:
+            Search a contact's employer for current openings.
+
+        Parameters:
+            contact (Mapping): Needs `company`; `careers_url` is used when set.
+
+        Returns:
+            tuple[list, int, int]: The openings, input tokens, output tokens.
+                The list is empty when nothing usable came back, which is a
+                normal answer rather than a failure.
+
+        Raises:
+            ProviderBudgetExhausted: When a limiter is attached and its ceiling
+                is spent.
+        """
+        if self.limiter is not None:
+            self.limiter.check()
+        text, input_tokens, output_tokens = self._call(
+            build_openings_prompt(contact), system=OPENINGS_SYSTEM_PROMPT
+        )
+        return parse_openings(text), input_tokens, output_tokens

@@ -257,6 +257,31 @@ def search_messages(query, max_results=25, creds=None):
 METADATA_HEADERS = ["From", "Subject", "Date", "List-Unsubscribe"]
 
 
+def _raise_if_gone(exc, message_id):
+    """Re-raise a 404 as the routine "message no longer exists" signal.
+
+    Summary:
+        Convert a Gmail 404 into `GmailMessageGone`, leaving anything else
+        alone.
+
+    Parameters:
+        exc (Exception): The exception raised by the API call.
+        message_id (str): The message being fetched, for the message text.
+
+    Raises:
+        GmailMessageGone: When the API reported HTTP 404.
+
+    Note:
+        Deliberately does not swallow. Callers still see every other error as
+        the exception it was, because "Gmail is down" and "that one message is
+        gone" call for different responses.
+    """
+    if getattr(getattr(exc, "resp", None), "status", None) == 404:
+        raise GmailMessageGone(
+            f"Message {message_id} no longer exists in the mailbox"
+        ) from exc
+
+
 def get_message_headers(message_id, creds=None):
     """Fetch only the headers and labels for a message.
 
@@ -270,17 +295,21 @@ def get_message_headers(message_id, creds=None):
     UPDATES are not - job alerts routinely land in both.
     """
     service = _service(creds)
-    message = (
-        service.users()
-        .messages()
-        .get(
-            userId="me",
-            id=message_id,
-            format="metadata",
-            metadataHeaders=METADATA_HEADERS,
+    try:
+        message = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=message_id,
+                format="metadata",
+                metadataHeaders=METADATA_HEADERS,
+            )
+            .execute()
         )
-        .execute()
-    )
+    except Exception as exc:  # googleapiclient raises HttpError
+        _raise_if_gone(exc, message_id)
+        raise
     headers = {
         h["name"].lower(): h["value"]
         for h in message.get("payload", {}).get("headers", [])
@@ -298,6 +327,21 @@ def get_message_headers(message_id, creds=None):
 
 
 # --- mailbox-wide sync -------------------------------------------------------
+
+
+class GmailMessageGone(Exception):
+    """Raised when a message Gmail told us about no longer exists.
+
+    A normal outcome, not a failure, and named for the same reason
+    `GmailHistoryExpired` is: the caller has to be able to tell "this one is
+    gone, move on" from "the API is broken", and only a named exception makes
+    that distinction without parsing an HTTP status at the call site.
+
+    Mail is deleted between Gmail generating a history page and this process
+    getting round to fetching it. Spam auto-purges, and a person clearing a
+    morning of job-board digests does the same thing by hand. Note that a
+    *trashed* message still fetches - this is permanent deletion only.
+    """
 
 
 class GmailHistoryExpired(Exception):
@@ -324,9 +368,42 @@ def list_history(start_history_id, creds=None, max_pages=20):
 
     Raises `GmailHistoryExpired` when the cursor is too old, which is a normal
     outcome after downtime longer than Gmail's retention.
+
+    Summary:
+        List the message IDs added since a history cursor, less any that were
+        deleted again before we looked.
+
+    Parameters:
+        start_history_id (str): The cursor to read forward from.
+        creds: Credentials for the API client.
+        max_pages (int): Most history pages to walk in one call.
+
+    Returns:
+        tuple[list[str], str]: The surviving message IDs, and the newest
+            history ID seen.
+
+    Raises:
+        GmailHistoryExpired: When Gmail no longer holds history from the
+            cursor.
+
+    Note:
+        `messageDeleted` is requested alongside `messageAdded` so a message
+        that arrived and was deleted again inside one window can be dropped
+        here rather than 404ing at the fetch. Asking for additions alone made
+        the deletion invisible - Gmail filters the records server-side - so
+        every purged spam message and every hand-cleared digest became a
+        warning with a traceback.
+
+        Records arrive in ascending history order, so applying additions and
+        deletions in sequence is what makes the result correct rather than
+        order-dependent. This narrows the race; it cannot close it, because a
+        message can still be deleted after the last page is generated. That
+        remainder is `GmailMessageGone`'s job.
     """
     service = _service(creds)
-    message_ids = []
+    #: Insertion-ordered, and used as a set: `dict.fromkeys` at the end relied
+    #: on this to dedupe, and deletions have to be able to remove an entry.
+    message_ids = {}
     latest = start_history_id
     page_token = None
     pages = 0
@@ -339,7 +416,7 @@ def list_history(start_history_id, creds=None, max_pages=20):
                 .list(
                     userId="me",
                     startHistoryId=start_history_id,
-                    historyTypes=["messageAdded"],
+                    historyTypes=["messageAdded", "messageDeleted"],
                     pageToken=page_token,
                 )
                 .execute()
@@ -355,15 +432,20 @@ def list_history(start_history_id, creds=None, max_pages=20):
             for added in record.get("messagesAdded", []) or []:
                 message = added.get("message") or {}
                 if message.get("id"):
-                    message_ids.append(message["id"])
+                    message_ids[message["id"]] = None
+            for removed in record.get("messagesDeleted", []) or []:
+                message = removed.get("message") or {}
+                if message.get("id"):
+                    message_ids.pop(message["id"], None)
         latest = response.get("historyId", latest)
         page_token = response.get("nextPageToken")
         pages += 1
         if not page_token:
             break
 
-    # Gmail can report the same message across pages; order is not meaningful.
-    return list(dict.fromkeys(message_ids)), latest
+    # Gmail can report the same message across pages; order is not meaningful,
+    # and the mapping has already deduped.
+    return list(message_ids), latest
 
 
 def iter_message_ids(query="", creds=None, max_results=None, page_size=500):
@@ -458,12 +540,16 @@ def extract_body(payload, max_chars=MAX_BODY_CHARS):
 def get_message_body(message_id, creds=None):
     """Fetch a full message and return its readable text plus Gmail's snippet."""
     service = _service(creds)
-    message = (
-        service.users()
-        .messages()
-        .get(userId="me", id=message_id, format="full")
-        .execute()
-    )
+    try:
+        message = (
+            service.users()
+            .messages()
+            .get(userId="me", id=message_id, format="full")
+            .execute()
+        )
+    except Exception as exc:  # googleapiclient raises HttpError
+        _raise_if_gone(exc, message_id)
+        raise
     return {
         "body": extract_body(message.get("payload", {})),
         "snippet": html.unescape(message.get("snippet", "") or ""),

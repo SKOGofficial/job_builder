@@ -96,6 +96,30 @@ TASKS = {
         "Writes the covering letter for one application, from the requirements "
         "the research found and the experience bullets that answer them.",
     ),
+    # The second task that reaches the web, and the only one a user triggers by
+    # hand. Same chain as `research` for the same reasons - Gemini's grounding
+    # is cheaper and Claude picks up whatever it cannot take.
+    "check_openings": Task(
+        "Check a company for openings", SHAPE_RESEARCH, 2048,
+        ("gemini", "anthropic"),
+        "Searches one company's careers page for the roles it is advertising "
+        "now. Runs only when you press Check now for a contact.",
+    ),
+    # Gemini leads for the same reason it leads the cover letter: this is
+    # output a real person reads in the applicant's own voice. Groq rather than
+    # Anthropic behind it, because Claude is registered for SHAPE_RESEARCH only
+    # and a chain naming it here would be unroutable.
+    # 2000 for an email of about 200 tokens, and the gap is not slack. Gemini's
+    # flash models think before they answer, and `maxOutputTokens` is the
+    # ceiling on thinking *and* answer together - so a budget sized to the
+    # email is spent reasoning about it, and the reply arrives truncated
+    # mid-JSON. Measured: 700 cut off after the subject line; 2500 completed
+    # with room to spare.
+    "draft_referral": Task(
+        "Draft a referral request", SHAPE_JSON, 2000, ("gemini", "groq"),
+        "Writes the short email asking someone you know to refer you for a "
+        "specific opening at their company.",
+    ),
 }
 
 #: Gap-filling shares `AlertHandler`'s injected client with alert extraction -

@@ -42,8 +42,11 @@ from clients.providers.gemini import (
     to_contents,
 )
 from clients.research_client import (
+    OPENINGS_SYSTEM_PROMPT,
     RESEARCH_SYSTEM_PROMPT,
+    build_openings_prompt,
     build_research_prompt,
+    parse_openings,
     parse_research,
 )
 
@@ -131,14 +134,17 @@ class GeminiResearchClient:
         """
         return f"{API_BASE}/{self.model}:generateContent"
 
-    def build_body(self, prompt):
+    def build_body(self, prompt, system_prompt=None):
         """The grounded request body.
 
         Summary:
-            Assemble the generateContent body for one research call.
+            Assemble the generateContent body for one grounded call.
 
         Parameters:
-            prompt (str): The user-side prompt from `build_research_prompt`.
+            prompt (str): The user-side prompt from `build_research_prompt` or
+                `build_openings_prompt`.
+            system_prompt (str | None): The system instruction. None uses
+                `RESEARCH_SYSTEM_PROMPT`, leaving the research path unchanged.
 
         Returns:
             dict: The request body.
@@ -147,10 +153,12 @@ class GeminiResearchClient:
             Carries `tools` and deliberately omits `responseMimeType`. The two
             cannot be sent together - see the module docstring. There is a test
             asserting exactly this pairing, because the failure mode if it
-            regresses is an HTTP 400 on every research call.
+            regresses is an HTTP 400 on every research call. The same applies
+            to a careers check, which is why it shares this body rather than
+            building its own.
         """
         contents, system = to_contents([
-            {"role": "system", "content": RESEARCH_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt or RESEARCH_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ])
         body = {
@@ -165,14 +173,17 @@ class GeminiResearchClient:
             body["systemInstruction"] = system
         return body
 
-    def _call(self, prompt):
+    def _call(self, prompt, system_prompt=None):
         """One request. Returns `(text, input_tokens, output_tokens)`.
 
         Summary:
-            Send one grounded research request and return its text and usage.
+            Send one grounded request and return its text and usage.
 
         Parameters:
             prompt (str): The user-side prompt.
+            system_prompt (str | None): The system instruction. None uses the
+                research prompt. The injected `caller` still takes the prompt
+                alone, so existing test doubles keep working.
 
         Returns:
             tuple[str, int, int]: Reply text, input tokens, output tokens.
@@ -193,7 +204,7 @@ class GeminiResearchClient:
                 "x-goog-api-key": self.key,
                 "Content-Type": "application/json",
             },
-            json=self.build_body(prompt),
+            json=self.build_body(prompt, system_prompt),
             timeout=REQUEST_TIMEOUT,
         )
 
@@ -254,3 +265,32 @@ class GeminiResearchClient:
             self.limiter.check()
         text, input_tokens, output_tokens = self._call(build_research_prompt(lead))
         return parse_research(text), input_tokens, output_tokens
+
+    def find_openings(self, contact):
+        """Check one company for what it is advertising now.
+
+        Summary:
+            Search a contact's employer for current openings.
+
+        Parameters:
+            contact (Mapping): Needs `company`; `careers_url` is used when set.
+
+        Returns:
+            tuple[list, int, int]: The openings, input tokens, output tokens.
+
+        Raises:
+            ProviderBudgetExhausted: When a limiter is attached and its ceiling
+                is spent.
+            ProviderRateLimited: On HTTP 429.
+
+        Note:
+            The prompt and the parser are imported from `research_client` for
+            the same reason `research` imports its own: one copy of each, so
+            the two providers cannot drift into checking different things.
+        """
+        if self.limiter is not None:
+            self.limiter.check()
+        text, input_tokens, output_tokens = self._call(
+            build_openings_prompt(contact), OPENINGS_SYSTEM_PROMPT
+        )
+        return parse_openings(text), input_tokens, output_tokens

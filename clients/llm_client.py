@@ -53,6 +53,7 @@ from clients.providers.base import (
     ProviderBudgetExhausted,
     ProviderNotConfigured,
     ProviderRateLimited,
+    ProviderRequestTooLarge,
     ProviderUnavailable,
     describe_rate_limit,
     estimate_tokens,
@@ -151,6 +152,9 @@ class GroqNotConfigured(Exception):
 # already do.
 GroqNotConfigured = ProviderNotConfigured
 GroqRateLimited = ProviderRateLimited
+#: Same aliasing rule as `GroqRateLimited`: an alias, never a subclass,
+#: so a catch by this name also stops a second provider's 413.
+GroqRequestTooLarge = ProviderRequestTooLarge
 
 
 # Configuration ------------------------------------------------------------
@@ -415,6 +419,16 @@ class GroqClient:
                 limits=snapshot,
                 retry_after=retry_after_seconds(response),
                 provider=DISPLAY_NAME,
+            )
+        if response.status_code == 413:
+            # Not a rate limit, however much the message looks like one. Groq
+            # sends this both for a payload the model will not take and for a
+            # request whose prompt plus max_tokens exceeds the whole per-minute
+            # token allowance. Neither improves by waiting, so it is raised as
+            # its own thing and the pool sends it to a provider with more room.
+            raise GroqRequestTooLarge(
+                f"Groq refused the request as too large: "
+                f"{getattr(response, 'text', '')[:200]}"
             )
         if response.status_code >= 400:
             # Named, not a bare RuntimeError. A caller has to be able to tell

@@ -2,6 +2,192 @@
 
 Use this file to record meaningful project changes, implementation decisions, and verification notes.
 
+## 2026-08-19 - Groq 413s, and the head-of-line block behind them
+
+Reported as `HTTP 413 Request Entity Too Large` from Groq on two stages. The prompts were
+not the problem and were not touched: the router already caps a body at 2,000 characters
+and alert extraction at 6,000, and the two requests that failed were 3.7 KB and 7.3 KB -
+roughly 1,000 and 2,000 tokens.
+
+Reproduced against the API with the exact stored payloads. `groq/compound` returns 413 for
+the 7.3 KB request while accepting a 10-character one, and `openai/gpt-oss-20b` and
+`openai/gpt-oss-120b` both serve the identical payload in about a second, parse cleanly
+through this project's own `parse_route` and `parse_extraction`, and return the correct
+postings. `groq/compound` is an agentic system routed over `openai/gpt-oss-120b` - its
+advertised 131k context does not describe what it will accept in one request. The model in
+`.env` is a configuration matter and was left to the user.
+
+The useful finding was what the 413 exposed in the pipeline. Two things, both worse than
+the error itself:
+
+- **The router stopped the whole pass on any unexpected error.** `except Exception: break`.
+  So one message whose payload no provider would take sat at the head of the queue and
+  every message behind it stayed unclassified - measured at the time: 188 messages backed
+  up behind a single email from 2 June. Now `continue`, with a count logged; a rate limit
+  is still `break`, because that one really does apply to everything behind it.
+- **A 413 did not fail over.** `ProviderPool.call` fails over on a rate limit, an exhausted
+  budget and a misconfiguration, but a 413 arrived as a bare `RuntimeError` and stopped the
+  call dead - with Gemini sitting behind it in the chain, with room to spare. Now raised as
+  `ProviderRequestTooLarge` and treated as grounds to try the next provider. It
+  deliberately does **not** cool the provider down: the payload was too big, the provider
+  is fine, and the next message may be a tenth the size.
+
+Measured while diagnosing, and worth recording because it decides whether the prompt caps
+need to change - they do not:
+
+- Every task's worst case fits under the 8,000 tokens-per-minute ceiling these models
+  report. Alert extraction is the largest at roughly 1,800 prompt tokens plus 1,500
+  completion, about 3,300 of 8,000.
+- Both `gpt-oss` models returned `completion_tokens` exactly equal to `max_tokens` on the
+  extraction call. They reason before answering, so the reply fit with nothing to spare -
+  the same trap `draft_referral` hit on Gemini. A digest carrying many more postings could
+  truncate. Left alone, since raising it is a judgement about spend.
+- `TOKENS_PER_MINUTE` in `providers/base.py` defaults to 12,000 while these models report
+  8,000, so the pacer will overshoot until `GROQ_TOKENS_PER_MINUTE` is set.
+
+Verification:
+
+- 689 tests pass, up from 682. Five new in `test_provider_pool.py` covering the failover,
+  the absence of a cooldown, the client surviving, and the exception not being a rate
+  limit; two new in `test_ingest.py` covering the router skipping a bad message and still
+  stopping on a rate limit.
+- Each was run against the unfixed code and confirmed to fail there. The first attempt at
+  that check was itself wrong - the revert matched an earlier `ProviderNotConfigured` and
+  duplicated code instead of removing the handler, so the tests passed and appeared to
+  prove nothing was being tested. Redone precisely, three of the five fail as they should.
+
+## 2026-08-19 - Gmail 404s, and two quieter bugs behind them
+
+Started from repeated warnings in the log: `HttpError 404` fetching headers for two message
+ids, each with a full traceback. Confirmed against the real mailbox first - both ids return
+404 from `users.messages.get`, and neither is trashed, since a trashed message still
+fetches. They were permanently deleted.
+
+Cause: `list_history` asked for `historyTypes=["messageAdded"]` alone. Gmail filters those
+records server-side, so a message that arrived and was deleted again inside one history
+window was reported as added with the deletion invisible. It now asks for `messageDeleted`
+too and applies both in the order the records arrive. That narrows the race without closing
+it - a message can still be deleted after the last page is generated - so the remainder is
+named: `GmailMessageGone`, following `GmailHistoryExpired`'s precedent that a routine
+outcome deserves a class rather than an HTTP status parsed at the call site.
+
+Impact of the original 404s was log noise only. The cursor advances past them either way,
+which was checked rather than assumed. But reading that path turned up two things that were
+not noise:
+
+- **The body fetcher could loop for ever.** It skipped a failed fetch and left `body_text`
+  NULL, and `messages_awaiting_body` selected on that column alone, so a mirrored message
+  that was later deleted would return on every cycle, spending an API call each time to be
+  told again that it is gone. A confirmed deletion now stores an empty body.
+- **`messages_awaiting_body` contradicted two docstrings.** Both `store_body` and
+  `prune_bodies` claim the queue is governed by `body_fetched_at`; the query used
+  `body_text IS NULL`. Since `prune_bodies` deliberately nulls `body_text` on old
+  irrelevant mail, every pruned message was eligible for re-fetch - downloaded again,
+  pruned again, indefinitely, undoing the retention pass. The predicate now matches what
+  the docstrings always said.
+
+Separately, **the incremental path could lose mail.** `_store_headers` capped its batch at
+`max_messages` but `_incremental` advanced the cursor regardless, so anything past the cap
+in one window was never fetched and could never be listed again. The cursor is now held on
+a capped pass. The obvious version of that fix stalls - a deleted id is never stored, stays
+unseen for ever, and would refill every subsequent batch - so confirmed deletions are
+remembered in `MailboxSync._gone` and the set is cleared when the cursor advances, which
+also bounds it.
+
+Measured before changing anything:
+
+- 580 messages had passed the filter with no body. All 580 had `body_fetched_at` NULL and
+  no category, so they were a genuine unfetched backlog rather than a stuck loop - an
+  earlier guess that `prune_bodies` was feeding them back was wrong, and the data said so.
+  It drains at 60 a cycle; it was 520 an hour later.
+- `body_text` and `body_fetched_at` were perfectly consistent across all 1,696 rows - no
+  row set one without the other - so switching the queue predicate changed nothing about
+  today's behaviour, only tomorrow's.
+
+Verification:
+
+- 682 tests pass, up from 669. Twelve new ones in `tests/test_ingest.py` cover deletion
+  subtraction in `list_history` (same page, later page, duplicates, a deletion for
+  something never added), the deleted-message paths on both fetchers, the held cursor and
+  its resumption, the stall the naive fix would have introduced, and a pruned body staying
+  out of the queue.
+- Each new test was checked against the unfixed code and confirmed to fail there, so none
+  of them is passing vacuously.
+- `list_history` was called against the real mailbox with the new `historyTypes` to confirm
+  the API accepts it. Nothing had changed since the stored cursor, so it returned zero ids.
+
+## 2026-08-19 - Referral contacts, and the morning list of who to ask
+
+The tracker knew about a thousand postings and nothing about the five people who could
+get an application read. This adds the missing side: who you know, where they work, and
+what their employers are advertising right now.
+
+Two new tables, `contacts` and `referral_outreach`. Neither needed a migration - whole
+tables are created by `create_tables` on every `initialise`, before the version gate - so
+`SCHEMA_VERSION` stays at 6. `company_slug` is stored on the contact rather than derived
+per query, because it is the join key: a lead says "Capital One" and the user types
+"Capital One, Inc.".
+
+Cost is the axis the design is built on:
+
+- **Matching is free** and runs on every page render. One `list_leads` call, bucketed by
+  slug in Python, joined to contacts. Read-time rather than stamped onto a lead at
+  creation, because the first thing anyone does here is add five contacts and expect to
+  see the postings already in the list.
+- **`Check now` spends a grounded search**, for one company, only when pressed. New
+  `check_openings` task on the same chain as `research`, with `find_openings` added to
+  both research clients (their `_call` takes an optional system prompt now; the injected
+  `caller` still takes the prompt alone, so no test double changed). What it finds becomes
+  an ordinary lead tagged `board=careers-check`, inheriting scoring, research and document
+  generation. Openings with no URL are dropped by the parser: these come from a model
+  reading the web rather than from mail the user received, and a role that cannot be
+  verified is not one to spend a real favour on.
+- **Drafting** follows `cover_letter.py`'s rule - `score_bullet` picks the supporting
+  evidence before the model sees anything. The stakes are higher here than for a covering
+  letter: an invented project lands in front of someone who knows the applicant.
+
+Nothing is sent by the app. Gmail stays `gmail.readonly`; a draft gets a copy button and a
+`mailto:` link.
+
+Three bugs found while verifying, all real:
+
+- **The badge could never clear for an undated lead.** `is_new_for` keyed only on
+  `posted_ts`, which is absent on rows written before it existed. Now falls back to
+  `created_at`, the same fallback `purge_stale_leads` uses - undated rows are immortal
+  there and were permanently new here.
+- **A task's token budget has to cover the model's thinking.** `draft_referral` at 700
+  tokens returned JSON truncated after the subject line: `gemini-3.6-flash` reasons before
+  answering and `maxOutputTokens` caps both together. Raised to 2000 and documented in
+  `routing.py` and `AGENTS.md`. **`write_cover_letter` at 1200 may have the same problem
+  and was left alone** - it is existing behaviour and changing it is a separate decision.
+- **The page tests would have made live billed calls.** Pressing `Check now` under test
+  reached the real pool, and the developer machine has real keys in `.env`. The referral
+  page tests now install a stub pool on `state._pool`.
+
+Verification:
+
+- 669 tests pass, up from 623. New `tests/test_referrals.py` (39) covers contact storage,
+  slug matching across differently-written company names, the new/checked boundary
+  including both date fallbacks, openings parsing (fenced, prose-wrapped, unlinked,
+  garbage), the checker's dedupe and already-applied guards, and the draft prompt and
+  parser. Seven page tests in `test_web_pages.py` cover the route end to end.
+- Exercised by hand against a `VACUUM INTO` copy of the real database, never the database
+  itself. A contact entered as "Capital One, Inc." matched all 11 open Capital One leads;
+  `Mark checked` cleared the count and the drawer badge; a real draft came back complete
+  after the budget fix, citing only stored bullets and inventing no relationship for a
+  contact with no notes. Checked in both themes.
+
+Noted while verifying, not changed:
+
+- **`GROQ_MODEL=llama-3.3-70b-versatile` in `.env` is decommissioned** - Groq returns HTTP
+  404 for every request. Groq is the primary for `route_email`, `extract_alert`,
+  `extract_update`, `extract_acknowledgement`, `score_relevance` and `classify_reply`, so
+  all of those are currently falling through to Gemini.
+- **An HTTP 503 does not fail over.** `ProviderPool.call` fails over on rate limits,
+  budget exhaustion and misconfiguration, but a 503 raises `RuntimeError` and stops there.
+  Gemini returned 503 repeatedly during verification and the Groq fallback was never
+  tried. Changing this alters failover semantics for every task, so it is left as a
+  finding.
 ## 2026-08-20 - A failed model call is not an attempt
 
 A real data loss, caused by the `handled_at` marker added three days earlier

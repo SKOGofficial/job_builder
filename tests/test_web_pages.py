@@ -15,6 +15,7 @@ from nicegui import ui
 import utilities.store as store_module
 from clients import llm_client
 from utilities import credentials
+from pipeline.referrals import BOARD_CAREERS_CHECK, new_match_count
 from utilities.identity import identity_key
 from utilities.store import JobStore
 from web.state import AppState, set_state
@@ -679,3 +680,107 @@ async def test_dark_mode_choice_is_stored(user, state, store):
     user.find("Dark mode").click()
     await user.should_see("Appearance")
     assert store.get_profile_value("theme", "light") == "dark"
+
+
+# Referrals -----------------------------------------------------------------
+
+
+async def test_referrals_page_explains_itself_when_empty(user, state):
+    await user.open("/referrals")
+    await user.should_see("Add someone you would be comfortable asking")
+
+
+async def test_a_contact_matches_a_lead_at_their_company(user, state):
+    """The join that the whole page rests on, through the real form."""
+    add_lead(state, company="Acme")
+    await user.open("/referrals")
+
+    user.find("Name").type("Priya Raman")
+    # Written differently from the lead's company on purpose: the match runs on
+    # the reduced slug, not on the display name.
+    user.find("Company").type("Acme, Inc.")
+    user.find("Save contact").click()
+
+    await user.should_see("Contact saved")
+    await user.should_see("Priya Raman")
+    await user.should_see("Backend Engineer")
+    await user.should_see("1 new")
+
+
+async def test_a_contact_at_a_quiet_company_says_so(user, state):
+    add_lead(state, company="Acme")
+    state.mail.save_contact({"name": "Tom Nkemelu", "company": "Datadog"})
+    await user.open("/referrals")
+    await user.should_see("Tom Nkemelu")
+    await user.should_see("Nothing open at this company")
+
+
+async def test_marking_checked_clears_the_new_marker(user, state):
+    add_lead(state, company="Acme")
+    state.mail.save_contact({"name": "Priya Raman", "company": "Acme"})
+    await user.open("/referrals")
+    await user.should_see("1 new")
+
+    user.find("Mark checked").click()
+    await user.should_see("as checked")
+    assert new_match_count(state.mail) == 0
+
+
+class StubPool:
+    """A provider pool that hands out one canned client, or none.
+
+    Installed on `state._pool` so the page never builds the real one. That is
+    not only about speed: the developer machine has real keys in `.env`, so a
+    page test that pressed Check now against the real pool would fire a live,
+    billed web search.
+    """
+
+    def __init__(self, client=None):
+        self.client = client
+        self.asked = []
+
+    def for_task(self, task, max_wait=None):
+        self.asked.append(task)
+        return self.client
+
+
+class StubOpenings:
+    """A research client that reports one opening and never leaves the process."""
+
+    def find_openings(self, contact):
+        return [{"title": "Staff Engineer", "location": "Remote",
+                 "url": "https://acme.com/jobs/7", "posted_ts": None}], 10, 20
+
+
+async def test_checking_a_company_needs_a_provider(user, state):
+    """The one paid button says why it did nothing rather than failing quietly."""
+    state._pool = StubPool(None)
+    state.mail.save_contact({"name": "Priya Raman", "company": "Acme"})
+    await user.open("/referrals")
+    user.find("Check now").click()
+    await user.should_see("No research provider is configured")
+
+
+async def test_a_found_opening_lands_on_the_to_apply_list(user, state):
+    """What Check now finds becomes an ordinary lead, tagged with its origin."""
+    state._pool = StubPool(StubOpenings())
+    state.mail.save_contact({"name": "Priya Raman", "company": "Acme"})
+    await user.open("/referrals")
+    user.find("Check now").click()
+    await user.should_see("1 opening(s) found")
+
+    leads = state.mail.list_leads()
+    assert [row["title"] for row in leads] == ["Staff Engineer"]
+    assert leads[0]["board"] == BOARD_CAREERS_CHECK
+    assert leads[0]["apply_url"] == "https://acme.com/jobs/7"
+
+
+async def test_a_stored_draft_can_be_reopened(user, state):
+    lead = add_lead(state, company="Acme")
+    contact_id = state.mail.save_contact({"name": "Priya Raman", "company": "Acme"})
+    state.mail.record_outreach(contact_id, lead["identity_key"],
+                               "Backend Engineer at Acme", "Hi Priya,\n\nA role.")
+    await user.open("/referrals")
+    user.find("Open draft").click()
+    await user.should_see("Referral request to Priya Raman")
+    await user.should_see("Hi Priya,")

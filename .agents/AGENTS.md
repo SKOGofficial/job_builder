@@ -110,6 +110,17 @@ modules back into one file.
   - **`GroqRateLimited` is an *alias* of `ProviderRateLimited`, not a subclass.** Six
     pipeline modules catch it by name to stop a batch cleanly. Subclassing would mean those
     catches missed a second provider's 429 - the exact opposite of what is needed.
+  - **A task's `max_tokens` must cover the model's *thinking*, not just its answer.**
+    Gemini's flash models reason before replying and `maxOutputTokens` caps both together,
+    so a budget sized to the output arrives truncated mid-JSON and the parser returns its
+    empty fallback. `draft_referral` declares 2000 for a 200-token email for this reason;
+    measured, 700 was cut off after the subject line.
+  - **`ProviderRequestTooLarge` fails over; it never cools a provider down.** It means
+    "this payload is too big for me", not "I am unavailable", and the next message may be a
+    tenth the size. It is an *alias target* for `GroqRequestTooLarge` under the same rule as
+    `GroqRateLimited`, and it is deliberately **not** a rate limit: Groq sends HTTP 413 both
+    for a payload the model will not take and for a request whose prompt plus `max_tokens`
+    exceeds the whole per-minute token allowance, and neither improves by waiting.
   - **`ProviderState` has one budget, cooldown and pacer per *provider*, not per client.**
     Gemini holds two clients because grounded research and JSON-mode classification cannot
     share a request body, but they spend one project quota.
@@ -120,6 +131,17 @@ modules back into one file.
   `generate`, `prepare`, `orchestrator`, `scheduler`, plus board parsers under
   `pipeline/parsers/` registered in its `__init__.py`. Nothing here imports a UI framework, so
   the whole pipeline runs from `cli.py` as well as the app.
+- `pipeline/referrals.py` and `pipeline/referral_email.py` serve `web/pages/referrals.py`.
+  They are not scheduler stages: matching runs at page load and costs nothing, and
+  `OpeningsChecker` runs only when the user presses a button. Three things there are
+  deliberate:
+  - **Matching is read-time, never stamped on a lead.** Contacts are added and edited after
+    leads arrive, and a flag written at lead creation would need a backfill on every edit.
+  - **`is_new_for` falls back from `posted_ts` to `created_at`**, the same fallback
+    `purge_stale_leads` uses. Undated rows are immortal there and would be permanently new
+    here, and a badge that cannot be cleared stops being read.
+  - **`score_bullet` picks the evidence, not the model** - the `cover_letter.py` rule, and
+    it matters more here, because the reader knows the applicant personally.
 - Schema lives in `utilities/schema.py` (current shape, `SCHEMA_VERSION`) and
   `utilities/migrations.py` (`PRAGMA user_version` gate, upgrade steps, pre-migration backup).
   `JobStore.init_db` delegates to them. `utilities/identity.py` owns the (title, company,
@@ -131,6 +153,34 @@ modules back into one file.
   `test_identity.py`, `test_migrations.py`, `test_rough_filter.py`, `test_resolver.py`,
   `test_lifecycle.py`, `test_ingest.py`, and `test_generation.py` are unittest;
   `test_web_pages.py` is pytest with NiceGUI user simulation. `pytest` runs all of them.
+
+## Sync Invariants
+
+Three things in `pipeline/sync.py` and its store methods look interchangeable with a
+simpler version and are not:
+
+- **The history cursor may only advance when the whole window was covered.** A capped pass
+  holds it. Advancing regardless silently discarded every message past `max_messages` in
+  that window - never fetched, and never listable again.
+- **`MailboxSync._gone` is what stops a held cursor stalling.** A deleted message can never
+  be stored, so it stays "unseen" for ever; without remembering it, a capped batch refills
+  with the same dead ids every pass and never reaches the live mail behind them. Cleared
+  when the cursor advances, which is also what bounds it.
+- **`messages_awaiting_body` keys on `body_fetched_at`, never on `body_text IS NULL`.**
+  `prune_bodies` sets `body_text` back to NULL by design, so the simpler predicate hands
+  every pruned message back to the fetcher to be downloaded and pruned again, for ever.
+  A fetch that fails must therefore either write the timestamp or leave the row genuinely
+  retryable - `GmailMessageGone` writes an empty body for exactly this reason, and any
+  other error deliberately does not.
+
+## Pipeline Stage Rule
+
+**A failure specific to one item may never end the pass.** `break` in a stage loop is
+reserved for conditions that genuinely apply to everything behind it - a rate limit, an
+exhausted budget. Anything else is `continue`, because the alternative is a head-of-line
+block: the bad item returns to the front of the queue next cycle and stops the same work
+again, indefinitely and silently. The router had exactly this, and one email from June left
+187 messages unclassified for weeks.
 
 ## Concurrency Contract
 

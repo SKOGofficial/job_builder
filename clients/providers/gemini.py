@@ -35,6 +35,7 @@ from clients.providers.base import (
     Pacer,
     ProviderNotConfigured,
     ProviderRateLimited,
+    ProviderRequestTooLarge,
     ProviderUnavailable,
     estimate_tokens,
     retry_after_seconds,
@@ -551,6 +552,16 @@ class GeminiClient:
                 retry_after=seconds,
                 provider=DISPLAY_NAME,
                 scope=scope,
+            )
+        if response.status_code in (413, 400) and "too large" in (
+            getattr(response, "text", "") or ""
+        ).lower():
+            # Gemini reports an oversized request as 400 rather than 413, so
+            # the body has to be read. Same meaning either way: too big to
+            # serve, and no amount of waiting changes that.
+            raise ProviderRequestTooLarge(
+                f"Gemini refused the request as too large: "
+                f"{getattr(response, 'text', '')[:200]}"
             )
         if response.status_code >= 400:
             # See the matching site in `clients/llm_client.py`: a failed call
