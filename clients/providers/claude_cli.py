@@ -39,6 +39,7 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import datetime, timedelta
 
 from clients.providers.base import (
     ProviderBudgetExhausted,
@@ -372,9 +373,30 @@ def is_configured():
 
 
 #: Patterns that mean "come back later" rather than "this call was bad".
+#: What the CLI says when it will not serve because a limit is spent.
+#:
+#: `session limit` is here because it was missing, and the omission mattered:
+#: a real "You've hit your session limit - resets 12:10pm" fell through to the
+#: catch-all and was reported as a crash rather than a limit, so the wait it
+#: named was thrown away and the provider was cooled for a flat 300s instead.
+#: The subscription plans phrase their ceilings as session and weekly limits,
+#: which is exactly the case the CLI provider exists to serve.
 _LIMIT_PATTERN = re.compile(
-    r"rate limit|usage limit|limit reached|quota|too many requests", re.I
+    r"rate limit|usage limit|session limit|weekly limit|limit reached|"
+    r"hit your .{0,24}limit|quota|too many requests",
+    re.I,
 )
+
+#: "resets 12:10pm", "resets at 9am". A clock time rather than a duration, which
+#: is how the subscription limits phrase themselves.
+_RESET_AT_PATTERN = re.compile(
+    r"reset[s]?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", re.I
+)
+
+#: Longest wait a parsed clock time is allowed to produce. A reset time read in
+#: the wrong timezone - the CLI names one, and it need not be the machine's -
+#: would otherwise park a provider for most of a day on a misreading.
+MAX_PARSED_RESET = 6 * 3600.0
 _AUTH_PATTERN = re.compile(
     r"not logged in|log in|unauthorized|authentication|invalid api key|"
     r"credit balance", re.I
@@ -384,7 +406,7 @@ _DURATION_PATTERN = re.compile(r"(\d+)\s*(second|minute|hour)s?", re.I)
 _SECONDS_PER = {"second": 1, "minute": 60, "hour": 3600}
 
 
-def parse_retry_after(text, default=DEFAULT_LIMIT_COOLDOWN):
+def parse_retry_after(text, default=DEFAULT_LIMIT_COOLDOWN, now=None):
     """Read a wait out of a refusal message.
 
     Summary:
@@ -393,16 +415,65 @@ def parse_retry_after(text, default=DEFAULT_LIMIT_COOLDOWN):
     Parameters:
         text (str): The CLI's message.
         default (float): Used when nothing parses.
+        now (datetime | None): Current local time, for reading a clock-time
+            reset. Injectable so the behaviour is testable without waiting for
+            a particular hour.
 
     Returns:
         float: Seconds. The largest duration mentioned, because a message
             naming both a window and a reset names the reset second.
+
+    Note:
+        Durations first, then a clock time. "Try again in 3 hours" is
+        unambiguous; "resets 12:10pm" has to be read against a clock and the
+        CLI names a timezone that need not be the machine's, so a clock reading
+        is capped by `MAX_PARSED_RESET` and falls back to `default` when it
+        lands outside that. Being an hour early costs one wasted retry; being
+        five hours late costs the rest of the day.
     """
     found = [
         int(value) * _SECONDS_PER[unit.lower()]
         for value, unit in _DURATION_PATTERN.findall(text or "")
     ]
-    return float(max(found)) if found else float(default)
+    if found:
+        return float(max(found))
+    seconds = _seconds_until_reset(text, now=now)
+    return float(seconds) if seconds is not None else float(default)
+
+
+def _seconds_until_reset(text, now=None):
+    """Seconds until a clock time named in a refusal, or None.
+
+    Summary:
+        Read "resets 12:10pm" as a wait, in local time.
+
+    Parameters:
+        text (str): The CLI's message.
+        now (datetime | None): Current local time. Injectable for tests.
+
+    Returns:
+        float | None: Seconds until the next occurrence of that time, or None
+            when nothing parses or the result exceeds `MAX_PARSED_RESET`.
+    """
+    match = _RESET_AT_PATTERN.search(text or "")
+    if match is None:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = (match.group(3) or "").lower()
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    now = now or datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    seconds = (target - now).total_seconds()
+    return seconds if 0 < seconds <= MAX_PARSED_RESET else None
 
 
 def subprocess_env(bare=False, environ=None):
