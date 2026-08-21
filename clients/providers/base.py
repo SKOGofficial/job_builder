@@ -109,6 +109,25 @@ class ProviderUnavailable(Exception):
         self.status = status
 
 
+class ProviderRequestTooLarge(Exception):
+    """Raised when a provider refuses a request as too big to serve.
+
+    Distinct from `ProviderRateLimited`, and the distinction is the whole
+    point: a rate limit clears on its own, so the right response is to wait and
+    send the same request again. This never clears. Retrying the identical
+    payload against the same provider fails identically for ever, so the only
+    useful responses are to send it somewhere with more room or to give up on
+    it - which is why the pool treats this as grounds to fail over rather than
+    to pause.
+
+    Groq answers HTTP 413 for two different situations that both fit this:
+    a payload larger than the model will accept at all, and a single request
+    whose prompt plus `max_tokens` exceeds the account's per-minute token
+    allowance. The second is limit-shaped but is not a rate limit - waiting
+    does not help, because the request is bigger than the whole minute's budget.
+    """
+
+
 class ProviderBudgetExhausted(Exception):
     """Raised when a configured spend or request ceiling is gone for the window.
 
