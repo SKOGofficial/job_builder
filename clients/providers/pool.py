@@ -37,6 +37,7 @@ from clients.providers.base import (
     ProviderBudgetExhausted,
     ProviderNotConfigured,
     ProviderRateLimited,
+    ProviderUnavailable,
     estimate_tokens,
 )
 from clients.providers.budget import Budget, BudgetLedger
@@ -71,6 +72,13 @@ THREAD_MAX_WAIT = 45.0
 #: Without it a zero retry-after would let the same provider be retried
 #: immediately, which is what the cooldown exists to prevent.
 MIN_COOLDOWN = 5.0
+
+#: How long a provider sits out after failing to serve a request at all.
+#: Long enough that a decommissioned model or a revoked key is not re-tried
+#: once per message for a whole batch, short enough that a transient 5xx costs
+#: one cycle rather than a day. Deliberately not the daily window that a spend
+#: ceiling earns - this may well be over in a second.
+UNAVAILABLE_COOLDOWN = 300.0
 
 
 def _build_groq(_mail):
@@ -825,6 +833,23 @@ class ProviderPool:
                 state.clients.pop(shape, None)
                 state.last_error = str(exc)
                 blocked.append((state.name, "not configured", 0.0))
+                continue
+            except ProviderUnavailable as exc:
+                # The request was not served: a decommissioned model, a revoked
+                # key, a 5xx. Before this it arrived as a bare exception and
+                # stopped the whole call with the next provider in the chain
+                # sitting idle behind it - a dead model name in `.env` took the
+                # pipeline down while a working provider went unasked.
+                #
+                # Cooled down as well as skipped, because the common causes are
+                # persistent and re-discovering them once per message costs a
+                # round trip each time.
+                state.cool_down(self._clock() + UNAVAILABLE_COOLDOWN, str(exc))
+                state.last_error = str(exc)
+                self.record(state.name, task, "error",
+                            model=self._model_of(state, shape))
+                blocked.append((state.name, f"unavailable ({exc.status or 'no response'})",
+                                UNAVAILABLE_COOLDOWN))
                 continue
 
         return self._default_and_wait(

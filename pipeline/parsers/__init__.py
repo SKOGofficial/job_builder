@@ -11,6 +11,7 @@ specific boards ahead of anything broad.
 import logging
 
 from clients.llm_client import GroqRateLimited
+from clients.providers.base import ProviderUnavailable
 from pipeline.parsers import generic, indeed, linkedin
 from pipeline.parsers.base import Posting, collect_anchors, strip_tags
 
@@ -59,7 +60,7 @@ def parse_alert(message, client=None):
             if client is not None and any(not p.company for p in postings):
                 try:
                     postings = generic.complete(message, postings, client)
-                except GroqRateLimited:
+                except (GroqRateLimited, ProviderUnavailable):
                     # Not a parse failure - see the note on the outer handler.
                     raise
                 except Exception:
@@ -73,14 +74,20 @@ def parse_alert(message, client=None):
         return []
     try:
         postings = generic.extract(message, client)
-    except GroqRateLimited:
-        # A rate limit is not a parse failure, and swallowing it here was
-        # actively misleading: the alert got logged as unparseable, produced no
-        # leads, and - because nothing links it - came back on the next cycle
-        # to hit the same limit again. Letting it reach the handler lets the
-        # batch stop cleanly and resume with a fresh token budget.
+    except (GroqRateLimited, ProviderUnavailable):
+        # Neither is a parse failure, and swallowing them here was actively
+        # misleading: the alert got logged as unparseable and produced no
+        # leads, so the handler read "this digest contains nothing".
+        #
+        # For a rate limit that only wasted a cycle. For a provider failure it
+        # destroyed data - the handler stamped `handled_at` and permanently
+        # retired 70 real alerts while a decommissioned model name in `.env`
+        # returned 404 on every call. Letting both reach the handler is what
+        # lets the batch stop cleanly and resume once the provider is back.
         raise
     except Exception:
+        # Still swallowed: a genuine parse bug is specific to this message, and
+        # blocking the queue on it would be a worse failure than dropping it.
         log.exception("Model extraction failed for %s",
                       message.get("gmail_message_id"))
         return []

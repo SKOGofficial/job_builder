@@ -74,6 +74,41 @@ class ProviderRateLimited(Exception):
         self.limits = limits or {}
 
 
+class ProviderUnavailable(Exception):
+    """Raised when a provider could not serve a request at all.
+
+    An HTTP error that is not a rate limit: a decommissioned model, a revoked
+    key, a 5xx, a connection that never opened. The call did not happen, and
+    that is the whole point of giving it a name.
+
+    It used to arrive as a bare `RuntimeError`, and a bare exception is
+    indistinguishable from a parse failure. `pipeline/parsers/__init__.py`
+    swallowed it and returned no postings, `AlertHandler` read "no postings"
+    as "this digest contains nothing", and stamped `handled_at` - permanently
+    retiring a perfectly good alert because a model name in `.env` had been
+    decommissioned. 70 alerts were lost that way before it was caught.
+
+    So the rule this class exists to enforce: **a failed call is not an
+    attempt.** Anything that reaches a handler through this exception must
+    leave the message exactly as it found it.
+
+    Parameters:
+        message (str): Human-readable reason, surfaced in the log.
+        provider (str): Display name of the provider that could not serve.
+            Empty when a test double raises.
+        status (int): The HTTP status, or 0 when the failure was not an HTTP
+            response at all.
+
+    Summary:
+        Signal that a provider could not serve a request, so nothing was tried.
+    """
+
+    def __init__(self, message, provider="", status=0):
+        super().__init__(message)
+        self.provider = provider
+        self.status = status
+
+
 class ProviderBudgetExhausted(Exception):
     """Raised when a configured spend or request ceiling is gone for the window.
 

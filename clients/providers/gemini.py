@@ -35,6 +35,7 @@ from clients.providers.base import (
     Pacer,
     ProviderNotConfigured,
     ProviderRateLimited,
+    ProviderUnavailable,
     estimate_tokens,
     retry_after_seconds,
 )
@@ -508,7 +509,8 @@ class GeminiClient:
         Raises:
             ProviderRateLimited: On HTTP 429, carrying the retry hint and
                 whether the limit was a per-minute or per-day one.
-            RuntimeError: On any other HTTP error at or above 400.
+            ProviderUnavailable: On any other HTTP error at or above 400,
+                meaning the request was not served at all.
 
         Note:
             No `responseSchema` is sent. Every parser in this project already
@@ -551,9 +553,13 @@ class GeminiClient:
                 scope=scope,
             )
         if response.status_code >= 400:
-            raise RuntimeError(
+            # See the matching site in `clients/llm_client.py`: a failed call
+            # must be distinguishable from an empty answer.
+            raise ProviderUnavailable(
                 f"Gemini returned HTTP {response.status_code}: "
-                f"{getattr(response, 'text', '')[:200]}"
+                f"{getattr(response, 'text', '')[:200]}",
+                provider=DISPLAY_NAME,
+                status=response.status_code,
             )
 
         payload = response.json()
