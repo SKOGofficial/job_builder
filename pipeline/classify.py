@@ -341,5 +341,29 @@ def classify_message(message):
 
     Returns:
         dict | None: As `classify`.
+
+    Note:
+        Reads by subscript rather than `.get`, because the callers pass both
+        plain dicts and `sqlite3.Row` - and a Row has no `.get`. The docstring
+        said "row or dict" long before that was true of the code.
     """
-    return classify(message.get("sender"), message.get("subject"))
+    return classify(_field(message, "sender"), _field(message, "subject"))
+
+
+def _field(message, name):
+    """One field of a row or dict, or None when absent.
+
+    Summary:
+        Read a named field from either mapping type.
+
+    Parameters:
+        message (Mapping | sqlite3.Row): The message to read.
+        name (str): The field name.
+
+    Returns:
+        str | None: The value, or None when the field is missing.
+    """
+    try:
+        return message[name]
+    except (IndexError, KeyError):
+        return None
