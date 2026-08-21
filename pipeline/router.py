@@ -214,6 +214,14 @@ class MessageRouter:
             self._record(payload, result, RULE_MODEL, counts)
             self.by_rule += 1
 
+        # Committed before the model is asked anything. The rules cost nothing
+        # and are already finished; leaving them in an open transaction meant a
+        # slow model pass held them hostage - on a real backlog, a hundred free
+        # labels sat unwritten for minutes behind a provider that was pacing at
+        # 45 seconds a call, and a cycle that died in the middle lost the lot.
+        if self.by_rule:
+            self.mail.commit()
+
         if undecided:
             await self._route_with_model(undecided, counts)
 
