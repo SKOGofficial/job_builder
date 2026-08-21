@@ -118,6 +118,50 @@ def configure_logging():
         level=os.environ.get("JOB_BUILDER_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
+    logging.getLogger("nicegui").addFilter(_TimerTeardownNoise())
+
+
+class _TimerTeardownNoise(logging.Filter):
+    """Drop the traceback NiceGUI logs when a page timer outlives its page.
+
+    Navigating away from Settings or Email matches logs a full traceback ending
+    in `RuntimeError: The parent slot of Timer(id=N) has been deleted.` The app
+    is fine - the timer is already on its way out - but at a 0.4s tick the race
+    is hit on almost every navigation, and a traceback that appears during
+    normal use trains you to ignore tracebacks.
+
+    It cannot be fixed from our side. `Timer._run_in_loop` evaluates
+    `with self._get_context():` *before* consulting `_should_stop()`, and it is
+    `_get_context` that raises on a deleted element - so the element is gone
+    before anything checks whether the timer should still be running.
+    `web/shell.py`'s `page_timer` cancels on disconnect, which sets the flag
+    that `_should_stop` reads, and the raise still beats it there.
+
+    So this is suppression, knowingly: one exact message, on one logger, for a
+    condition with no user-visible effect. Every other NiceGUI error still gets
+    through.
+
+    Summary:
+        Filter out NiceGUI's benign timer-teardown traceback.
+    """
+
+    #: Matched on the message rather than the exception type, because by the
+    #: time it reaches a handler it is an ordinary log record. Narrow enough
+    #: that a real RuntimeError about anything else still passes.
+    MESSAGE = "parent slot of Timer"
+
+    def filter(self, record):
+        """
+        Summary:
+            Decide whether one log record should be emitted.
+
+        Parameters:
+            record (logging.LogRecord): The record to test.
+
+        Returns:
+            bool: False for the timer-teardown race, True for everything else.
+        """
+        return self.MESSAGE not in record.getMessage()
 
 
 def main(argv=None):

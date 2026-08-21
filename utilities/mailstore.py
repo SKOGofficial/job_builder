@@ -407,6 +407,42 @@ class MailStore:
             return self.conn.execute(sql).fetchall()
         return self.conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
 
+    def unclassified_headers(self, limit=None):
+        """Every unclassified message, headers only.
+
+        Summary:
+            List the sender and subject of all messages awaiting a category.
+
+        Parameters:
+            limit (int | None): Most rows to return. None for all of them.
+
+        Returns:
+            list[sqlite3.Row]: `gmail_message_id`, `sender`, and `subject`,
+                oldest first.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Deliberately separate from `messages_awaiting_classification`, and
+            deliberately without its body requirement or its limit. The rule
+            tier reads only the sender and the subject, costs nothing, and has
+            no reason to be rationed - so it sweeps the whole backlog while the
+            limit stays where the expense is, on the model's share.
+
+            Bodies are excluded rather than merely unused: a full backlog is
+            thousands of rows, and loading their text to run a regex over the
+            subject line would be the most expensive part of the cheap tier.
+        """
+        sql = """
+            SELECT gmail_message_id, sender, subject FROM messages
+            WHERE category IS NULL
+            ORDER BY received_ts ASC
+        """
+        if limit is None:
+            return self.conn.execute(sql).fetchall()
+        return self.conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
+
     def count_awaiting_classification(self):
         """
         Summary:

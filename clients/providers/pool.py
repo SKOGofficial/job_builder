@@ -761,7 +761,7 @@ class ProviderPool:
                 something will free up rather than only that nothing did.
         """
         ready, blocked = [], []
-        for name in self.chain(task):
+        for position, name in enumerate(self.chain(task)):
             state = self.providers.get(name)
             if state is None or not state.configured():
                 blocked.append((name, "not configured", 0.0))
@@ -780,8 +780,28 @@ class ProviderPool:
             if delay > budget_s:
                 blocked.append((name, "pacing", delay))
                 continue
-            ready.append(state)
-        return ready, blocked
+            ready.append((delay, position, state))
+
+        # Soonest first, chain order breaking ties. Everything above decides
+        # *whether* a provider may take the call; this decides who goes first
+        # among those that may, and the honest answer is whoever can actually
+        # serve it now.
+        #
+        # Chain order alone was the throughput bug. A primary whose pacer said
+        # "wait 40s" still counted as ready, so `_send` slept out those 40
+        # seconds while a fallback sat idle with a full day's allowance - and
+        # then the primary often returned 429 anyway, so the call failed over
+        # having already burned the wait. Measured on a real mailbox: Groq had
+        # served 295 requests and was rate limiting on almost every call, while
+        # Gemini showed 1 of 1200 used, and classification advanced one or two
+        # messages per ten-minute cycle against a backlog of 200.
+        #
+        # Ties keep chain order exactly, so the usual case - nothing is paced,
+        # every delay is 0.0 - still prefers the configured primary. This only
+        # changes behaviour when the primary would genuinely have made the
+        # caller wait.
+        ready.sort(key=lambda entry: (entry[0], entry[1]))
+        return [state for _delay, _position, state in ready], blocked
 
     def call(self, task, shape, send, projected_tokens, max_wait=None):
         """Run one model call against the first provider that will take it.

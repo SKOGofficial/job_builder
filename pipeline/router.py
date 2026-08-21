@@ -174,45 +174,63 @@ class MessageRouter:
             the model only where they do not.
 
         Parameters:
-            limit (int | None): Most messages to classify in one pass. The limit
-                bounds the whole batch, not just the model's share of it.
+            limit (int | None): Most **model calls** this pass may make. The
+                rule tier ignores it and sweeps the whole backlog, because it
+                costs nothing and rationing it was what let expensive work
+                block free work.
 
         Returns:
             dict[str, int]: Count per label assigned in this pass.
 
         Note:
-            The rules run over the whole batch before a client is asked for, so
-            a mailbox of nothing but job-board digests is classified in full
+            The rules run over the whole backlog before a client is asked for,
+            so a mailbox of nothing but job-board digests is classified in full
             with no provider configured at all. That matters more than the cost:
             a rate-limited or missing model used to stop classification dead,
-            and now it only stops the part that needs a model.
+            and now it only stops the part that genuinely needs a model.
         """
-        pending = self.mail.messages_awaiting_classification(limit)
-        if not pending:
-            return {}
-
         counts = {}
 
-        # Plain dicts across the thread boundary - handing a worker a sqlite
-        # Row would tempt it into touching a connection it does not own.
-        payloads = [
+        # The rules first, over the *whole* backlog rather than one batch.
+        #
+        # They used to see only the same `limit` rows the model would, taken
+        # oldest first, and that made the cheap tier useless exactly when it
+        # mattered. On a real mailbox all 60 of the oldest unclassified
+        # messages were ones the rules decline, so the rule pass answered none
+        # of them, the model took the lot at one or two per cycle - and the 104
+        # messages behind them that the rules could have answered instantly and
+        # for free were never reached at all. Head-of-line blocking, with the
+        # free work stuck behind the expensive work.
+        #
+        # Headers only: the rules read the sender and the subject, so there is
+        # no reason to load thousands of message bodies to run them.
+        for header in self.mail.unclassified_headers():
+            result = classify_message(header)
+            if result is None:
+                continue
+            self._record(header, result, RULE_MODEL, counts)
+            self.by_rule += 1
+
+        # Committed before the model is asked anything. The rules cost nothing
+        # and are already finished; leaving them in an open transaction meant a
+        # slow model pass held them hostage - a hundred free labels sat unwritten
+        # for minutes behind a provider pacing at 45 seconds a call, and a cycle
+        # that died in the middle lost the lot.
+        if self.by_rule:
+            self.mail.commit()
+
+        # Now the model's share, and only now. The rule pass has committed, so
+        # this query no longer returns anything it answered - and `limit` means
+        # what it should: how many *model calls* one cycle may make.
+        undecided = [
             {
                 "gmail_message_id": row["gmail_message_id"],
                 "sender": row["sender"],
                 "subject": row["subject"],
                 "body_text": row["body_text"],
             }
-            for row in pending
+            for row in self.mail.messages_awaiting_classification(limit)
         ]
-
-        undecided = []
-        for payload in payloads:
-            result = classify_message(payload)
-            if result is None:
-                undecided.append(payload)
-                continue
-            self._record(payload, result, RULE_MODEL, counts)
-            self.by_rule += 1
 
         if undecided:
             await self._route_with_model(undecided, counts)
