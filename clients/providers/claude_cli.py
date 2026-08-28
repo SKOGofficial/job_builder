@@ -170,6 +170,11 @@ MISSING_BINARY_HINT = (
 # Configuration ------------------------------------------------------------
 
 
+#: Set once `.env` has been read, so configuration is fixed for the life of
+#: the process rather than drifting as the file is edited under a running app.
+_env_loaded = False
+
+
 def _load_env():
     """Load `.env` if python-dotenv is installed.
 
@@ -181,7 +186,19 @@ def _load_env():
         locally, because the tests null that name out to keep a developer's
         real .env from leaking into a run. Three `dirname` calls, not two:
         this module sits one directory deeper than `clients/llm_client.py`.
+
+        Loaded once per process. `load_dotenv` never overrides a variable that
+        is already set, so a second call could only ever pick up a key *added*
+        to `.env` since startup - which meant a running process could change
+        behaviour halfway through, and two runs of the same build were not
+        guaranteed to be the same program. Configuration is now fixed for the
+        life of the process; restart to pick up an edit.
     """
+    global _env_loaded
+
+    if _env_loaded:
+        return
+    _env_loaded = True
     if load_dotenv:
         env_path = os.path.join(
             os.path.dirname(

@@ -255,6 +255,54 @@ def diagnostics_page():
                     "Check the routing for that task in Settings."
                 ).classes("text-xs opacity-60")
 
+                research_spend()
+
+        def research_spend():
+            """The one spend the app measures in the units it is billed in.
+
+            Summary:
+                Show research output-token spend against its daily ceiling.
+
+            Note:
+                No dollar figures anywhere on this page, deliberately. Two of
+                the four providers cannot be priced per token at all - the CLI
+                bills a subscription and Groq's tier is free - so a price table
+                would put a confident number next to the two it does not
+                describe, and go stale besides. Research output tokens are the
+                exception: `SpendLimiter` already enforces a ceiling in exactly
+                those units, so the number is real and already load-bearing.
+            """
+            from clients.research_client import SpendLimiter
+
+            try:
+                limiter = SpendLimiter(mail)
+                spent = limiter.spent_today()
+            except Exception:
+                log.debug("Research spend unavailable", exc_info=True)
+                return
+
+            output = spent["output_tokens"]
+            ceiling = limiter.ceiling
+            ui.label("Research budget").classes("text-sm font-medium pt-3")
+            ui.label(
+                f"{output:,} of {ceiling:,} output tokens used in the last 24 "
+                f"hours, across {spent['calls']} call(s)."
+            ).classes("text-xs opacity-70")
+            if ceiling:
+                bar = ui.linear_progress(
+                    value=min(1.0, output / ceiling), show_value=False
+                ).props("rounded")
+                if output >= ceiling * 0.9:
+                    bar.props("color=red")
+                elif output >= ceiling * 0.5:
+                    bar.props("color=orange")
+            ui.label(
+                "Raise it with RESEARCH_DAILY_OUTPUT_TOKENS. Only calls whose "
+                "result was stored are counted, so a call that failed before "
+                "answering is not billed here even though it was billed by the "
+                "provider."
+            ).classes("text-xs opacity-60")
+
         def refresh_all():
             queues_card.refresh()
             timings_card.refresh()

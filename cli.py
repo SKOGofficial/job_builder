@@ -154,6 +154,20 @@ def cmd_diagnostics(args):
         print(f"  {provider:<12} {entry['requests']:>5} calls  "
               f"{entry['tokens']:>9} tokens{share}   {entry['model'] or ''}")
 
+    # The one spend measured in the units it is billed in. No dollar figures:
+    # two of the four providers cannot be priced per token at all, so a price
+    # table would put a confident number next to the two it does not describe.
+    try:
+        from clients.research_client import SpendLimiter
+
+        limiter = SpendLimiter(mail)
+        spent = limiter.spent_today()
+        print("\nResearch budget (last 24h)")
+        print(f"  {spent['output_tokens']:,} of {limiter.ceiling:,} output "
+              f"tokens across {spent['calls']} call(s)")
+    except Exception as exc:
+        log.debug("Research spend unavailable: %s", exc)
+
     store.close()
     return 0
 
