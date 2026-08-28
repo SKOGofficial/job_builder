@@ -59,6 +59,11 @@ VERDICT_PASSED = "passed"
 #: into "cannot be classified, and here is why".
 MAX_CLASSIFY_ATTEMPTS = 3
 
+#: Recorded on a message that passed the filter, had its body fetched, and got
+#: nothing back. Phrased as a finished decision rather than an error, because
+#: that is what it is - there is no reply the model could give.
+EMPTY_BODY_REASON = "The fetched body was empty; there is nothing to classify."
+
 LEAD_NEW = "new"
 LEAD_PREPARING = "preparing"
 LEAD_READY = "ready"
@@ -584,15 +589,14 @@ class MailStore:
             f"""
             UPDATE messages
             SET classify_attempts = {MAX_CLASSIFY_ATTEMPTS},
-                classify_error = 'The fetched body was empty; '
-                                 'there is nothing to classify.'
+                classify_error = ?
             WHERE category IS NULL
               AND filter_verdict = ?
               AND body_fetched_at IS NOT NULL
               AND (body_text IS NULL OR TRIM(body_text) = '')
               AND classify_attempts < {MAX_CLASSIFY_ATTEMPTS}
             """,
-            (VERDICT_PASSED,),
+            (EMPTY_BODY_REASON, VERDICT_PASSED),
         )
         self.conn.commit()
         return cursor.rowcount

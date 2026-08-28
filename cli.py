@@ -9,6 +9,7 @@ Safe to run alongside the app. WAL mode plus a busy timeout (set in
 than deadlock.
 
     python cli.py status
+    python cli.py diagnostics --hours 24
     python cli.py sync --once
     python cli.py backfill --days 365 --max 2000
     python cli.py filter-stats
@@ -54,6 +55,9 @@ def cmd_status(args):
     print("\nMailbox")
     print(f"  last sync   {mail.get_cursor(CURSOR_LAST_SYNC) or 'never'}")
     print(f"  history id  {mail.get_cursor(CURSOR_HISTORY_ID) or 'unset'}")
+    # The same call the Settings badge makes. These two used to be different
+    # queries that disagreed by 264; `cli.py diagnostics` breaks the number
+    # down when it matters.
     print(f"  unclassified {mail.count_awaiting_classification()}")
 
     print("\nFilter verdicts")
@@ -64,6 +68,109 @@ def cmd_status(args):
         print(f"  {category:<32} {count}")
     store.close()
     return 0
+
+
+#: Queue keys in the order a message actually moves through them, so the
+#: report reads as a pipeline rather than as an alphabetised list of numbers.
+QUEUE_ORDER = (
+    ("awaiting_filter", "waiting for a filter verdict"),
+    ("awaiting_body", "passed, waiting for a body"),
+    ("awaiting_rules", "waiting for the rule tier"),
+    ("awaiting_classification", "waiting for the model"),
+    ("awaiting_handling_job_alert", "alerts waiting for extraction"),
+    ("awaiting_handling_job_update", "updates waiting for extraction"),
+    ("awaiting_handling_job_acknowledgement", "acknowledgements waiting"),
+    ("dead_lettered", "retired - cannot be classified"),
+)
+
+
+def cmd_diagnostics(args):
+    """Where the pipeline's time goes, and what is waiting on it.
+
+    Summary:
+        Print queue depths, stage timings, and provider outcomes.
+
+    Parameters:
+        args (argparse.Namespace): Parsed arguments; uses `db` and `hours`.
+
+    Returns:
+        int: 0.
+
+    Note:
+        Deliberately a CLI command and not only a page. The scheduler lives
+        inside the NiceGUI process, so the moment worth asking "is anything
+        draining" is exactly the moment the app is closed and the page is
+        unreachable.
+    """
+    from datetime import datetime, timedelta
+
+    store, mail = open_stores(args.db)
+    since = (datetime.now() - timedelta(hours=args.hours)).isoformat(
+        timespec="seconds")
+
+    print(f"Queues  (as of {datetime.now().isoformat(timespec='seconds')})")
+    depths = mail.queue_depths()
+    for key, label in QUEUE_ORDER:
+        print(f"  {label:<38} {depths.get(key, 0)}")
+
+    dropped = mail.filtered_out()
+    if dropped:
+        total = sum(dropped.values())
+        print(f"\nFiltered out before classification  ({total} total)")
+        print("  Not a backlog: dropped on headers, no body fetched, never "
+              "sent to a model.")
+        for verdict, count in dropped.items():
+            print(f"  {verdict:<38} {count}")
+
+    print(f"\nStage timings  (last {args.hours}h)")
+    timings = mail.stage_timings(since)
+    if not timings:
+        print("  Nothing recorded yet - the pipeline has not run in this "
+              "window.")
+    else:
+        print(f"  {'stage':<12} {'runs':>5} {'done':>6} {'median':>9} "
+              f"{'p95':>9} {'max':>9} {'fails':>6}")
+        for row in timings:
+            print(f"  {row['stage']:<12} {row['runs']:>5} "
+                  f"{row['processed']:>6} {_ms(row['median_ms']):>9} "
+                  f"{_ms(row['p95_ms']):>9} {_ms(row['max_ms']):>9} "
+                  f"{row['failures']:>6}")
+
+    errors = mail.last_stage_errors()
+    if errors:
+        print("\nLast failure per stage")
+        for stage, entry in sorted(errors.items()):
+            print(f"  {stage:<12} {entry['started_at']}  {entry['detail']}")
+
+    print(f"\nProviders  (last {args.hours}h)")
+    usage = mail.provider_usage_since(since)
+    if not usage:
+        print("  No model calls in this window.")
+    for provider, entry in sorted(usage.items()):
+        share = ""
+        if entry["requests"]:
+            share = f"  {entry['failures'] / entry['requests']:.0%} failed"
+        print(f"  {provider:<12} {entry['requests']:>5} calls  "
+              f"{entry['tokens']:>9} tokens{share}   {entry['model'] or ''}")
+
+    store.close()
+    return 0
+
+
+def _ms(value):
+    """
+    Summary:
+        Format a millisecond duration for a fixed-width column.
+
+    Parameters:
+        value (int | None): Milliseconds.
+
+    Returns:
+        str: Seconds with one decimal past a second, milliseconds below it.
+    """
+    if not value:
+        return "0ms"
+    return f"{value / 1000:.1f}s" if value >= 1000 else f"{int(value)}ms"
 
 
 def cmd_sync(args):
@@ -236,6 +343,13 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("status", help="counts and cursors").set_defaults(func=cmd_status)
+
+    diagnostics = sub.add_parser(
+        "diagnostics", help="queue depths, stage timings, provider outcomes")
+    diagnostics.add_argument(
+        "--hours", type=int, default=24,
+        help="how far back to summarise timings and usage (default 24)")
+    diagnostics.set_defaults(func=cmd_diagnostics)
 
     sync = sub.add_parser("sync", help="run one pipeline cycle")
     sync.add_argument("--once", action="store_true", help="accepted for clarity")
