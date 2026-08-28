@@ -282,6 +282,10 @@ class ProviderState:
         self.cooldown_until = 0.0
         self.last_error = ""
         self._clock = clock
+        #: Guards `cooldown_until` and `last_error`, which are written from
+        #: executor threads and read on the loop thread. `Budget` next to it
+        #: has had one from the start; these were simply missed.
+        self._lock = threading.Lock()
 
     @property
     def client(self):
@@ -373,10 +377,19 @@ class ProviderState:
             Extends an existing cooldown but never shortens it. A second
             refusal arriving with a smaller hint must not make a provider look
             available sooner than the first one said.
+
+            Locked, because this is called from executor threads - every stage
+            puts its model call on one - while `candidates` reads it on the
+            loop thread. `max` of a stale read is how two providers refusing at
+            once could leave one of them looking available, and a cooldown lost
+            that way sends the very next call at a provider that has just said
+            no. `Budget` has had a lock since it was written; this is the same
+            argument for the field next to it.
         """
-        self.cooldown_until = max(self.cooldown_until, until)
-        if reason:
-            self.last_error = reason
+        with self._lock:
+            self.cooldown_until = max(self.cooldown_until, until)
+            if reason:
+                self.last_error = reason
 
     def delay(self, now, projected_tokens):
         """The longest of every pacing rule that applies to this provider.
@@ -448,6 +461,16 @@ class ProviderPool:
         self.providers = {}
         self.routes = {}
         self.pending_usage = []
+        #: Guards `pending_usage` and the mutable fields on `ProviderState`.
+        #:
+        #: `record`, `cool_down` and the pacer are all called from executor
+        #: threads - every stage puts its model call on one - while `flush` and
+        #: `begin_cycle` run on the loop thread. `Budget` has had a lock since
+        #: it was written; the rest of the shared state did not, so a lost
+        #: append dropped a usage row and a lost cooldown sent the next stage
+        #: at a provider that had just refused. Both corrupt the decision the
+        #: pool makes next, and neither leaves a trace.
+        self._lock = threading.Lock()
         #: Task id -> (provider name, model) for the most recent call. Read by
         #: the two stages that write a classification row.
         self.attribution = {}
@@ -558,10 +581,11 @@ class ProviderPool:
             actually did the work - the rows are bookkeeping, and losing them
             costs accuracy in the next budget seed, not correctness.
         """
-        if self.ledger is None or not self.pending_usage:
-            self.pending_usage = []
-            return 0
-        rows, self.pending_usage = self.pending_usage, []
+        with self._lock:
+            if self.ledger is None or not self.pending_usage:
+                self.pending_usage = []
+                return 0
+            rows, self.pending_usage = self.pending_usage, []
         try:
             return self.ledger.flush(rows)
         except Exception:
@@ -590,11 +614,12 @@ class ProviderPool:
             make a fast model behind a slow pacer look like a slow model. The
             wait is visible in `stage_runs`, which times whole stages.
         """
-        self.pending_usage.append({
-            "provider": provider, "task": task, "outcome": outcome,
-            "model": model, "total_tokens": tokens or 0,
-            "duration_ms": duration_ms,
-        })
+        with self._lock:
+            self.pending_usage.append({
+                "provider": provider, "task": task, "outcome": outcome,
+                "model": model, "total_tokens": tokens or 0,
+                "duration_ms": duration_ms,
+            })
 
     # Status ----------------------------------------------------------------
 

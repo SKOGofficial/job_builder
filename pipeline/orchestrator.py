@@ -33,13 +33,29 @@ log = logging.getLogger(__name__)
 
 IDLE, RUNNING, ERROR = "idle", "running", "error"
 
+#: What share of the poll interval one cycle may spend before it stops starting
+#: new stages.
+#:
+#: Every stage is bounded by a count and none by time, which is not the same
+#: thing at all: `classify` at sixty calls against a five-second pacer is three
+#: hundred seconds, and `prepare` is five leads against a subprocess that may
+#: take four minutes each. `dispatch` runs after both. So the stages at the end
+#: were not competing for the cycle - they were getting whatever the ones at the
+#: front left over, which on a bad day was nothing.
+#:
+#: Seventy per cent leaves room for the cycle to finish the stage it is in.
+#: The deadline is checked between stages, never inside one: interrupting a
+#: model call mid-flight would spend the tokens and keep none of the answer.
+CYCLE_DEADLINE_SHARE = 0.7
+
 
 class PipelineCycle:
     """One pass over the pipeline, with per-stage limits."""
 
     def __init__(self, store, mail, client_factory=None, executor=None,
                  threshold=0.85, limits=None, research_factory=None,
-                 relevance_threshold=None, auto_prepare=False):
+                 relevance_threshold=None, auto_prepare=False,
+                 deadline_seconds=None):
         self.store = store
         self.mail = mail
         self.client_factory = client_factory
@@ -71,6 +87,12 @@ class PipelineCycle:
             # spend and a slow call, so a burst of new leads is spread across
             # cycles rather than fired at once.
             "prepare": 5,
+            # The only stage that had no limit at all. It walks every message
+            # with no verdict yet and writes one per row, synchronously, on the
+            # loop thread that also serves the UI - so a first backfill of
+            # several thousand messages was a single unbounded burst in the
+            # middle of a cycle that bounds everything else.
+            "filter": 500,
         }
         self.limits.update(limits or {})
 
@@ -92,9 +114,26 @@ class PipelineCycle:
         self.pending_timings = []
         self.cycle_id = ""
 
+        #: Wall-clock budget for one cycle, or None for no ceiling.
+        #: `PipelineScheduler` sets it from the poll interval.
+        self.deadline_seconds = deadline_seconds
+        self._deadline_at = None
+
     @property
     def busy(self):
         return self.state == RUNNING
+
+    def out_of_time(self):
+        """
+        Summary:
+            Whether this cycle has spent its wall-clock budget.
+
+        Returns:
+            bool: True when the deadline has passed. Always False when no
+                deadline is set.
+        """
+        return (self._deadline_at is not None
+                and time.monotonic() >= self._deadline_at)
 
     # --- measurement -------------------------------------------------------
 
@@ -125,6 +164,16 @@ class PipelineCycle:
             cycle. The failure is now the stage's own, and it is written down
             instead of only logged.
         """
+        if self.out_of_time():
+            # Recorded rather than silently not run. A stage that never gets a
+            # turn looks exactly like a stage with nothing to do, and telling
+            # those apart is the whole reason the deadline is visible at all.
+            self.note_skipped(
+                stage,
+                f"Cycle ran out of time before this stage "
+                f"({self.deadline_seconds}s budget).")
+            return default
+
         started = time.perf_counter()
         started_at = datetime.now().isoformat(timespec="seconds")
         outcome, detail = "ok", None
@@ -249,15 +298,34 @@ class PipelineCycle:
         return pool
 
     def apply_filter(self):
-        """Give every unfiltered message a verdict.
+        """Give unfiltered messages a verdict, up to this cycle's limit.
 
         Runs on headers alone. Rebuilt each cycle so a company applied to five
         minutes ago, or a domain just added to the denylist, is reflected
         immediately.
+
+        Summary:
+            Assign a rough-filter verdict to messages that have none.
+
+        Returns:
+            dict[str, int]: `passed` and `dropped` counts for this pass.
+
+        Raises:
+            sqlite3.Error: If a read or a write fails.
+
+        Note:
+            Bounded and oldest-first, like every other stage. It was neither,
+            and it is the one stage that does its whole pass synchronously on
+            the thread serving the UI - so a backfill made the interface stop
+            responding for as long as it took to verdict several thousand
+            headers. What is left over is picked up next cycle; the verdict
+            column is the resume point.
         """
         rough = build_filter(self.store, self.mail)
         rows = self.mail.conn.execute(
-            "SELECT * FROM messages WHERE filter_verdict IS NULL"
+            "SELECT * FROM messages WHERE filter_verdict IS NULL "
+            "ORDER BY received_ts ASC LIMIT ?",
+            (self.limits["filter"],),
         ).fetchall()
         passed = dropped = 0
         for row in rows:
@@ -286,6 +354,8 @@ class PipelineCycle:
         self.state = RUNNING
         self.cycle_id = uuid.uuid4().hex[:12]
         self.pending_timings = []
+        self._deadline_at = (time.monotonic() + self.deadline_seconds
+                             if self.deadline_seconds else None)
         result = {}
         try:
             result["synced"] = await self._timed(
