@@ -1,21 +1,28 @@
 """To-apply: roles surfaced from job-board alerts that you have not applied to.
 
-The list is meant to be acted on directly - open a row, click through to the
-portal, apply. A `ready` lead has already had the expensive half done: the
-company researched, its resume bullets chosen, its letter written. Clicking
-Resume or Cover Letter only renders and delivers, so there is still no
-"generate" step waiting on a model.
+The list is a shortlist to choose from, not a queue that has already been
+worked. Nothing here costs anything until you press Generate on a specific
+role: the pipeline scores every lead, because scoring is free and is what makes
+the list rankable, and then stops.
 
-Rows sit in one of three visible states. `new` means it has not cleared the
-relevance gate that keeps research spend proportional, `preparing` means the
-work is under way, and `ready` means it can be acted on now. A lead whose
-preparation failed stays out of `ready` and shows the reason.
+That is a reversal. Documents used to be built unattended for anything scoring
+above 0.45, on the theory that the list should be application-ready before it
+was opened. What it produced was 363 leads and eleven documents, none of them
+asked for - a relevance score is a reasonable way to sort a list and a poor way
+to authorise a research call.
 
-Ordering is by posting date, newest first, and open leads are deleted once the
-posting passes `LEAD_FRESHNESS_DAYS`. Both are the same judgement: applying
-early is most of what decides whether an application is read at all, so the
-freshest role belongs at the top, and a two-month-old posting on a to-apply
-list is not a task - it is a role that has already been filled.
+Rows sit in one of three visible states. `new` means nothing has been built
+yet, which is now the normal resting state rather than a sign of a low score.
+`preparing` means a Generate click is under way, and `ready` means the
+documents exist. A lead whose preparation failed stays out of `ready` and shows
+the reason, so the list never offers a link that does not work.
+
+Ordering defaults to posting date, newest first, and open leads are deleted
+once the posting passes `LEAD_FRESHNESS_DAYS` - unless documents have been
+built for it, which is proof someone meant to apply. Applying early is most of
+what decides whether an application is read at all, so the freshest role
+belongs at the top, and a two-month-old posting on a to-apply list is not a
+task; it is a role that has already been filled.
 """
 
 import asyncio
@@ -37,6 +44,8 @@ from utilities.mailstore import (
     LEAD_OPEN_STATUSES,
     LEAD_PREPARING,
     LEAD_READY,
+    LEAD_SORT_POSTED,
+    LEAD_SORT_RELEVANCE,
     PREPARE_WAITING_PREFIX,
 )
 from web.shell import card, page_shell
@@ -54,8 +63,8 @@ STATUS_COLORS = {
 
 STATUS_HINTS = {
     LEAD_READY: "Resume and cover letter are ready. Download and apply.",
-    LEAD_PREPARING: "Research and resume generation are running.",
-    LEAD_NEW: "Waiting on relevance scoring, or scored below the threshold.",
+    LEAD_PREPARING: "Research and document generation are running.",
+    LEAD_NEW: "No documents yet. Press Generate if you want to apply.",
 }
 
 FILTERS = [
@@ -131,13 +140,18 @@ def _column(row, name, default=None):
 def leads_page():
     state = get_state()
     store, mail = state.store, state.mail
-    chosen = {"statuses": LEAD_OPEN_STATUSES}
+    chosen = {"statuses": LEAD_OPEN_STATUSES, "sort": LEAD_SORT_POSTED}
+    #: Lead ids with a Generate click in flight. The status column would nearly
+    #: do this on its own, but a lead left at `preparing` by a crashed run
+    #: would then be permanently un-clickable; this clears with the page.
+    preparing = set()
 
     with page_shell(
         "To apply",
-        "Roles found in job-board alerts, newest posting first. Ready rows have a "
-        f"tailored resume and cover letter waiting. Anything still unapplied after "
-        f"{LEAD_FRESHNESS_DAYS} days is dropped automatically.",
+        "Roles found in job-board alerts, newest posting first. Nothing is "
+        "written until you press Generate on a role you want. Anything still "
+        f"untouched after {LEAD_FRESHNESS_DAYS} days is dropped automatically; "
+        "a lead you have generated documents for is kept.",
         active="/leads",
     ):
 
@@ -168,9 +182,81 @@ def leads_page():
             chosen["statuses"] = statuses
             lead_list.refresh()
 
+        def sort_by(key):
+            chosen["sort"] = key
+            lead_list.refresh()
+
+        async def generate(lead):
+            """Research the company and build this lead's documents, on demand.
+
+            Summary:
+                Run preparation for one lead and refresh the list.
+
+            Parameters:
+                lead (Mapping): The lead row to prepare.
+
+            Note:
+                This is the click the pipeline no longer makes on its own.
+                `prepare_now` bypasses the relevance threshold on purpose:
+                asking for a role *is* the judgement the score was standing in
+                for, and a threshold set slightly wrong should not make a role
+                unreachable.
+
+                The status is deliberately *not* written here. `prepare` sets
+                `preparing` itself and, on a rate limit, restores whatever
+                status the lead arrived with - so writing `preparing` first
+                made "restore" mean "leave it at preparing", and a lead that
+                hit a busy provider stayed stuck in that state for ever with
+                its Generate button showing. The in-memory set below is enough
+                to render the spinner and to stop a second click.
+            """
+            from pipeline.prepare import LeadPreparer
+
+            if lead["id"] in preparing:
+                return
+            preparing.add(lead["id"])
+            lead_list.refresh()
+            ui.notify(f"Researching {lead['company'] or 'the company'} and "
+                      "writing your documents. This takes a minute.")
+            try:
+                pool = state.pool
+                preparer = LeadPreparer(
+                    store, mail,
+                    pool.for_task("score_relevance"),
+                    pool.for_task("research"),
+                    letter_client=pool.for_task("write_cover_letter"),
+                )
+                ready = await preparer.prepare_now(lead["id"])
+            except Exception as exc:
+                log.exception("Could not prepare lead %s", lead["id"])
+                # Only reached for a failure raised before `prepare` takes
+                # over - building the pool, say. Written to the lead rather
+                # than only to a toast, because `prepare` records its own
+                # failures there and the card already renders them, so a
+                # failure that lands anywhere else vanishes with the
+                # notification.
+                #
+                # Restores the status it arrived with rather than forcing
+                # `new`: a `ready` lead being regenerated still has its old
+                # documents, and demoting it would hide working downloads.
+                mail.set_lead_status(lead["id"], lead["status"], str(exc))
+                ready = False
+            finally:
+                preparing.discard(lead["id"])
+                lead_list.refresh()
+
+            if ready:
+                ui.notify("Resume and cover letter are ready.", type="positive")
+            else:
+                current = mail.lead(lead["id"])
+                reason = (current["prepare_error"] if current else "") or \
+                    "Nothing was written."
+                ui.notify(f"Could not prepare this lead: {reason}",
+                          type="negative", multi_line=True, close_button=True)
+
         @ui.refreshable
         def lead_list():
-            leads = mail.list_leads(chosen["statuses"])
+            leads = mail.list_leads(chosen["statuses"], chosen["sort"])
             with card("p-5"):
                 with ui.row().classes("w-full items-center gap-2"):
                     for label, statuses in FILTERS:
@@ -181,6 +267,16 @@ def leads_page():
                             ("unelevated" if active else "flat") + " no-caps dense"
                         )
                     ui.space()
+                    # Two questions, two orders: "what arrived this morning"
+                    # and "which of these is worth a research call".
+                    for label, key in (("Newest", LEAD_SORT_POSTED),
+                                       ("Best fit", LEAD_SORT_RELEVANCE)):
+                        ui.button(
+                            label, on_click=lambda k=key: sort_by(k)
+                        ).props(
+                            ("unelevated" if chosen["sort"] == key else "flat")
+                            + " no-caps dense"
+                        )
                     ui.button(icon="refresh", on_click=lead_list.refresh).props(
                         "flat round dense"
                     ).tooltip("Refresh")
@@ -363,6 +459,28 @@ def leads_page():
                         "flat no-caps dense"
                     )
                 elif lead["status"] != LEAD_APPLIED:
+                    # The click that used to be a background job. Offered while
+                    # a lead has no documents, and again once it has - a
+                    # posting whose description has changed, or a profile that
+                    # has been edited, is worth rewriting for.
+                    if lead["id"] in preparing:
+                        ui.spinner(size="sm")
+                        ui.label("Generating…").classes("text-xs opacity-70")
+                    else:
+                        has_documents = bool(mail.selections_for(
+                            lead["identity_key"]))
+                        ui.button(
+                            "Regenerate" if has_documents
+                            else "Generate documents",
+                            icon="auto_awesome",
+                            on_click=lambda l=lead: generate(l),
+                        ).props(
+                            ("flat" if has_documents else "unelevated")
+                            + " no-caps dense"
+                        ).tooltip(
+                            "Research this company and write a tailored resume "
+                            "and cover letter. Costs a model call."
+                        )
                     ui.button(
                         "I applied to this", on_click=lambda l=lead: promote(l)
                     ).props("flat no-caps dense")

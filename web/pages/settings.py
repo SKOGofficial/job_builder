@@ -16,6 +16,7 @@ import logging
 from nicegui import ui
 
 from clients import gmail_client, llm_client
+from pipeline import relevance
 from utilities import credentials, mailstore
 from web.ai_settings import build_ai_card, build_routing_card
 from web.shell import card, page_shell, page_timer
@@ -381,6 +382,54 @@ def settings_page():
                         on_click=lambda: retire_now(number.value),
                     ).props("flat no-caps dense")
 
+        # Relevance ------------------------------------------------------------
+
+        @ui.refreshable
+        def relevance_card():
+            """The bar the to-apply list uses to decide what to show first.
+
+            Summary:
+                Render the relevance threshold setting.
+
+            Note:
+                This used to decide what got researched, which made it a
+                spending control with an over-tight setting silently costing
+                you roles. Generation is a click now, so it only ranks - and
+                that is worth saying on the card, because a number that used to
+                mean money and now means sort order should not be adjusted on
+                the old assumption.
+            """
+            with card():
+                ui.label("Relevance bar").classes("text-base font-semibold")
+                ui.label(
+                    "How well a role must match your profile to be highlighted "
+                    "in the to-apply list. This only affects ordering and "
+                    "emphasis - you can generate documents for any lead, "
+                    "whatever it scored."
+                ).classes("text-sm opacity-70")
+
+                current = relevance.configured_threshold(state.store)
+
+                def save(value):
+                    try:
+                        score = max(0.0, min(1.0, float(value) / 100))
+                    except (TypeError, ValueError):
+                        ui.notify("Enter a percentage.", type="warning")
+                        return
+                    state.store.save_profile_value(
+                        relevance.RELEVANCE_THRESHOLD_KEY, f"{score:.2f}")
+                    if state.pipeline is not None:
+                        state.pipeline.relevance_threshold = score
+                    notify(f"Relevance bar set to {score:.0%}.")
+
+                percent = ui.number(
+                    label="Minimum match", value=round(current * 100),
+                    min=0, max=100, step=5, suffix="%", format="%d",
+                ).props("dense outlined").classes("w-40")
+                ui.button("Save", on_click=lambda: (save(percent.value),
+                                                    relevance_card.refresh()),
+                          ).props("unelevated no-caps dense")
+
         def retire_now(value):
             """
             Summary:
@@ -475,6 +524,7 @@ def settings_page():
         routing_card()
         pipeline_card()
         staleness_card()
+        relevance_card()
         denylist_card()
         page_timer(0.4, watch)
 

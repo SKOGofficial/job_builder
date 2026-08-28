@@ -377,7 +377,7 @@ class TestLeadPreparer(unittest.IsolatedAsyncioTestCase):
             self.store, self.mail,
             FakeGroq(['{"score": 0.9, "reason": "great fit"}']),
             self._research(), output_dir=self.directory, executor=immediate)
-        result = await preparer.run()
+        result = await preparer.run(prepare_limit=5)
         self.assertEqual(result["scored"], 1)
         self.assertEqual(result["prepared"], 1)
 
@@ -390,7 +390,7 @@ class TestLeadPreparer(unittest.IsolatedAsyncioTestCase):
             self.store, self.mail,
             FakeGroq(['{"score": 0.05, "reason": "wrong field"}']),
             self._research(), output_dir=self.directory, executor=immediate)
-        result = await preparer.run()
+        result = await preparer.run(prepare_limit=5)
         self.assertEqual(result["prepared"], 0)
         self.assertEqual(self.mail.list_leads()[0]["status"], LEAD_NEW)
 
@@ -401,7 +401,7 @@ class TestLeadPreparer(unittest.IsolatedAsyncioTestCase):
         preparer = LeadPreparer(
             store, mail, FakeGroq(['{"score": 0.9, "reason": "fit"}']),
             self._research(), output_dir=self.directory, executor=immediate)
-        result = await preparer.run()
+        result = await preparer.run(prepare_limit=5)
 
         self.assertEqual(result["failed"], 1)
         lead = mail.list_leads()[0]
@@ -429,7 +429,7 @@ class TestLeadPreparer(unittest.IsolatedAsyncioTestCase):
             FakeGroq(['{"score": 0.9, "reason": "fit"}',
                       '{"score": 0.9, "reason": "fit"}']),
             research, output_dir=self.directory, executor=immediate)
-        result = await preparer.run()
+        result = await preparer.run(prepare_limit=5)
 
         self.assertEqual(result["prepared"], 0)
         self.assertEqual(result["failed"], 0, "budget stop is not a lead failure")
@@ -451,7 +451,7 @@ class TestLeadPreparer(unittest.IsolatedAsyncioTestCase):
             research, output_dir=self.directory, executor=immediate)
 
         with self.assertNoLogs("pipeline.prepare", level="ERROR"):
-            result = await preparer.run()
+            result = await preparer.run(prepare_limit=5)
 
         self.assertEqual(result["prepared"], 0)
         self.assertEqual(result["failed"], 0, "a pause is not a lead failure")
@@ -472,7 +472,7 @@ class TestLeadPreparer(unittest.IsolatedAsyncioTestCase):
             self.store, self.mail,
             FakeGroq(['{"score": 0.9, "reason": "fit"}']),
             research, output_dir=self.directory, executor=immediate)
-        result = await preparer.run()
+        result = await preparer.run(prepare_limit=5)
 
         self.assertEqual(research.calls, 0, "asked before spending an attempt")
         self.assertEqual(result["prepared"], 0)
@@ -487,7 +487,7 @@ class TestLeadPreparer(unittest.IsolatedAsyncioTestCase):
             self.store, self.mail,
             FakeGroq(['{"score": 0.9, "reason": "fit"}']),
             research, output_dir=self.directory, executor=immediate)
-        await preparer.run()
+        await preparer.run(prepare_limit=5)
         self.assertTrue(self.mail.list_leads()[0]["prepare_error"])
 
         preparer.builder.research_client = self._research()

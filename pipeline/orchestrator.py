@@ -39,7 +39,7 @@ class PipelineCycle:
 
     def __init__(self, store, mail, client_factory=None, executor=None,
                  threshold=0.85, limits=None, research_factory=None,
-                 relevance_threshold=None):
+                 relevance_threshold=None, auto_prepare=False):
         self.store = store
         self.mail = mail
         self.client_factory = client_factory
@@ -47,6 +47,15 @@ class PipelineCycle:
         self.executor = executor
         self.threshold = threshold
         self.relevance_threshold = relevance_threshold
+        #: Whether a cycle may build documents on its own.
+        #:
+        #: False, and named rather than implied, because this is a policy and
+        #: not a tuning constant. A relevance score is a guess about whether a
+        #: person wants a role; using it to authorise a research call and a
+        #: cover letter made the bill a function of how well the model guessed.
+        #: Scoring still runs every cycle - it is free, and it is what makes
+        #: the list rankable - but the spend waits for a click.
+        self.auto_prepare = auto_prepare
         self.limits = {
             "sync": 500,
             "bodies": 60,
@@ -57,9 +66,10 @@ class PipelineCycle:
             # hour on alerts alone. 15 keeps each handler's share of a cycle
             # bounded to a few minutes.
             "handle": 15,
-            # Deliberately small: each prepared lead is a real spend and a slow
-            # call, so a burst of new leads is spread across cycles rather than
-            # fired at once.
+            # Only reached when `auto_prepare` is on, which it is not by
+            # default. Kept small for when it is: each prepared lead is a real
+            # spend and a slow call, so a burst of new leads is spread across
+            # cycles rather than fired at once.
             "prepare": 5,
         }
         self.limits.update(limits or {})
@@ -293,6 +303,13 @@ class PipelineCycle:
                 "retire", self.mail.retire_unclassifiable, 0)
             result["expired"] = await self._timed(
                 "expire", self.mail.purge_stale_leads, 0)
+            # Before the provider gate, with the other free stages. Retiring a
+            # stale alert costs no model call, and running it inside `dispatch`
+            # meant a cooling-off pool skipped the one piece of backlog work
+            # that needed no provider at all - the same mistake the rule tier
+            # was moved out of `_model_stages` to fix.
+            result["retired_alerts"] = await self._timed(
+                "retire_alerts", self.retire_stale_alerts, 0)
 
             pool = self._pool()
             if pool is not None:
@@ -343,6 +360,38 @@ class PipelineCycle:
             self.flush_timings()
         self.last_result = result
         return result
+
+    def retire_stale_alerts(self):
+        """Clear alerts too old for extraction to yield anything.
+
+        Summary:
+            Retire unhandled alerts past the configured staleness cutoff.
+
+        Returns:
+            int: How many alerts were retired.
+
+        Raises:
+            sqlite3.Error: Propagated from the store.
+
+        Note:
+            A lead built from an alert older than `LEAD_FRESHNESS_DAYS` is
+            deleted by `purge_stale_leads` on the same cycle that created it,
+            so extracting one is not merely low-value - its yield is zero. The
+            cutoff is a setting rather than a constant because the right answer
+            depends on the mailbox; see the Settings page, which shows what a
+            given cutoff would retire before it is chosen.
+        """
+        from utilities.mailstore import alert_staleness_days
+
+        days = alert_staleness_days(self.store)
+        retired = self.mail.retire_stale_alerts(days)
+        if retired:
+            log.info(
+                "Retired %d alert(s) older than %d days without extracting "
+                "them; a lead from one would be dropped as stale on the same "
+                "cycle it was created.", retired, days,
+            )
+        return retired
 
     async def classify(self, pool):
         """Label the unclassified backlog, with or without a provider.
@@ -472,15 +521,11 @@ class PipelineCycle:
         }
 
     async def prepare(self, pool):
-        """Score new leads and build artifacts for the ones worth it.
-
-        Degrades in two independent steps. Without a research provider, leads
-        still get scored and simply wait at `new`; without a scoring provider
-        this is not reached at all. Neither absence stops the rest of the
-        pipeline.
+        """Score new leads. Build documents only if explicitly told to.
 
         Summary:
-            Run the relevance gate and the artifact builder for this cycle.
+            Run the relevance scorer, and the artifact builder only when
+            `auto_prepare` is on.
 
         Parameters:
             pool (ProviderPool): The pool to draw task clients from.
@@ -489,6 +534,20 @@ class PipelineCycle:
             dict: The preparer's per-stage counts, or an empty dict on failure.
 
         Note:
+            Scoring is free and stays automatic - it is what makes the to-apply
+            list rankable, and a research provider being out is no reason to
+            leave the backlog unscored.
+
+            Building is not automatic. A score above a threshold is a guess
+            that someone wants a role, and letting that guess authorise a
+            research call and a cover letter produced 363 leads' worth of
+            documents nobody asked for. The spend now waits for a click on the
+            Leads page, which calls `LeadPreparer.prepare_now`.
+
+            The research and letter clients are still resolved here, because
+            `auto_prepare` can be turned on and because resolving a client
+            costs nothing until it is called.
+
             Awaited, and the scorer and the builder both put their slow work on
             an executor, so these clients take the longer sleep budget for the
             same reason `dispatch`'s do.
@@ -513,7 +572,9 @@ class PipelineCycle:
                                         max_wait=THREAD_MAX_WAIT),
         )
         try:
-            return await preparer.run(prepare_limit=self.limits["prepare"])
+            return await preparer.run(
+                prepare_limit=self.limits["prepare"] if self.auto_prepare else 0
+            )
         except GroqRateLimited as exc:
             # A backstop, not the primary handler. `LeadPreparer` catches its
             # own limits per lead - it has to, since it is the one that knows

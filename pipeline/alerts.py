@@ -177,19 +177,15 @@ class AlertHandler:
             already written is kept, and the emails not reached stay unlinked,
             so the next cycle picks them up with a fresh token budget.
 
-            Stale alerts are retired before anything is extracted. That is what
-            makes the oldest-first ordering below affordable: without it, the
-            queue's tail is seven weeks of adverts whose leads would be deleted
-            on the cycle that created them.
+            Retiring stale alerts is not done here. It costs no model call, so
+            it belongs outside the provider gate - `PipelineCycle` runs it
+            unconditionally, next to the other free stages. Doing it here meant
+            that a cooling-off pool, which skips `dispatch` entirely, also
+            skipped the one piece of backlog work that needed no provider at
+            all. `_pending` still refuses stale rows, so this handler cannot
+            extract one whether or not the retirement has run.
         """
         totals = [0, 0, 0]
-        self.retired = self.mail.retire_stale_alerts(self.staleness_days)
-        if self.retired:
-            log.info(
-                "Retired %d alert(s) older than %d days without extracting "
-                "them; a lead from one would be dropped as stale on the same "
-                "cycle it was created.", self.retired, self.staleness_days,
-            )
         for message in self._pending(limit):
             try:
                 created, skipped, linked = await self.handle(message)
@@ -258,9 +254,15 @@ class AlertHandler:
             while the queue held seven weeks of alerts - a fresh posting is
             worth more than an old one - but it starved the tail permanently:
             469 alerts draining at fifteen a cycle never reached July. Now that
-            `run` retires anything past the staleness cutoff first, everything
-            left is inside the window and worth extracting, so the fair order
-            is the one where nothing waits for ever.
+            anything past the staleness cutoff is retired unextracted,
+            everything left is inside the window and worth extracting, so the
+            fair order is the one where nothing waits for ever.
+
+            The cutoff is applied here as well as by the retirement pass. The
+            two run in different stages, and a handler that would spend a model
+            call on a stale alert simply because the cheap pass had not got to
+            it yet is a handler with a hole in it.
         """
-        return self.mail.messages_awaiting_handling(CATEGORY_ALERT, limit,
-                                                    newest_first=False)
+        return self.mail.messages_awaiting_handling(
+            CATEGORY_ALERT, limit, newest_first=False,
+            newer_than_days=self.staleness_days)

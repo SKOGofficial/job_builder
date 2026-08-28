@@ -67,8 +67,8 @@ class StageTimingTests(unittest.TestCase):
         stages = {row["stage"] for row in self.rows()}
         self.assertEqual(
             stages,
-            {"sync", "filter", "bodies", "retire", "expire", "classify",
-             "dispatch", "prepare"},
+            {"sync", "filter", "bodies", "retire", "retire_alerts", "expire",
+             "classify", "dispatch", "prepare"},
         )
 
     def test_the_stages_of_one_cycle_share_a_cycle_id(self):

@@ -169,14 +169,16 @@ class TheHandlerSpendsNothingOnStaleAlertsTests(unittest.TestCase):
                             staleness_days=days)
 
     def test_a_stale_alert_is_never_sent_to_a_model(self):
+        # Belt and braces. The cycle retires these in a free stage before any
+        # provider is asked for, but the handler must refuse one anyway - a
+        # handler that would pay for a stale alert just because the cheap pass
+        # had not reached it yet is a handler with a hole in it.
         add_alert(self.mail, "old", 60)
         client = Counting()
 
         asyncio.run(self.handler(client).run(limit=10))
 
         self.assertEqual(client.calls, 0)
-        self.assertEqual(
-            self.mail.queue_depths()["awaiting_handling_job_alert"], 0)
 
     def test_a_fresh_alert_is_still_extracted(self):
         add_alert(self.mail, "fresh", 2)
@@ -186,14 +188,23 @@ class TheHandlerSpendsNothingOnStaleAlertsTests(unittest.TestCase):
 
         self.assertEqual(client.calls, 1)
 
-    def test_the_handler_reports_what_it_retired(self):
+    def test_the_cycle_retires_stale_alerts_without_a_provider(self):
+        # The reason this moved out of the handler: `dispatch` is skipped
+        # entirely when no provider is free, which used to skip the one piece
+        # of backlog work that needs no provider at all.
+        from pipeline.orchestrator import PipelineCycle
+
         add_alert(self.mail, "old-1", 30)
         add_alert(self.mail, "old-2", 40)
         add_alert(self.mail, "fresh", 1)
 
-        handler = self.handler(Counting())
-        asyncio.run(handler.run(limit=10))
-        self.assertEqual(handler.retired, 2)
+        def no_pool():
+            raise RuntimeError("no provider configured")
+
+        cycle = PipelineCycle(self.store, self.mail, client_factory=no_pool)
+        self.assertEqual(cycle.retire_stale_alerts(), 2)
+        self.assertEqual(
+            self.mail.queue_depths()["awaiting_handling_job_alert"], 1)
 
 
 class NothingWaitsForEverTests(unittest.TestCase):

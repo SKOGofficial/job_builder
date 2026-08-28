@@ -45,6 +45,10 @@ Help the user log and manage all job applications locally. The app should reduce
 - **2026-08-04** - user approved a third model provider (Google Gemini) as a second engine
   for classification and as the *primary* for research, with per-task routing editable in
   Settings. Research falls back to Anthropic.
+- **2026-08-28** - user chose fully manual document generation. Resumes and cover letters
+  are no longer built unattended for leads that clear a relevance score; they are built
+  when the user presses Generate on a specific lead. This supersedes the relevance-gate
+  half of the cost rule below.
 
 ## Cost And Safety Rules Specific To This Repo
 
@@ -57,10 +61,18 @@ Help the user log and manage all job applications locally. The app should reduce
 - **Every automatic status write must be reversible**, capturing the previous status and
   response date first. Applying `Rejected` stamps a response date, which drops the job out
   of the pool future scans check.
-- **Keep the expensive model behind the relevance gate and the daily spend ceiling.**
-  Removing either turns a parser bug into a large bill. Gemini being primary for research
-  lowers the bill but does not replace either guard: Claude still picks up whatever Gemini
-  cannot take.
+- **Nothing expensive runs without a person asking for it.** Research and cover-letter
+  writing happen only through `LeadPreparer.prepare_now`, from the Generate button on the
+  Leads page. `PipelineCycle.auto_prepare` defaults to False and turning it on is a policy
+  change, not a tuning tweak. The relevance score still runs on every cycle - it is free
+  and it ranks the list - but a score is a guess about someone else's taste and must never
+  again be what authorises a spend.
+- **The daily spend ceiling still stands.** It is now the backstop rather than the second
+  of two guards, so removing it turns a parser bug into a large bill with nothing in the
+  way. Gemini being primary for research lowers the bill but does not replace it.
+- **Extraction is not free either.** Alerts older than the configured staleness cutoff are
+  retired without a model call, because a lead built from one is deleted by
+  `purge_stale_leads` on the same cycle. Do not "fix" this by extracting them.
 - **Every model call must record which model served it.** The confidence threshold is
   global by design, so the recorded model name is the only thing that can attribute a bad
   label afterwards.

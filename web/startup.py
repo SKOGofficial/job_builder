@@ -83,10 +83,17 @@ def build_pipeline(state=None):
     if state.pipeline is None:
         # The pipeline draws from the same pool Settings displays, so the
         # budget and cooldowns shown are the ones actually in force.
+        from pipeline.relevance import configured_threshold
+
         state.pipeline = PipelineCycle(
             state.store, state.mail,
             client_factory=lambda: state.pool,
             threshold=confidence_threshold(),
+            # Was never passed, so the hardcoded default was the only value
+            # this could ever have. It no longer gates spend - generation is a
+            # click - but it does decide what the to-apply list shows first,
+            # which is worth being able to change.
+            relevance_threshold=configured_threshold(state.store),
         )
     if state.scheduler is None:
         state.scheduler = PipelineScheduler(state.pipeline, poll_interval())

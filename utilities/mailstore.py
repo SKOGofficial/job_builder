@@ -81,6 +81,29 @@ LEAD_OPEN_STATUSES = (LEAD_READY, LEAD_PREPARING, LEAD_NEW)
 #: stops being a list of things to do.
 LEAD_FRESHNESS_DAYS = 14
 
+#: How the to-apply list may be ordered.
+#:
+#: Two questions, two orders. "What arrived this morning" wants the newest
+#: posting first, because applying early is most of what decides whether an
+#: application is read. "Which of these should I spend a research call on"
+#: wants the best fit first, and only became a question worth asking once
+#: generation stopped happening on its own.
+LEAD_SORT_POSTED = "posted"
+LEAD_SORT_RELEVANCE = "relevance"
+
+LEAD_SORTS = {
+    LEAD_SORT_POSTED: (
+        "ORDER BY COALESCE(posted_ts, 0) DESC, "
+        "relevance_score DESC NULLS LAST, "
+        "created_at DESC"
+    ),
+    LEAD_SORT_RELEVANCE: (
+        "ORDER BY relevance_score DESC NULLS LAST, "
+        "COALESCE(posted_ts, 0) DESC, "
+        "created_at DESC"
+    ),
+}
+
 #: Profile key holding how old an unhandled alert may be before the pipeline
 #: retires it without spending a model call on it. Kept in the key/value
 #: profile table rather than as a constant because the right answer depends on
@@ -960,7 +983,8 @@ class MailStore:
                      cursor.rowcount, category)
         return cursor.rowcount
 
-    def messages_awaiting_handling(self, category, limit=50, newest_first=True):
+    def messages_awaiting_handling(self, category, limit=50, newest_first=True,
+                                   newer_than_days=None):
         """A category handler's backlog.
 
         Summary:
@@ -974,6 +998,10 @@ class MailStore:
                 matters more than an old one. Acknowledgements pass False -
                 they are processed oldest first so that a lead is promoted by
                 the receipt that actually came first.
+            newer_than_days (int | None): Exclude messages older than this.
+                None, the default, means no age limit. Alerts pass their
+                staleness cutoff so a handler cannot spend a model call on a
+                message the retirement pass has not reached yet.
 
         Returns:
             list[sqlite3.Row]: Unhandled messages in that category.
@@ -982,15 +1010,30 @@ class MailStore:
             sqlite3.Error: If the query fails.
         """
         order = "DESC" if newest_first else "ASC"
+        age_clause = ""
+        args = [category]
+        if newer_than_days is not None:
+            # Same `fetched_at` fallback as `retire_stale_alerts`, so the two
+            # agree about which rows are stale. An undated message is treated
+            # as recent in both.
+            age_clause = """
+              AND COALESCE(
+                    received_ts,
+                    CAST(strftime('%s', fetched_at) AS INTEGER)
+                  ) >= ?
+            """
+            args.append(int(time.time()) - int(newer_than_days) * 86400)
+        args.append(limit)
         return self.conn.execute(
             f"""
             SELECT * FROM messages
             WHERE category = ?
               AND handled_at IS NULL
+              {age_clause}
             ORDER BY received_ts {order}
             LIMIT ?
             """,
-            (category, limit),
+            args,
         ).fetchall()
 
     def unlink_message(self, gmail_message_id, identity_key):
@@ -1205,7 +1248,8 @@ class MailStore:
             "SELECT * FROM job_leads WHERE id = ?", (lead_id,)
         ).fetchone()
 
-    def list_leads(self, statuses=LEAD_OPEN_STATUSES):
+    def list_leads(self, statuses=LEAD_OPEN_STATUSES,
+                   sort_by=LEAD_SORT_POSTED):
         """The to-apply list, newest posting first.
 
         Summary:
@@ -1215,6 +1259,7 @@ class MailStore:
             statuses (tuple[str, ...] | None): Statuses to include. Defaults
                 to `LEAD_OPEN_STATUSES`. Pass None for every lead regardless
                 of status, which is what the "show dismissed" view uses.
+            sort_by (str): One of `LEAD_SORTS`. Defaults to newest posting.
 
         Returns:
             list[sqlite3.Row]: Matching leads, newest posting first, with
@@ -1234,12 +1279,14 @@ class MailStore:
 
             `created_at` is the tiebreaker of last resort, never the sort key -
             see `migrate_v6` for why it cannot carry this.
+
+            Sorting by relevance is offered as an alternative rather than as
+            the default, and only became worth offering once generation was a
+            click: choosing which handful of 363 leads to spend a research call
+            on is a different task from seeing what arrived this morning, and
+            it wants a different order.
         """
-        order = (
-            "ORDER BY COALESCE(posted_ts, 0) DESC, "
-            "relevance_score DESC NULLS LAST, "
-            "created_at DESC"
-        )
+        order = LEAD_SORTS.get(sort_by, LEAD_SORTS[LEAD_SORT_POSTED])
         if statuses is None:
             return self.conn.execute(
                 f"SELECT * FROM job_leads {order}"
@@ -1278,6 +1325,13 @@ class MailStore:
             The date falls back to `created_at` when `posted_ts` is missing.
             Skipping dateless rows instead would make them permanent, which is
             the one outcome this method exists to prevent.
+
+            A lead with documents in `job_artifacts` is never purged, whatever
+            its age. Generation is a deliberate act now rather than something
+            the pipeline did on its own, so those rows are the ones a person
+            actually chose - and deleting a role you asked for documents about,
+            two weeks later, without saying anything, is not freshness. It is
+            losing your work.
         """
         cutoff = int(time.time()) - older_than_days * 86400
         marks = ", ".join("?" for _ in LEAD_OPEN_STATUSES)
@@ -1289,6 +1343,7 @@ class MailStore:
                     posted_ts,
                     CAST(strftime('%s', created_at) AS INTEGER)
                   ) < ?
+              AND identity_key NOT IN (SELECT identity_key FROM job_artifacts)
             """,
             (*LEAD_OPEN_STATUSES, cutoff),
         )

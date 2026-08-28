@@ -557,6 +557,49 @@ async def test_empty_leads_page_explains_itself(user, state):
     await user.should_see("No leads here yet")
 
 
+async def test_a_lead_offers_generation_rather_than_having_run_it(user, state):
+    """The button that replaced a background job.
+
+    A lead scoring 90% used to have had its research and letter bought already.
+    Now the page offers to do it, and the offer is the only thing that spends.
+    """
+    add_lead(state)
+    await user.open("/leads")
+    await user.should_see("Generate documents")
+    assert state.mail.selections_for(
+        identity_key("Backend Engineer", "Acme", "Remote")) == []
+
+
+async def test_a_lead_with_documents_offers_to_rewrite_them(user, state):
+    add_lead(state)
+    key = identity_key("Backend Engineer", "Acme", "Remote")
+    state.mail.save_selection(key, "resume", bullet_ids=[1])
+    state.mail.commit()
+
+    await user.open("/leads")
+    await user.should_see("Regenerate")
+
+
+async def test_leads_can_be_sorted_by_best_fit(user, state):
+    """Choosing what to spend a research call on wants a different order."""
+    add_lead(state, title="Backend Engineer", score=0.4)
+    add_lead(state, title="Staff Engineer", score=0.95)
+
+    await user.open("/leads")
+    user.find("Best fit").click()
+    await user.should_see("Relevance 95%")
+
+    ordered = state.mail.list_leads(sort_by="relevance")
+    assert [row["title"] for row in ordered] == ["Staff Engineer",
+                                                 "Backend Engineer"]
+
+
+async def test_the_page_says_nothing_is_written_until_you_ask(user, state):
+    add_lead(state)
+    await user.open("/leads")
+    await user.should_see("Nothing is written until you press Generate")
+
+
 async def test_promoting_a_lead_creates_an_application(user, state, store):
     add_lead(state)
     await user.open("/leads")
