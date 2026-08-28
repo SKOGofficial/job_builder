@@ -1592,31 +1592,44 @@ class MailStore:
             Read the saved per-task provider routing.
 
         Returns:
-            dict[str, tuple[str | None, str | None]]: Task id mapped to
-                `(primary, fallback)`. Empty when nothing has been edited.
+            dict[str, tuple[str, ...]]: Task id mapped to its ordered provider
+                chain. Empty when nothing has been edited.
 
         Raises:
             sqlite3.Error: If the query fails.
+
+        Note:
+            Reads `chain` in preference to the legacy pair, and falls back to
+            the pair for a row written before `migrate_v8`. The pair could only
+            ever hold two, so saving a route here used to silently drop the
+            third provider from an `LLM_ROUTE_*` chain - and this `.env` names
+            three for every classification task.
         """
         rows = self.conn.execute(
-            "SELECT task, primary_provider, fallback_provider FROM provider_settings"
+            "SELECT task, primary_provider, fallback_provider, chain "
+            "FROM provider_settings"
         ).fetchall()
-        return {
-            row["task"]: (row["primary_provider"], row["fallback_provider"])
-            for row in rows
-        }
+        routes = {}
+        for row in rows:
+            chain = [name.strip() for name in (row["chain"] or "").split(",")
+                     if name.strip()]
+            if not chain:
+                chain = [name for name in (row["primary_provider"],
+                                           row["fallback_provider"]) if name]
+            routes[row["task"]] = tuple(chain)
+        return routes
 
-    def set_provider_route(self, task, primary, fallback=None):
+    def set_provider_route(self, task, *providers):
         """
         Summary:
             Save which providers should serve one task, in order.
 
         Parameters:
             task (str): The task identifier being routed.
-            primary (str | None): Provider to try first. None means the task is
-                turned off entirely.
-            fallback (str | None): Provider to try when the primary has no
-                headroom. None means there is nowhere to fall back to.
+            *providers (str | None): Providers to try, in order. `None` and
+                empty entries are dropped, and duplicates are removed while
+                preserving order. No providers at all means the task is turned
+                off.
 
         Raises:
             sqlite3.Error: If the write or the commit fails.
@@ -1624,18 +1637,33 @@ class MailStore:
         Note:
             Commits, because this is a user action rather than pipeline
             progress - it must survive whatever the current cycle does next.
+
+            Takes a chain rather than a primary and a fallback. The old
+            two-argument form silently threw away any third provider, which is
+            most of the point of `migrate_v8`. `primary_provider` and
+            `fallback_provider` are still written so a downgrade reads
+            something sensible, but `chain` is what `provider_routes` returns.
         """
+        chain = []
+        for name in providers:
+            if name and name not in chain:
+                chain.append(name)
         self.conn.execute(
             """
             INSERT INTO provider_settings
-                (task, primary_provider, fallback_provider, updated_at)
-            VALUES (?, ?, ?, ?)
+                (task, primary_provider, fallback_provider, chain, updated_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(task) DO UPDATE SET
                 primary_provider = excluded.primary_provider,
                 fallback_provider = excluded.fallback_provider,
+                chain = excluded.chain,
                 updated_at = excluded.updated_at
             """,
-            (task, primary, fallback, _now()),
+            (task,
+             chain[0] if chain else None,
+             chain[1] if len(chain) > 1 else None,
+             ",".join(chain),
+             _now()),
         )
         self.conn.commit()
 

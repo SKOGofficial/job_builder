@@ -566,6 +566,51 @@ def migrate_v7(conn):
         conn.execute("ALTER TABLE messages ADD COLUMN classify_error TEXT")
 
 
+def migrate_v8(conn):
+    """Let a saved route hold a whole chain, not just a first and second pick.
+
+    `provider_settings` had `primary_provider` and `fallback_provider` and
+    nothing else, so a task routed through three providers in `.env` - which is
+    every classification task here - lost its third the moment anyone touched
+    that task in Settings. The loss was silent and the UI, which only ever drew
+    two dropdowns, could not show that it had happened.
+
+    Summary:
+        Add `provider_settings.chain` and backfill it from the existing pair.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to migrate.
+
+    Raises:
+        sqlite3.Error: If the column check, the `ALTER TABLE`, or the backfill
+            fails.
+
+    Note:
+        Backfilled, unlike v7 - and for the opposite reason. A duration cannot
+        be reconstructed after the fact, but a chain can: the pair already
+        recorded is exactly the chain the user chose under the old shape, so
+        writing it here changes nothing about what runs and only moves it to
+        where the code now reads it.
+    """
+    if "chain" in column_names(conn, "provider_settings"):
+        return
+    conn.execute("ALTER TABLE provider_settings ADD COLUMN chain TEXT")
+    conn.execute(
+        """
+        UPDATE provider_settings
+        SET chain = TRIM(
+            COALESCE(primary_provider, '') ||
+            CASE
+                WHEN fallback_provider IS NOT NULL AND fallback_provider <> ''
+                THEN ',' || fallback_provider
+                ELSE ''
+            END,
+            ','
+        )
+        """
+    )
+
+
 MIGRATIONS = [
     (1, migrate_v1),
     (2, migrate_v2),
@@ -574,6 +619,7 @@ MIGRATIONS = [
     (5, migrate_v5),
     (6, migrate_v6),
     (7, migrate_v7),
+    (8, migrate_v8),
 ]
 
 

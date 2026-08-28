@@ -202,8 +202,9 @@ def chain_for(task, saved=None):
     Parameters:
         task (str): A task id or alias.
         saved (dict | None): Rows from `MailStore.provider_routes`, mapping
-            task id to `(primary, fallback)`. A task absent from this mapping
-            has no explicit choice and falls through to the environment.
+            task id to an ordered chain of provider names. A task absent from
+            this mapping has no explicit choice and falls through to the
+            environment.
 
     Returns:
         tuple[str, ...]: Provider names to try in order. Empty when the task
@@ -219,8 +220,7 @@ def chain_for(task, saved=None):
     """
     canonical = resolve(task)
     if saved and canonical in saved:
-        primary, fallback = saved[canonical]
-        chain = tuple(name for name in (primary, fallback) if name)
+        chain = tuple(name for name in saved[canonical] if name)
     else:
         from_env = env_chain(canonical)
         chain = from_env if from_env is not None else TASKS[canonical].default_chain

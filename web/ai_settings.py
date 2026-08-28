@@ -373,12 +373,24 @@ def build_routing_card(state, notify):
             options[name] = label
         return options
 
-    def save(task_id, primary, fallback):
-        if primary == NO_FALLBACK:
-            primary = None
-        if fallback == NO_FALLBACK:
-            fallback = None
-        state.mail.set_provider_route(task_id, primary, fallback)
+    def save(task_id, *choices):
+        """
+        Summary:
+            Persist a task's provider chain from the select values.
+
+        Parameters:
+            task_id (str): The task being routed.
+            *choices (str | None): Select values, in chain order.
+
+        Note:
+            Three slots rather than two. The table behind this held only a
+            primary and a fallback, so saving here used to drop the third
+            provider from a chain the .env had named - silently, and with no
+            way for a two-dropdown UI to show that it had.
+        """
+        chain = [None if value in (NO_FALLBACK, None) else value
+                 for value in choices]
+        state.mail.set_provider_route(task_id, *chain)
         state.pool.reload_routes()
         notify("Routing saved. It applies from the next cycle.", "positive")
         routing_card.refresh()
@@ -433,14 +445,20 @@ def build_routing_card(state, notify):
                             fallback_options,
                             value=chain[1] if len(chain) > 1 else NO_FALLBACK,
                         ).props("dense outlined").classes("min-w-[11rem]")
+                        ui.label("then").classes("text-xs opacity-60")
+                        # Third slot, because the .env chains have three and a
+                        # two-slot editor could only ever save the first two of
+                        # them.
+                        third = ui.select(
+                            fallback_options,
+                            value=chain[2] if len(chain) > 2 else NO_FALLBACK,
+                        ).props("dense outlined").classes("min-w-[11rem]")
 
-                    primary.on_value_change(
-                        lambda e, t=task_id, p=primary, f=fallback:
-                        save(t, p.value, f.value)
-                    )
-                    fallback.on_value_change(
-                        lambda e, t=task_id, p=primary, f=fallback:
-                        save(t, p.value, f.value)
-                    )
+                    selects = (primary, fallback, third)
+                    for element in selects:
+                        element.on_value_change(
+                            lambda e, t=task_id, s=selects:
+                            save(t, *(item.value for item in s))
+                        )
 
     return routing_card

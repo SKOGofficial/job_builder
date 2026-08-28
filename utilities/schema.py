@@ -16,7 +16,7 @@ missing it. `SCHEMA_VERSION` must be bumped in lockstep.
 #: no migration entry, because `create_tables` runs `CREATE TABLE IF NOT
 #: EXISTS` unconditionally on every `initialise`, before the version gate. Only
 #: new columns on existing tables need a migration.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 -- Applications the user has actually applied to. -----------------------------
@@ -303,6 +303,12 @@ CREATE TABLE IF NOT EXISTS provider_settings (
     task TEXT PRIMARY KEY,
     primary_provider TEXT,
     fallback_provider TEXT,
+    -- The full ordered chain, comma-separated. The two columns above hold only
+    -- a first and second choice, so saving a route in Settings silently threw
+    -- away the third provider in an `LLM_ROUTE_*` chain - and the .env here
+    -- names three for every classification task. They are kept in step for a
+    -- database that predates this column, and `chain` wins when both are set.
+    chain TEXT,
     updated_at TEXT NOT NULL
 );
 
