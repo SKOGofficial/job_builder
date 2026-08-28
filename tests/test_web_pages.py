@@ -165,6 +165,7 @@ def use_stub_classifier(state, results):
         ("/email-matches", "Email matches"),
         ("/leads", "To apply"),
         ("/experiences", "Experiences"),
+        ("/diagnostics", "Diagnostics"),
         ("/settings", "Settings"),
         ("/profile", "Profile"),
         ("/resume", "Resume notes"),
@@ -757,6 +758,58 @@ async def test_the_saved_alert_cutoff_is_what_the_pipeline_reads(user, state):
     await user.open("/settings")
     await user.should_see("older than 5 day(s)")
     assert alert_staleness_days(state.store) == 5
+
+
+# Diagnostics ---------------------------------------------------------------
+
+
+async def test_diagnostics_separates_queues_from_decisions(user, state):
+    """The distinction that 264 messages of confusion came down to.
+
+    Filter-dropped mail is not a backlog: it never gets a body, so it can never
+    leave `category IS NULL`. Listing it as "waiting" is what made two honest
+    counts disagree.
+    """
+    from pipeline.rough_filter import DROP_PERSONAL
+
+    state.mail.upsert_message({"id": "dropped", "sender": "friend@gmail.com",
+                               "subject": "Lunch?", "date": ""})
+    state.mail.set_filter_verdict("dropped", DROP_PERSONAL)
+    state.mail.commit()
+
+    await user.open("/diagnostics")
+    await user.should_see("dropped before classification")
+    await user.should_see("Not a backlog")
+
+    # A table's rows are props rather than child elements, so this asserts on
+    # the data the table was handed.
+    queues = next(iter(user.find(kind=ui.table).elements)).rows
+    by_queue = {row["queue"]: row["waiting"] for row in queues}
+    assert by_queue["Waiting for the rule tier"] == 0
+    assert by_queue["Waiting for the model"] == 0
+
+
+async def test_diagnostics_says_plainly_when_nothing_has_run(user, state):
+    await user.open("/diagnostics")
+    await user.should_see("Nothing recorded in this window")
+    await user.should_see("No model calls in this window")
+
+
+async def test_diagnostics_reports_stage_timings(user, state):
+    state.mail.record_stage_runs([
+        {"cycle_id": "c1", "stage": "classify",
+         "started_at": __import__("datetime").datetime.now().isoformat(
+             timespec="seconds"),
+         "duration_ms": 4200, "processed": 12, "outcome": "ok"},
+    ])
+
+    await user.open("/diagnostics")
+    tables = [element.rows for element in user.find(kind=ui.table).elements]
+    timings = next(rows for rows in tables
+                   if rows and "stage" in rows[0])
+    assert timings[0]["stage"] == "classify"
+    assert timings[0]["median"] == "4.2 s"
+    assert timings[0]["processed"] == 12
 
 
 async def test_blocked_domains_are_listed_and_removable(user, state):

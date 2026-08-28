@@ -11,6 +11,7 @@ than deadlock.
     python cli.py status
     python cli.py diagnostics --hours 24
     python cli.py sync --once
+    python cli.py sync --until-empty
     python cli.py backfill --days 365 --max 2000
     python cli.py filter-stats
     python cli.py prune --days 30
@@ -174,12 +175,71 @@ def _ms(value):
 
 
 def cmd_sync(args):
+    """Run the pipeline without the app, once or until the queues stop moving.
+
+    Summary:
+        Run one or more pipeline cycles and report what each did.
+
+    Parameters:
+        args (argparse.Namespace): Parsed arguments; uses `db`, `until_empty`,
+            and `max_cycles`.
+
+    Returns:
+        int: 0 when every cycle was clean, 1 when any reported an error.
+
+    Note:
+        The scheduler lives inside the NiceGUI process, so nothing drains while
+        the app is closed - this mailbox went six days without a cycle for
+        exactly that reason. This is the supported way to catch up, and the way
+        a scheduled task should call it.
+
+        `--until-empty` stops when a cycle changes nothing rather than when the
+        queues read zero. A queue can be legitimately non-empty - alerts
+        waiting on a rate limit, say - and looping until it clears would spin
+        until the limit did.
+    """
     store, mail = open_stores(args.db)
     cycle = PipelineCycle(store, mail)
-    result = asyncio.run(cycle.run())
-    print(json.dumps(result, indent=2, default=str))
+    failed = False
+    for pass_number in range(1, max(1, args.max_cycles) + 1):
+        result = asyncio.run(cycle.run())
+        failed = failed or "error" in result
+        if args.until_empty:
+            print(f"--- cycle {pass_number} ---")
+        print(json.dumps(result, indent=2, default=str))
+        if not args.until_empty:
+            break
+        if not _moved(result):
+            print(f"Nothing moved on cycle {pass_number}; stopping.")
+            break
     store.close()
-    return 0 if "error" not in result else 1
+    return 1 if failed else 0
+
+
+#: Result keys that mean a cycle actually changed something. `retry_after` is
+#: deliberately absent: waiting is not progress, and treating it as such is how
+#: an "until empty" loop turns into a spin against a rate limit.
+PROGRESS_KEYS = ("synced", "bodies", "retired", "retired_alerts", "expired")
+
+
+def _moved(result):
+    """
+    Summary:
+        Whether a cycle changed anything worth running another for.
+
+    Parameters:
+        result (dict): A `PipelineCycle.run` result.
+
+    Returns:
+        bool: True when any stage did work.
+    """
+    if any(result.get(key) for key in PROGRESS_KEYS):
+        return True
+    for key in ("classified", "handled", "prepared", "filter"):
+        section = result.get(key) or {}
+        if isinstance(section, dict) and any(section.values()):
+            return True
+    return False
 
 
 def cmd_backfill(args):
@@ -351,8 +411,14 @@ def build_parser():
         help="how far back to summarise timings and usage (default 24)")
     diagnostics.set_defaults(func=cmd_diagnostics)
 
-    sync = sub.add_parser("sync", help="run one pipeline cycle")
+    sync = sub.add_parser("sync", help="run the pipeline without the app")
     sync.add_argument("--once", action="store_true", help="accepted for clarity")
+    sync.add_argument(
+        "--until-empty", action="store_true",
+        help="keep running cycles until one changes nothing")
+    sync.add_argument(
+        "--max-cycles", type=int, default=20,
+        help="ceiling on --until-empty, so a catch-up run always terminates")
     sync.set_defaults(func=cmd_sync)
 
     backfill = sub.add_parser("backfill", help="seed from an existing mailbox")
