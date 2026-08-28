@@ -22,7 +22,7 @@ from clients.llm_client import GroqRateLimited
 from clients.providers.base import ProviderUnavailable
 from pipeline.parsers import parse_alert
 from utilities.identity import identity_key, identity_scheme
-from utilities.mailstore import CATEGORY_ALERT
+from utilities.mailstore import CATEGORY_ALERT, alert_staleness_days
 
 log = logging.getLogger(__name__)
 
@@ -61,11 +61,20 @@ class AlertHandler:
     that owns the sqlite connection.
     """
 
-    def __init__(self, store, mail, client=None, executor=None):
+    def __init__(self, store, mail, client=None, executor=None,
+                 staleness_days=None):
         self.store = store
         self.mail = mail
         self.client = client
         self.executor = executor or asyncio.to_thread
+        #: Read once per handler rather than per message, so a setting changed
+        #: mid-pass cannot make one batch inconsistent with itself.
+        self.staleness_days = (staleness_days if staleness_days is not None
+                               else alert_staleness_days(store))
+        #: Alerts retired unextracted this pass, and messages that failed for a
+        #: reason of their own. Both reported by `run`.
+        self.retired = 0
+        self.failed = 0
 
     async def handle(self, message):
         """Process one alert email. Returns (created, skipped, linked).
@@ -167,8 +176,20 @@ class AlertHandler:
             A rate limit ends the pass rather than failing it. Everything
             already written is kept, and the emails not reached stay unlinked,
             so the next cycle picks them up with a fresh token budget.
+
+            Stale alerts are retired before anything is extracted. That is what
+            makes the oldest-first ordering below affordable: without it, the
+            queue's tail is seven weeks of adverts whose leads would be deleted
+            on the cycle that created them.
         """
         totals = [0, 0, 0]
+        self.retired = self.mail.retire_stale_alerts(self.staleness_days)
+        if self.retired:
+            log.info(
+                "Retired %d alert(s) older than %d days without extracting "
+                "them; a lead from one would be dropped as stale on the same "
+                "cycle it was created.", self.retired, self.staleness_days,
+            )
         for message in self._pending(limit):
             try:
                 created, skipped, linked = await self.handle(message)
@@ -191,13 +212,33 @@ class AlertHandler:
                     totals[0], exc.retry_after,
                 )
                 break
+            except Exception:
+                # A failure specific to this message - a body no parser can
+                # read, a posting with no title - is not a reason to abandon
+                # the ones behind it. AGENTS.md has said so since the router
+                # learned it; this handler had not, so anything but a rate
+                # limit propagated out of `dispatch` and took the whole
+                # `prepare` stage down with it for that cycle.
+                #
+                # Marked handled, not left pending: it *was* tried, and a
+                # message that fails identically every cycle is exactly what
+                # `handled_at` exists to stop being re-charged for.
+                log.exception(
+                    "Alert %s could not be extracted; marking it handled and "
+                    "continuing", message["gmail_message_id"],
+                )
+                self.mail.mark_handled(message["gmail_message_id"])
+                self.failed += 1
+                continue
             totals[0] += created
             totals[1] += skipped
             totals[2] += linked
+        if self.failed:
+            log.warning("%d alert(s) failed to extract this pass", self.failed)
         return tuple(totals)
 
     def _pending(self, limit):
-        """Alerts not yet extracted, newest first.
+        """Alerts not yet extracted, oldest first.
 
         Summary:
             List the alert emails this handler still has to process.
@@ -212,5 +253,14 @@ class AlertHandler:
             Keyed on `handled_at`, not on the absence of a link. A digest whose
             postings have all been applied to already links to nothing new, and
             under the old query that made it permanently pending.
+
+            Oldest first, which is a reversal. Newest-first was the right call
+            while the queue held seven weeks of alerts - a fresh posting is
+            worth more than an old one - but it starved the tail permanently:
+            469 alerts draining at fifteen a cycle never reached July. Now that
+            `run` retires anything past the staleness cutoff first, everything
+            left is inside the window and worth extracting, so the fair order
+            is the one where nothing waits for ever.
         """
-        return self.mail.messages_awaiting_handling(CATEGORY_ALERT, limit)
+        return self.mail.messages_awaiting_handling(CATEGORY_ALERT, limit,
+                                                    newest_first=False)

@@ -8,6 +8,8 @@ did, keeping everything already written. So the last class here drives the real
 """
 
 import asyncio
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 import os
 import unittest
 
@@ -765,7 +767,10 @@ class RealHandlerTests(PoolFixture):
             "thread_id": "t1",
             "sender": "alerts@board.test",
             "subject": "Jobs for you",
-            "date": "Tue, 20 Jan 2026 10:00:00 -0400",
+            # Relative, not a literal date: an alert past the staleness
+            # cutoff is retired without extraction, so a pinned date would
+            # turn this into a test about the calendar.
+            "date": format_datetime(datetime.now(timezone.utc) - timedelta(days=1)),
             "snippet": "roles",
         })
         self.mail.store_body(message_id, "Software Engineer at Acme. Apply now.",

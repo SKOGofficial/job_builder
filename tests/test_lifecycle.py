@@ -16,6 +16,8 @@ No network: the model client is a scripted fake, the same way
 import asyncio
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
 from clients.llm_client import GroqRateLimited
 from pipeline.acknowledgements import AcknowledgementHandler, application_date_from
@@ -85,11 +87,33 @@ def make_app():
     return store, mail, resolver
 
 
+def recent_header(days_ago=1):
+    """An RFC-2822 date a given number of days back from now.
+
+    Summary:
+        Build a Date header relative to today rather than a fixed date.
+
+    Parameters:
+        days_ago (int): How many days before now the message arrived.
+
+    Returns:
+        str: The header value.
+
+    Note:
+        Relative on purpose. Alerts past the staleness cutoff are now retired
+        without extraction, so a fixture pinned to a literal date silently
+        becomes a stale alert as the calendar moves and the test starts failing
+        for a reason that has nothing to do with what it is testing.
+    """
+    return format_datetime(datetime.now(timezone.utc) - timedelta(days=days_ago))
+
+
 def add_message(mail, message_id, sender, subject, body, category,
-                date_header="Mon, 02 Feb 2026 09:00:00 -0800"):
+                date_header=None):
     mail.upsert_message({
         "id": message_id, "thread_id": "t", "sender": sender,
-        "subject": subject, "date": date_header, "labels": [], "snippet": "",
+        "subject": subject, "date": date_header or recent_header(),
+        "labels": [], "snippet": "",
     })
     mail.store_body(message_id, body)
     mail.record_category(message_id, category, 0.95, "test")

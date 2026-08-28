@@ -679,6 +679,43 @@ async def test_settings_shows_the_pipeline_card(user, state):
     await user.should_see("Blocked senders")
 
 
+async def test_settings_previews_what_the_alert_cutoff_would_clear(user, state):
+    """The preview is the whole point of the card.
+
+    The cutoff decides real spend - extraction is the most expensive call in
+    the pipeline - so the number of alerts it would retire has to be visible
+    while choosing it, not only after saving.
+    """
+    import time
+
+    from utilities.mailstore import CATEGORY_ALERT
+
+    for index, days in enumerate((1, 40, 60)):
+        state.mail.upsert_message({"id": f"alert-{index}",
+                                   "sender": "jobs@board.test",
+                                   "subject": "Jobs", "date": ""})
+        state.mail.store_body(f"alert-{index}", "Engineer at Acme.")
+        state.mail.record_category(f"alert-{index}", CATEGORY_ALERT, 0.9, "d")
+        state.mail.conn.execute(
+            "UPDATE messages SET received_ts = ? WHERE gmail_message_id = ?",
+            (int(time.time() - days * 86400), f"alert-{index}"))
+    state.mail.commit()
+
+    await user.open("/settings")
+    await user.should_see("Alert age limit")
+    # Two of the three are past the default fourteen-day cutoff.
+    await user.should_see("retires 2 of them")
+
+
+async def test_the_saved_alert_cutoff_is_what_the_pipeline_reads(user, state):
+    from utilities.mailstore import ALERT_STALENESS_KEY, alert_staleness_days
+
+    state.store.save_profile_value(ALERT_STALENESS_KEY, "5")
+    await user.open("/settings")
+    await user.should_see("older than 5 day(s)")
+    assert alert_staleness_days(state.store) == 5
+
+
 async def test_blocked_domains_are_listed_and_removable(user, state):
     state.mail.deny_sender("newsletter.example.com")
     await user.open("/settings")

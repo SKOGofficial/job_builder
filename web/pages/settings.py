@@ -16,7 +16,7 @@ import logging
 from nicegui import ui
 
 from clients import gmail_client, llm_client
-from utilities import credentials
+from utilities import credentials, mailstore
 from web.ai_settings import build_ai_card, build_routing_card
 from web.shell import card, page_shell, page_timer
 from web.state import get_state
@@ -301,6 +301,109 @@ def settings_page():
                         for name, count in categories.items():
                             ui.label(f"{name}: {count}").classes("text-xs opacity-70")
 
+        # Alert staleness ------------------------------------------------------
+
+        @ui.refreshable
+        def staleness_card():
+            """Choose how old an alert may be before it is retired unextracted.
+
+            Summary:
+                Render the alert staleness setting with a live preview of how
+                many alerts the current cutoff would retire.
+
+            Note:
+                The preview is the point of this card. Extraction is the most
+                expensive call in the pipeline, and a lead built from an alert
+                older than the lead freshness window is deleted on the cycle
+                that created it - so the cutoff decides real spend. A number
+                that only appears after saving is a number nobody can use to
+                decide, so it updates as the value changes.
+            """
+            with card():
+                ui.label("Alert age limit").classes("text-base font-semibold")
+                ui.label(
+                    "Job alerts older than this are cleared without asking a "
+                    "model to read them. A lead built from an older alert is "
+                    "dropped as stale on the same cycle it is created, so "
+                    "reading it costs money and yields nothing."
+                ).classes("text-sm opacity-70")
+
+                current = mailstore.alert_staleness_days(state.store)
+                waiting = state.mail.queue_depths().get(
+                    "awaiting_handling_job_alert", 0)
+                preview = ui.label().classes("text-sm")
+
+                def describe(days):
+                    """
+                    Summary:
+                        Phrase what a cutoff would do to the current queue.
+
+                    Parameters:
+                        days (int): The cutoff being considered.
+                    """
+                    try:
+                        days = max(1, int(days))
+                    except (TypeError, ValueError):
+                        preview.set_text("Enter a whole number of days.")
+                        preview.classes(replace="text-sm text-amber-500")
+                        return
+                    stale = state.mail.stale_alert_count(days)
+                    preview.set_text(
+                        f"{waiting} alert(s) waiting. Clearing anything older "
+                        f"than {days} day(s) retires {stale} of them now, "
+                        f"leaving {waiting - stale} to read."
+                    )
+                    preview.classes(replace="text-sm opacity-80")
+
+                def save(value):
+                    try:
+                        days = max(1, int(value))
+                    except (TypeError, ValueError):
+                        return
+                    state.store.save_profile_value(
+                        mailstore.ALERT_STALENESS_KEY, str(days))
+                    notify(f"Alerts older than {days} day(s) will be cleared "
+                           f"without being read.")
+
+                number = ui.number(
+                    label="Days", value=current, min=1, max=365, step=1,
+                    format="%d",
+                ).props("dense outlined").classes("w-32")
+                number.on_value_change(lambda e: describe(e.value))
+                describe(current)
+
+                with ui.row().classes("items-center gap-2 pt-1"):
+                    ui.button("Save", on_click=lambda: (save(number.value),
+                                                        staleness_card.refresh()),
+                              ).props("unelevated no-caps dense")
+                    ui.button(
+                        "Clear them now",
+                        on_click=lambda: retire_now(number.value),
+                    ).props("flat no-caps dense")
+
+        def retire_now(value):
+            """
+            Summary:
+                Apply the cutoff immediately rather than waiting for a cycle.
+
+            Parameters:
+                value (float | str): The cutoff shown in the input.
+
+            Note:
+                Exists because the first use of this setting is a backlog of
+                469, and waiting ten minutes to find out whether the number was
+                right is a poor way to choose it.
+            """
+            try:
+                days = max(1, int(value))
+            except (TypeError, ValueError):
+                ui.notify("Enter a whole number of days.", type="warning")
+                return
+            retired = state.mail.retire_stale_alerts(days)
+            notify(f"Cleared {retired} alert(s) older than {days} day(s).")
+            staleness_card.refresh()
+            pipeline_card.refresh()
+
         # Blocked senders ------------------------------------------------------
 
         @ui.refreshable
@@ -371,6 +474,7 @@ def settings_page():
         ai_card(confirm=confirm)
         routing_card()
         pipeline_card()
+        staleness_card()
         denylist_card()
         page_timer(0.4, watch)
 

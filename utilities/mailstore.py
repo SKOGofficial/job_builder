@@ -81,6 +81,12 @@ LEAD_OPEN_STATUSES = (LEAD_READY, LEAD_PREPARING, LEAD_NEW)
 #: stops being a list of things to do.
 LEAD_FRESHNESS_DAYS = 14
 
+#: Profile key holding how old an unhandled alert may be before the pipeline
+#: retires it without spending a model call on it. Kept in the key/value
+#: profile table rather than as a constant because the right answer depends on
+#: the mailbox, and choosing it needs the count in front of you.
+ALERT_STALENESS_KEY = "alert_staleness_days"
+
 #: Marks a `prepare_error` that is a pause rather than a failure. The column
 #: holds free text and the Leads page renders it in red as "Preparation
 #: failed", which is the wrong thing to say about a lead that is simply waiting
@@ -121,6 +127,38 @@ def _now():
         str: The timestamp, for example ``2026-08-03T16:47:09``.
     """
     return datetime.now().isoformat(timespec="seconds")
+
+
+def alert_staleness_days(store):
+    """How old an unhandled alert may be before it is retired unextracted.
+
+    Summary:
+        Read the configured alert staleness cutoff.
+
+    Parameters:
+        store (JobStore): The store holding the profile key/value table.
+
+    Returns:
+        int: The cutoff in days. Defaults to `LEAD_FRESHNESS_DAYS`, and never
+            returns less than 1.
+
+    Note:
+        Defaults to the lead freshness window because that is the age at which
+        extraction stops being able to produce anything: a lead built from an
+        older alert is deleted by `purge_stale_leads` on the same cycle. A
+        different default would be a different claim about what the pipeline
+        is for.
+
+        Never raises on a bad stored value. A profile row someone hand-edited
+        should degrade to the default, not stop the pipeline.
+    """
+    raw = store.get_profile_value(ALERT_STALENESS_KEY, "")
+    try:
+        return max(1, int(raw)) if raw else LEAD_FRESHNESS_DAYS
+    except (TypeError, ValueError):
+        log.warning("%s=%r is not a number; using %d days",
+                    ALERT_STALENESS_KEY, raw, LEAD_FRESHNESS_DAYS)
+        return LEAD_FRESHNESS_DAYS
 
 
 def _percentile(sorted_values, fraction):
@@ -1760,6 +1798,91 @@ class MailStore:
         )
         cursor = self.conn.execute(
             "DELETE FROM provider_usage WHERE at < ?", (cutoff,)
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    # --- alert staleness ---------------------------------------------------
+
+    def stale_alert_count(self, older_than_days):
+        """How many waiting alerts a given cutoff would retire.
+
+        Summary:
+            Count unhandled alerts older than a cutoff, without changing any.
+
+        Parameters:
+            older_than_days (int): Age in days past which an alert is stale.
+
+        Returns:
+            int: How many unhandled alerts `retire_stale_alerts` would take.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Exists so the cutoff can be chosen against the mailbox rather than
+            guessed at. A number that only appears after the setting is saved
+            is a number nobody can use to decide.
+        """
+        cutoff = int(time.time()) - int(older_than_days) * 86400
+        return self.conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM messages
+            WHERE category = ? AND handled_at IS NULL
+              AND COALESCE(
+                    received_ts,
+                    CAST(strftime('%s', fetched_at) AS INTEGER)
+                  ) < ?
+            """,
+            (CATEGORY_ALERT, cutoff),
+        ).fetchone()["n"]
+
+    def retire_stale_alerts(self, older_than_days):
+        """Retire alerts too old to produce a lead that would survive.
+
+        Summary:
+            Mark unhandled alerts older than the cutoff as handled, without a
+            model call.
+
+        Parameters:
+            older_than_days (int): Age in days past which an alert is stale.
+
+        Returns:
+            int: How many alerts were retired.
+
+        Raises:
+            sqlite3.Error: If the update or the commit fails.
+
+        Note:
+            Commits. This is a spend decision written as a query. Extraction is
+            the most expensive call in the pipeline, and a lead built from an
+            alert older than `LEAD_FRESHNESS_DAYS` is deleted by
+            `purge_stale_leads` on the same cycle that created it - so the work
+            is not merely low-value, its yield is arithmetically zero.
+
+            The alert queue reached 469 with its oldest entry seven weeks back,
+            drained newest-first at fifteen a cycle. The tail was never going
+            to be reached, and reaching it would have bought nothing.
+
+            A message with no `received_ts` falls back to `fetched_at` rather
+            than to zero, and this is the opposite choice from
+            `purge_stale_leads`. There, a dateless row left alone would be
+            immortal, and deletion is the whole point. Here, retiring is
+            throwing a posting away unseen - so an undated alert is treated as
+            recent and extracted. Paying for one advert is the cheap mistake;
+            silently discarding an interview is not.
+        """
+        cutoff = int(time.time()) - int(older_than_days) * 86400
+        cursor = self.conn.execute(
+            """
+            UPDATE messages SET handled_at = ?
+            WHERE category = ? AND handled_at IS NULL
+              AND COALESCE(
+                    received_ts,
+                    CAST(strftime('%s', fetched_at) AS INTEGER)
+                  ) < ?
+            """,
+            (_now(), CATEGORY_ALERT, cutoff),
         )
         self.conn.commit()
         return cursor.rowcount
