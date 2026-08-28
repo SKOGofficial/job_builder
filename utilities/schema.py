@@ -16,7 +16,7 @@ missing it. `SCHEMA_VERSION` must be bumped in lockstep.
 #: no migration entry, because `create_tables` runs `CREATE TABLE IF NOT
 #: EXISTS` unconditionally on every `initialise`, before the version gate. Only
 #: new columns on existing tables need a migration.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 -- Applications the user has actually applied to. -----------------------------
@@ -95,6 +95,16 @@ CREATE TABLE IF NOT EXISTS messages (
     -- a bad label came from the primary or from the fallback.
     category_model TEXT,
     classified_at TEXT,
+    -- How many times classification has been tried and failed for a reason
+    -- that was specific to this message. A rate limit does not count: it
+    -- applies to every message behind this one and says nothing about this
+    -- one. Without a counter, a message the model can never answer sits at
+    -- the head of an oldest-first queue and is retried, at cost, for ever.
+    classify_attempts INTEGER NOT NULL DEFAULT 0,
+    -- Why the last attempt failed, and - once the attempts run out - why this
+    -- message stopped being tried. "Not classified" and "cannot be classified"
+    -- have to be distinguishable, or a permanent failure is invisible.
+    classify_error TEXT,
     fetched_at TEXT NOT NULL,
     body_fetched_at TEXT,
     -- When a category handler finished with this message, whatever the
@@ -252,7 +262,35 @@ CREATE TABLE IF NOT EXISTS provider_usage (
     total_tokens INTEGER NOT NULL DEFAULT 0,
     -- 'ok' | 'rate_limited' | 'denied_day' | 'error'
     outcome TEXT NOT NULL,
+    -- How long the call actually took. The outcome says what happened and the
+    -- token columns say what it cost, but neither says whether a cycle was
+    -- slow because a provider was slow - which is the question a pipeline that
+    -- sometimes takes a minute and sometimes takes twenty actually raises.
+    duration_ms INTEGER,
     at TEXT NOT NULL
+);
+
+-- How long each pipeline stage took, and what it got through. ------------------
+--
+-- The pipeline bounds every stage by a count and none of them by time, so a
+-- cycle's duration is whatever the providers happened to make it that day. No
+-- amount of reading the code answers "why was that cycle slow"; only a record
+-- of what each stage actually did.
+--
+-- `cycle_id` groups the stages of one pass so a slow stage can be read against
+-- the rest of its cycle rather than in isolation. `outcome` distinguishes a
+-- stage that finished from one that hit its deadline or was skipped for want
+-- of a provider - three very different reasons for a small `processed`.
+CREATE TABLE IF NOT EXISTS stage_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    processed INTEGER NOT NULL DEFAULT 0,
+    -- 'ok' | 'skipped' | 'deadline' | 'error'
+    outcome TEXT NOT NULL,
+    detail TEXT
 );
 
 -- Per-task provider routing, edited in Settings. -------------------------------
@@ -332,6 +370,11 @@ CREATE INDEX IF NOT EXISTS idx_job_sources_board ON job_sources(board, board_job
 CREATE INDEX IF NOT EXISTS idx_messages_category ON messages(category);
 CREATE INDEX IF NOT EXISTS idx_messages_verdict ON messages(filter_verdict);
 CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received_ts);
+-- Every queue in the pipeline is "rows in this state, oldest first", and there
+-- are six of them running on every cycle. The single-column indexes above can
+-- each answer half of that and then sort the rest by hand.
+CREATE INDEX IF NOT EXISTS idx_messages_queue
+    ON messages(category, handled_at, received_ts);
 CREATE INDEX IF NOT EXISTS idx_links_identity ON message_links(identity_key);
 CREATE INDEX IF NOT EXISTS idx_links_message ON message_links(gmail_message_id);
 CREATE INDEX IF NOT EXISTS idx_leads_status ON job_leads(status);
@@ -340,6 +383,10 @@ CREATE INDEX IF NOT EXISTS idx_email_matches_job_id ON email_matches(job_id);
 -- Every budget question is "how much has this provider spent since <time>",
 -- so the pair is the useful order.
 CREATE INDEX IF NOT EXISTS idx_provider_usage_at ON provider_usage(provider, at);
+-- Diagnostics reads one cycle at a time, and the retention pass deletes by
+-- age, so both questions start from `started_at`.
+CREATE INDEX IF NOT EXISTS idx_stage_runs_at ON stage_runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_stage_runs_cycle ON stage_runs(cycle_id);
 -- The morning lookup is "every company I am watching", so the archived flag
 -- belongs in the index rather than as a filter over its results.
 CREATE INDEX IF NOT EXISTS idx_contacts_slug ON contacts(company_slug, archived);

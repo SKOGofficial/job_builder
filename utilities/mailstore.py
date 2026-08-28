@@ -47,6 +47,18 @@ CATEGORIES = JOB_CATEGORIES + (CATEGORY_IRRELEVANT,)
 
 VERDICT_PASSED = "passed"
 
+#: How many times a message may fail classification for a reason of its own
+#: before the pipeline stops offering it.
+#:
+#: Three, not one: the common causes - a truncated body, a provider having a
+#: bad minute, a model returning prose instead of JSON - are often transient,
+#: and retiring a real recruiter email on one bad reply is the expensive
+#: mistake. But the retries have to end. The model queue is oldest-first, so a
+#: message no provider can ever answer sits at its head and is tried *first*,
+#: at cost, on every cycle for ever. A counter is what turns "still pending"
+#: into "cannot be classified, and here is why".
+MAX_CLASSIFY_ATTEMPTS = 3
+
 LEAD_NEW = "new"
 LEAD_PREPARING = "preparing"
 LEAD_READY = "ready"
@@ -104,6 +116,30 @@ def _now():
         str: The timestamp, for example ``2026-08-03T16:47:09``.
     """
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _percentile(sorted_values, fraction):
+    """
+    Summary:
+        Read a percentile out of an already-sorted list.
+
+    Parameters:
+        sorted_values (list[int]): Values in ascending order.
+        fraction (float): The percentile as 0.0-1.0, e.g. 0.95 for p95.
+
+    Returns:
+        int: The value at that position, or 0 for an empty list.
+
+    Note:
+        Nearest-rank, not interpolated. These are stage durations read by a
+        human off a diagnostics page, where "the slow one took 4.2 seconds" is
+        a real measurement and an interpolated 4.17 is an invented one.
+    """
+    if not sorted_values:
+        return 0
+    index = min(len(sorted_values) - 1,
+                max(0, int(round(fraction * (len(sorted_values) - 1)))))
+    return sorted_values[index]
 
 
 def parse_received(raw):
@@ -395,12 +431,18 @@ class MailStore:
             Messages whose body is empty are excluded rather than skipped
             later - there is nothing for the model to read, so sending them
             would spend quota for a guaranteed non-answer.
+
+            Messages that have already failed `MAX_CLASSIFY_ATTEMPTS` times are
+            excluded too. Oldest-first ordering means an unanswerable message
+            is offered *first* on every cycle, so without the ceiling one bad
+            row is a permanent tax on the front of the queue.
         """
-        sql = """
+        sql = f"""
             SELECT * FROM messages
             WHERE body_text IS NOT NULL
               AND TRIM(body_text) <> ''
               AND category IS NULL
+              AND classify_attempts < {MAX_CLASSIFY_ATTEMPTS}
             ORDER BY received_ts ASC
         """
         if limit is None:
@@ -433,10 +475,19 @@ class MailStore:
             Bodies are excluded rather than merely unused: a full backlog is
             thousands of rows, and loading their text to run a regex over the
             subject line would be the most expensive part of the cheap tier.
+
+            Filtered-out mail is excluded, and that is the point of the verdict
+            clause. Messages the rough filter dropped never get a body, so they
+            can never leave `category IS NULL` - and this query, which had no
+            verdict clause and no limit, re-read all 264 of them on every
+            ten-minute cycle and declined all of them, for ever. They are not a
+            backlog; they are a decision that was already made.
         """
-        sql = """
+        sql = f"""
             SELECT gmail_message_id, sender, subject FROM messages
             WHERE category IS NULL
+              AND (filter_verdict IS NULL OR filter_verdict = '{VERDICT_PASSED}')
+              AND classify_attempts < {MAX_CLASSIFY_ATTEMPTS}
             ORDER BY received_ts ASC
         """
         if limit is None:
@@ -456,11 +507,95 @@ class MailStore:
             sqlite3.Error: If the query fails.
         """
         return self.conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS n FROM messages
-            WHERE body_text IS NOT NULL AND TRIM(body_text) <> '' AND category IS NULL
+            WHERE body_text IS NOT NULL AND TRIM(body_text) <> ''
+              AND category IS NULL
+              AND classify_attempts < {MAX_CLASSIFY_ATTEMPTS}
             """
         ).fetchone()["n"]
+
+    def record_classify_failure(self, gmail_message_id, reason):
+        """Count one failed attempt against a message, and say why.
+
+        Summary:
+            Increment `classify_attempts` and store the reason it failed.
+
+        Parameters:
+            gmail_message_id (str): The message that could not be classified.
+            reason (str): What went wrong, truncated to 500 characters.
+
+        Returns:
+            int: The message's attempt count after this failure.
+
+        Raises:
+            sqlite3.Error: If the update fails.
+
+        Note:
+            Does not commit; the router commits its pass. Only failures
+            specific to *this* message are counted. A rate limit applies to
+            every message behind it as well and says nothing about this one, so
+            counting it would retire a queue's worth of perfectly good mail for
+            the crime of being at the front during a bad afternoon.
+        """
+        self.conn.execute(
+            """
+            UPDATE messages
+            SET classify_attempts = classify_attempts + 1,
+                classify_error = ?
+            WHERE gmail_message_id = ?
+            """,
+            ((reason or "")[:500], gmail_message_id),
+        )
+        row = self.conn.execute(
+            "SELECT classify_attempts AS n FROM messages "
+            "WHERE gmail_message_id = ?",
+            (gmail_message_id,),
+        ).fetchone()
+        return row["n"] if row else 0
+
+    def retire_unclassifiable(self):
+        """Give up, in writing, on mail there is nothing to classify.
+
+        Summary:
+            Mark passed messages whose fetched body turned out to be empty as
+            permanently unclassifiable.
+
+        Returns:
+            int: How many messages were retired.
+
+        Raises:
+            sqlite3.Error: If the update or the commit fails.
+
+        Note:
+            Commits. A message that passed the filter, had its body fetched,
+            and came back empty is excluded from the model queue by the
+            non-empty-body guard - for a good reason, since there is nothing to
+            send - but nothing ever marked it, so it sat in `category IS NULL`
+            for ever, indistinguishable from mail that simply had not been
+            reached yet. One such message has been in this mailbox since May.
+
+            Retired by exhausting the attempt counter rather than by assigning
+            a category, because no category would be true. The distinction the
+            pipeline needs is "tried and cannot be answered", and that is what
+            the counter means everywhere else.
+        """
+        cursor = self.conn.execute(
+            f"""
+            UPDATE messages
+            SET classify_attempts = {MAX_CLASSIFY_ATTEMPTS},
+                classify_error = 'The fetched body was empty; '
+                                 'there is nothing to classify.'
+            WHERE category IS NULL
+              AND filter_verdict = ?
+              AND body_fetched_at IS NOT NULL
+              AND (body_text IS NULL OR TRIM(body_text) = '')
+              AND classify_attempts < {MAX_CLASSIFY_ATTEMPTS}
+            """,
+            (VERDICT_PASSED,),
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     def record_category(self, gmail_message_id, category, confidence, reason,
                         model=None):
@@ -1443,7 +1578,9 @@ class MailStore:
         Parameters:
             rows (list[dict]): Each with `provider`, `task`, and `outcome`;
                 optionally `model`, `input_tokens`, `output_tokens`,
-                `total_tokens`. Missing token counts record as 0.
+                `total_tokens`, `duration_ms`. Missing token counts record as
+                0; a missing duration records as NULL, which is the honest
+                value for a call that never reached a provider.
 
         Returns:
             int: How many rows were written.
@@ -1463,8 +1600,8 @@ class MailStore:
             """
             INSERT INTO provider_usage
                 (provider, task, model, requests, input_tokens, output_tokens,
-                 total_tokens, outcome, at)
-            VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+                 total_tokens, outcome, duration_ms, at)
+            VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1475,6 +1612,7 @@ class MailStore:
                     row.get("output_tokens") or 0,
                     row.get("total_tokens") or 0,
                     row["outcome"],
+                    row.get("duration_ms"),
                     row.get("at") or at,
                 )
                 for row in rows
@@ -1618,6 +1756,303 @@ class MailStore:
         )
         cursor = self.conn.execute(
             "DELETE FROM provider_usage WHERE at < ?", (cutoff,)
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    # --- queue depths ------------------------------------------------------
+
+    def queue_depths(self):
+        """Every queue the pipeline drains, counted the same way it drains it.
+
+        Summary:
+            Report the depth of each pipeline queue, plus the rows that are
+            stuck in none of them.
+
+        Returns:
+            dict[str, int]: `awaiting_filter`, `awaiting_body`,
+                `awaiting_classification`, `awaiting_rules`, `dead_lettered`,
+                and one `awaiting_handling_<category>` per job category.
+
+        Raises:
+            sqlite3.Error: If a query fails.
+
+        Note:
+            This exists because two honest counts of "unclassified" disagreed
+            by 264. `count_awaiting_classification` required a body, so it read
+            0; anything counting `category IS NULL` read 265, because messages
+            the rough filter dropped never get a body and so never leave that
+            set. Both were right about different things and neither said so.
+
+            Every number here is produced by the same predicate the stage that
+            drains it uses, so the page and the pipeline cannot drift apart.
+        """
+        one = lambda sql, args=(): self.conn.execute(sql, args).fetchone()["n"]
+        depths = {
+            "awaiting_filter": one(
+                "SELECT COUNT(*) n FROM messages WHERE filter_verdict IS NULL"
+            ),
+            "awaiting_body": one(
+                """
+                SELECT COUNT(*) n FROM messages
+                WHERE filter_verdict = ? AND body_fetched_at IS NULL
+                """,
+                (VERDICT_PASSED,),
+            ),
+            "awaiting_classification": self.count_awaiting_classification(),
+            "awaiting_rules": one(
+                f"""
+                SELECT COUNT(*) n FROM messages
+                WHERE category IS NULL
+                  AND (filter_verdict IS NULL OR filter_verdict = ?)
+                  AND classify_attempts < {MAX_CLASSIFY_ATTEMPTS}
+                """,
+                (VERDICT_PASSED,),
+            ),
+            "dead_lettered": one(
+                f"""
+                SELECT COUNT(*) n FROM messages
+                WHERE category IS NULL
+                  AND classify_attempts >= {MAX_CLASSIFY_ATTEMPTS}
+                """
+            ),
+        }
+        for category in (CATEGORY_ALERT, CATEGORY_UPDATE,
+                         CATEGORY_ACKNOWLEDGEMENT):
+            depths[f"awaiting_handling_{category}"] = one(
+                "SELECT COUNT(*) n FROM messages "
+                "WHERE category = ? AND handled_at IS NULL",
+                (category,),
+            )
+        return depths
+
+    def filtered_out(self):
+        """
+        Summary:
+            Count the messages the rough filter dropped, by reason.
+
+        Returns:
+            dict[str, int]: Drop verdict mapped to how many messages carry it.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Reported separately from `queue_depths` on purpose. These rows are
+            not a backlog and never will be - they have no body and are not
+            meant to have one - so putting them in the same table as the queues
+            is what created the confusion in the first place.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT filter_verdict AS verdict, COUNT(*) AS n FROM messages
+            WHERE filter_verdict IS NOT NULL AND filter_verdict <> ?
+            GROUP BY filter_verdict ORDER BY n DESC
+            """,
+            (VERDICT_PASSED,),
+        ).fetchall()
+        return {row["verdict"]: row["n"] for row in rows}
+
+    # --- stage timings -----------------------------------------------------
+
+    def record_stage_runs(self, rows):
+        """Append what each stage of one cycle did, and how long it took.
+
+        Summary:
+            Write one `stage_runs` row per timed pipeline stage.
+
+        Parameters:
+            rows (list[dict]): Each with `cycle_id`, `stage`, `started_at`,
+                `duration_ms`, and `outcome`; optionally `processed` and
+                `detail`.
+
+        Returns:
+            int: How many rows were written.
+
+        Raises:
+            sqlite3.Error: If the write or the commit fails.
+
+        Note:
+            Commits, and takes a batch rather than a row. The cycle buffers its
+            timings and flushes them once at the end for the same reason the
+            provider ledger does: the measurement must not become a write in
+            the middle of the thing it is measuring.
+        """
+        if not rows:
+            return 0
+        self.conn.executemany(
+            """
+            INSERT INTO stage_runs
+                (cycle_id, stage, started_at, duration_ms, processed, outcome,
+                 detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["cycle_id"],
+                    row["stage"],
+                    row["started_at"],
+                    int(row.get("duration_ms") or 0),
+                    int(row.get("processed") or 0),
+                    row["outcome"],
+                    row.get("detail"),
+                )
+                for row in rows
+            ],
+        )
+        self.conn.commit()
+        return len(rows)
+
+    def recent_stage_runs(self, cycles=20):
+        """The stages of the last few cycles, newest cycle first.
+
+        Summary:
+            List every `stage_runs` row belonging to the most recent cycles.
+
+        Parameters:
+            cycles (int): How many cycles back to read. Defaults to 20.
+
+        Returns:
+            list[sqlite3.Row]: Stage rows, newest cycle first and in stage
+                order within a cycle.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Selected by cycle rather than by row count. A cycle that skipped
+            four stages writes fewer rows than one that ran them all, so a flat
+            `LIMIT` would silently show more history for a broken pipeline than
+            a working one - the opposite of what the page is for.
+        """
+        return self.conn.execute(
+            """
+            SELECT * FROM stage_runs
+            WHERE cycle_id IN (
+                SELECT cycle_id FROM stage_runs
+                GROUP BY cycle_id ORDER BY MAX(started_at) DESC LIMIT ?
+            )
+            ORDER BY started_at DESC, id DESC
+            """,
+            (cycles,),
+        ).fetchall()
+
+    def stage_timings(self, since_iso):
+        """How long each stage has been taking.
+
+        Summary:
+            Summarise duration and throughput per stage over a window.
+
+        Parameters:
+            since_iso (str): Inclusive lower bound as an ISO-8601 timestamp.
+
+        Returns:
+            list[dict]: One entry per stage with `stage`, `runs`, `processed`,
+                `median_ms`, `p95_ms`, `max_ms`, and `failures`, slowest
+                median first.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Percentiles are computed in Python rather than SQL. sqlite has no
+            percentile function, and a stage runs at most a few hundred times
+            in a retention window - small enough that sorting the list costs
+            less than the window function would.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT stage, duration_ms, processed, outcome
+            FROM stage_runs WHERE started_at >= ?
+            """,
+            (since_iso,),
+        ).fetchall()
+
+        by_stage = {}
+        for row in rows:
+            entry = by_stage.setdefault(
+                row["stage"], {"durations": [], "processed": 0, "failures": 0}
+            )
+            entry["durations"].append(row["duration_ms"])
+            entry["processed"] += row["processed"] or 0
+            if row["outcome"] not in ("ok", "skipped"):
+                entry["failures"] += 1
+
+        summary = []
+        for stage, entry in by_stage.items():
+            durations = sorted(entry["durations"])
+            summary.append({
+                "stage": stage,
+                "runs": len(durations),
+                "processed": entry["processed"],
+                "median_ms": _percentile(durations, 0.5),
+                "p95_ms": _percentile(durations, 0.95),
+                "max_ms": durations[-1] if durations else 0,
+                "failures": entry["failures"],
+            })
+        summary.sort(key=lambda entry: entry["median_ms"], reverse=True)
+        return summary
+
+    def last_stage_errors(self):
+        """The most recent failure of each stage, if it has ever failed.
+
+        Summary:
+            Report the latest non-ok outcome per stage.
+
+        Returns:
+            dict[str, dict]: Stage name mapped to `started_at`, `outcome`, and
+                `detail`.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            This is the gap that let a stage fail on every single cycle without
+            anything saying so: the scheduler only ever surfaced an error that
+            reached the top of `PipelineCycle.run`, and a stage that logged and
+            carried on never did.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT stage, started_at, outcome, detail FROM stage_runs
+            WHERE outcome NOT IN ('ok', 'skipped')
+            GROUP BY stage
+            HAVING started_at = MAX(started_at)
+            """
+        ).fetchall()
+        return {
+            row["stage"]: {
+                "started_at": row["started_at"],
+                "outcome": row["outcome"],
+                "detail": row["detail"],
+            }
+            for row in rows
+        }
+
+    def prune_stage_runs(self, older_than_days=30):
+        """
+        Summary:
+            Delete stage timing rows past the retention window.
+
+        Parameters:
+            older_than_days (int): Retention window in days. Defaults to 30.
+
+        Returns:
+            int: How many rows were deleted.
+
+        Raises:
+            sqlite3.Error: If the delete or the commit fails.
+
+        Note:
+            Commits. Seven stages every ten minutes is about a thousand rows a
+            day, so this table outgrows `provider_usage` and is pruned on the
+            same schedule for the same reason.
+        """
+        cutoff = (datetime.now() - timedelta(days=older_than_days)).isoformat(
+            timespec="seconds"
+        )
+        cursor = self.conn.execute(
+            "DELETE FROM stage_runs WHERE started_at < ?", (cutoff,)
         )
         self.conn.commit()
         return cursor.rowcount

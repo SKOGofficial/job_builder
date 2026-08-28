@@ -13,6 +13,9 @@ calling thread and only network calls go to the executor.
 """
 
 import logging
+import time
+import uuid
+from datetime import datetime
 
 from clients.llm_client import GroqNotConfigured, GroqRateLimited
 from clients.providers.pool import THREAD_MAX_WAIT
@@ -72,9 +75,125 @@ class PipelineCycle:
         self.message = ""
         self.last_result = {}
 
+        #: Stage timings for the cycle in flight, flushed once at the end.
+        #: Buffered rather than written per stage for the same reason the
+        #: provider ledger is: a measurement that writes to the database in the
+        #: middle of the stage it is measuring has changed what it measured.
+        self.pending_timings = []
+        self.cycle_id = ""
+
     @property
     def busy(self):
         return self.state == RUNNING
+
+    # --- measurement -------------------------------------------------------
+
+    async def _timed(self, stage, run, default=None):
+        """Run one stage, recording how long it took and how it ended.
+
+        Summary:
+            Await a stage, buffering a `stage_runs` row for it either way.
+
+        Parameters:
+            stage (str): The stage name, as it appears on the diagnostics page.
+            run (Callable): Zero-argument callable returning the stage's
+                awaitable or value.
+            default: What to return when the stage raises. None by default.
+
+        Returns:
+            Any: Whatever the stage returned, or `default` when it raised.
+
+        Raises:
+            asyncio.CancelledError: Propagated - a cancelled cycle is a
+                shutdown, not a stage failure.
+
+        Note:
+            Swallows the stage's exception and records it rather than letting
+            it end the cycle. Before this, an exception from any handler
+            propagated into `run`'s blanket `except` and took `prepare` down
+            with it - one bad alert email cost the whole second half of a
+            cycle. The failure is now the stage's own, and it is written down
+            instead of only logged.
+        """
+        started = time.perf_counter()
+        started_at = datetime.now().isoformat(timespec="seconds")
+        outcome, detail = "ok", None
+        value = default
+        try:
+            value = run()
+            if hasattr(value, "__await__"):
+                value = await value
+        except Exception as exc:
+            outcome, detail = "error", str(exc)[:500]
+            value = default
+            log.exception("Pipeline stage %r failed", stage)
+        finally:
+            self.pending_timings.append({
+                "cycle_id": self.cycle_id,
+                "stage": stage,
+                "started_at": started_at,
+                "duration_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                "processed": _count_of(value),
+                "outcome": outcome,
+                "detail": detail,
+            })
+        return value
+
+    def note_skipped(self, stage, detail):
+        """
+        Summary:
+            Record that a stage was deliberately not run this cycle.
+
+        Parameters:
+            stage (str): The stage that was skipped.
+            detail (str): Why, in one line.
+
+        Note:
+            A skipped stage has to leave a row. "Nothing happened because no
+            provider was free" and "nothing happened because there was nothing
+            to do" produce the same empty result, and only the record tells
+            them apart afterwards.
+        """
+        self.pending_timings.append({
+            "cycle_id": self.cycle_id,
+            "stage": stage,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "duration_ms": 0,
+            "processed": 0,
+            "outcome": "skipped",
+            "detail": detail[:500],
+        })
+
+    def failed_stages(self):
+        """
+        Summary:
+            List the stages that failed in the cycle currently being timed.
+
+        Returns:
+            list[tuple[str, str]]: `(stage, detail)` for each failed stage, in
+                the order they ran. Empty when every stage was fine.
+        """
+        return [(row["stage"], row["detail"] or "failed")
+                for row in self.pending_timings if row["outcome"] == "error"]
+
+    def flush_timings(self):
+        """
+        Summary:
+            Write this cycle's buffered stage timings and clear the buffer.
+
+        Returns:
+            int: How many rows were written.
+
+        Note:
+            Never raises. Losing a measurement must not fail the cycle that
+            produced it - the pipeline's job is the mail, not the metrics.
+        """
+        rows, self.pending_timings = self.pending_timings, []
+        try:
+            return self.mail.record_stage_runs(rows)
+        except Exception:
+            log.debug("Could not record stage timings", exc_info=True)
+            return 0
 
     def _pool(self):
         """The provider pool, or None when no model is configured.
@@ -155,12 +274,25 @@ class PipelineCycle:
         if self.busy:
             return self.last_result
         self.state = RUNNING
+        self.cycle_id = uuid.uuid4().hex[:12]
+        self.pending_timings = []
         result = {}
         try:
-            result["synced"] = await self.sync.run(self.limits["sync"])
-            result["filter"] = self.apply_filter()
-            result["bodies"] = await self.bodies.run(self.limits["bodies"])
-            result["expired"] = self.mail.purge_stale_leads()
+            result["synced"] = await self._timed(
+                "sync", lambda: self.sync.run(self.limits["sync"]), 0)
+            result["filter"] = await self._timed(
+                "filter", self.apply_filter, {})
+            result["bodies"] = await self._timed(
+                "bodies", lambda: self.bodies.run(self.limits["bodies"]), 0)
+            # Straight after the fetch, because that is when a body turns out
+            # to be empty. A message whose body came back blank is excluded
+            # from the model queue and was previously marked as nothing at all,
+            # so it stayed "unclassified" for ever with no way to tell it from
+            # mail that had simply not been reached.
+            result["retired"] = await self._timed(
+                "retire", self.mail.retire_unclassifiable, 0)
+            result["expired"] = await self._timed(
+                "expire", self.mail.purge_stale_leads, 0)
 
             pool = self._pool()
             if pool is not None:
@@ -169,22 +301,46 @@ class PipelineCycle:
                     # Classification first and unconditionally: the rule tier
                     # needs no provider, so a cooling-off pool must not stop
                     # a mailbox of job-board digests being sorted.
-                    result["classified"] = await self.classify(pool)
+                    result["classified"] = await self._timed(
+                        "classify", lambda: self.classify(pool), {})
                     result.update(await self._model_stages(pool))
                 finally:
                     pool.flush()
             else:
-                result["classified"] = await self.classify(None)
+                result["classified"] = await self._timed(
+                    "classify", lambda: self.classify(None), {})
+                self.note_skipped("dispatch", "No provider is configured.")
+                self.note_skipped("prepare", "No provider is configured.")
                 result["handled"] = {}
                 result["prepared"] = {}
 
             self.state = IDLE
             self.message = _summarise(result)
+
+            # A stage that failed no longer ends the cycle - the stages after
+            # it are worth running, and one bad alert email used to cost the
+            # whole second half of a pass. But it must still be *reported*: a
+            # stage failing on every single cycle showing nothing anywhere is
+            # the other half of the same bug.
+            failures = self.failed_stages()
+            if failures:
+                self.state = ERROR
+                result["error"] = "; ".join(
+                    f"{stage}: {detail}" for stage, detail in failures
+                )
+                self.message = (
+                    f"{self.message} "
+                    f"({', '.join(stage for stage, _ in failures)} failed)"
+                )
         except Exception as exc:
             self.state = ERROR
             self.message = f"Pipeline cycle failed: {exc}"
             log.exception("Pipeline cycle failed")
             result["error"] = str(exc)
+        finally:
+            # Written even when the cycle failed. A cycle that died halfway is
+            # precisely the one whose stage timings are worth reading.
+            self.flush_timings()
         self.last_result = result
         return result
 
@@ -254,11 +410,16 @@ class PipelineCycle:
                 "%ds. Mail still synced and sorted by rule; extraction resumes "
                 "when one frees up.", int(wait),
             )
+            reason = f"No provider available for about {int(wait)}s."
+            self.note_skipped("dispatch", reason)
+            self.note_skipped("prepare", reason)
             return {"handled": {}, "prepared": {}, "retry_after": int(wait)}
 
         return {
-            "handled": await self.dispatch(pool),
-            "prepared": await self.prepare(pool),
+            "handled": await self._timed(
+                "dispatch", lambda: self.dispatch(pool), {}),
+            "prepared": await self._timed(
+                "prepare", lambda: self.prepare(pool), {}),
         }
 
     async def dispatch(self, pool):
@@ -399,6 +560,36 @@ def _resolved_factory(client):
         return client
 
     return factory
+
+
+def _count_of(value):
+    """How much work a stage got through, from whatever shape it returned.
+
+    Summary:
+        Reduce a stage's return value to a single count.
+
+    Parameters:
+        value: A stage result - an int, a dict of counts, or None.
+
+    Returns:
+        int: The stage's throughput for this cycle, 0 when it cannot be read.
+
+    Note:
+        The stages predate the measurement and return four different shapes
+        between them. Normalising here keeps that history out of the schema,
+        which only wants a number.
+    """
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, dict):
+        return sum(v for v in value.values() if isinstance(v, int)
+                   and not isinstance(v, bool))
+    if isinstance(value, (list, tuple)):
+        return sum(v for v in value if isinstance(v, int)
+                   and not isinstance(v, bool))
+    return 0
 
 
 def _labels(row):

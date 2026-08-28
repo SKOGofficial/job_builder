@@ -116,8 +116,11 @@ class PipelineScheduler:
             # "what did last month cost" stays answerable, and dropped after
             # that so the table cannot grow without bound unattended.
             usage = self.cycle.mail.prune_provider_usage(self.prune_after_days)
+            # Seven stages every ten minutes outgrows the usage table, so it
+            # goes on the same schedule rather than a slower one of its own.
+            usage += self.cycle.mail.prune_stage_runs(self.prune_after_days)
             if usage:
-                log.info("Pruned %d provider usage row(s) older than %d days",
+                log.info("Pruned %d telemetry row(s) older than %d days",
                          usage, self.prune_after_days)
             if cleared:
                 log.info("Pruned %d irrelevant message bod%s older than %d days",

@@ -37,6 +37,7 @@ from utilities.mailstore import (
     CATEGORY_IRRELEVANT,
     CATEGORY_UPDATE,
     CATEGORIES,
+    MAX_CLASSIFY_ATTEMPTS,
 )
 
 log = logging.getLogger(__name__)
@@ -145,6 +146,10 @@ class MessageRouter:
         #: Reported so the split stays visible - a sudden collapse in this
         #: number means a board changed its sender or its subject wording.
         self.by_rule = 0
+        #: Messages that ran out of attempts this pass. Counted separately from
+        #: `failed` because they are the ones that will never be seen again,
+        #: which is the number worth putting in front of a person.
+        self.retired = 0
         self.by_category = {}
 
     async def _call(self, client, payload):
@@ -296,7 +301,7 @@ class MessageRouter:
                 log.info("Router paused by rate limit after %d message(s); "
                          "retry in about %ss", self.processed, exc.retry_after)
                 break
-            except Exception:
+            except Exception as exc:
                 # `continue`, not `break`. A failure that is specific to one
                 # message - a payload no provider will take, a malformed body -
                 # used to end the whole pass, so that message sat at the head
@@ -306,10 +311,20 @@ class MessageRouter:
                 # not a reason to stop reading the others.
                 #
                 # A rate limit is still `break` above, because that one really
-                # does apply to every message behind it.
+                # does apply to every message behind it - and for the same
+                # reason it is not counted against the message here.
                 log.exception("Router failed on %s; skipping it and "
                               "continuing", payload["gmail_message_id"])
+                attempts = self.mail.record_classify_failure(
+                    payload["gmail_message_id"], str(exc))
                 failed += 1
+                if attempts >= MAX_CLASSIFY_ATTEMPTS:
+                    self.retired += 1
+                    log.warning(
+                        "Message %s has failed classification %d times and "
+                        "will not be tried again: %s",
+                        payload["gmail_message_id"], attempts, exc,
+                    )
                 continue
 
             # `getattr` rather than an attribute access: every test double is
@@ -319,9 +334,11 @@ class MessageRouter:
                          counts)
 
         if failed:
-            # Said plainly rather than left to the tracebacks above. These
-            # messages are still unclassified and will be tried again next
-            # cycle; the count is what makes a permanent failure visible as a
-            # number that does not go down.
-            log.warning("%d message(s) could not be classified this pass and "
-                        "remain unclassified", failed)
+            # Said plainly rather than left to the tracebacks above. The
+            # retired count is the important half: before the attempt ceiling,
+            # a message no provider could answer was retried first on every
+            # cycle for ever, and the only symptom was a backlog number that
+            # never went down.
+            log.warning("%d message(s) could not be classified this pass; "
+                        "%d of them have now been retired after %d attempts",
+                        failed, self.retired, MAX_CLASSIFY_ATTEMPTS)

@@ -516,6 +516,56 @@ def migrate_v6(conn):
     )
 
 
+def migrate_v7(conn):
+    """Make the pipeline's own behaviour measurable, and its failures terminal.
+
+    Three columns, one purpose between them: the pipeline could not answer
+    "how long did that take" or "why is this message still here" about itself.
+
+    `provider_usage.duration_ms` is the missing half of that table. It already
+    recorded what a call cost and how it ended; it never recorded how long it
+    took, so a cycle that ran twenty minutes and one that ran two looked
+    identical afterwards.
+
+    `messages.classify_attempts` and `classify_error` end an unbounded retry.
+    A failure specific to one message left it unclassified, and because the
+    model queue is oldest-first that message was retried first on every cycle,
+    for ever, spending quota each time with no record that it had ever failed.
+
+    Summary:
+        Add `provider_usage.duration_ms`, `messages.classify_attempts`, and
+        `messages.classify_error`.
+
+    Parameters:
+        conn (sqlite3.Connection): The connection to migrate.
+
+    Raises:
+        sqlite3.Error: If a column check or an `ALTER TABLE` fails.
+
+    Note:
+        Nothing is backfilled. A duration cannot be reconstructed for a call
+        that has already happened, and an attempt count invented for history
+        would be a number the pipeline never actually observed - which is worse
+        than NULL, because it reads as measurement. The new columns describe
+        what happens from here.
+
+        The stage_runs table these are read alongside needs no entry here:
+        `create_tables` runs `CREATE TABLE IF NOT EXISTS` on every initialise,
+        before the version gate.
+    """
+    if "duration_ms" not in column_names(conn, "provider_usage"):
+        conn.execute("ALTER TABLE provider_usage ADD COLUMN duration_ms INTEGER")
+
+    message_columns = column_names(conn, "messages")
+    if "classify_attempts" not in message_columns:
+        conn.execute(
+            "ALTER TABLE messages "
+            "ADD COLUMN classify_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+    if "classify_error" not in message_columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN classify_error TEXT")
+
+
 MIGRATIONS = [
     (1, migrate_v1),
     (2, migrate_v2),
@@ -523,6 +573,7 @@ MIGRATIONS = [
     (4, migrate_v4),
     (5, migrate_v5),
     (6, migrate_v6),
+    (7, migrate_v7),
 ]
 
 
