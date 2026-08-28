@@ -453,6 +453,103 @@ def settings_page():
             staleness_card.refresh()
             pipeline_card.refresh()
 
+        # Pipeline tuning ------------------------------------------------------
+
+        @ui.refreshable
+        def tuning_card():
+            """The numbers that decide how much a cycle does and how long a
+            lead lives.
+
+            Summary:
+                Render the lead freshness window and the per-cycle stage
+                limits.
+
+            Note:
+                Lead freshness is first because it is the only one here with a
+                visible consequence - it decides when a role disappears from
+                the to-apply list, and a number that deletes your work should
+                not be a constant in a source file.
+
+                The stage limits are behind an expansion. They are real
+                controls and worth being reachable, but they are tuning rather
+                than policy, and the defaults were each chosen against a
+                measured constraint - see the comments in
+                `PipelineCycle.__init__`. `/diagnostics` is where to look
+                before changing one.
+            """
+            with card():
+                ui.label("Pipeline tuning").classes("text-base font-semibold")
+
+                ui.label("How long an untouched lead stays on the to-apply "
+                         "list. A lead you have generated documents for is "
+                         "kept regardless.").classes("text-sm opacity-70")
+
+                freshness = ui.number(
+                    label="Lead freshness (days)",
+                    value=mailstore.lead_freshness_days(state.store),
+                    min=1, max=365, step=1, format="%d",
+                ).props("dense outlined").classes("w-48")
+
+                def save_freshness():
+                    try:
+                        days = max(1, int(freshness.value))
+                    except (TypeError, ValueError):
+                        ui.notify("Enter a whole number of days.",
+                                  type="warning")
+                        return
+                    state.store.save_profile_value(
+                        mailstore.LEAD_FRESHNESS_KEY, str(days))
+                    notify(f"Leads are kept for {days} day(s).")
+                    tuning_card.refresh()
+
+                ui.button("Save", on_click=save_freshness).props(
+                    "unelevated no-caps dense")
+
+                with ui.expansion("Per-cycle limits").classes("w-full pt-2"):
+                    ui.label(
+                        "How much one pass may do before the scheduler comes "
+                        "back. Each default was chosen against a measured "
+                        "constraint - alert extraction is about 3,400 tokens "
+                        "against a 12,000/minute ceiling, so fifteen is a few "
+                        "minutes. Check /diagnostics before changing one."
+                    ).classes("text-xs opacity-70")
+
+                    pipeline = state.pipeline
+                    if pipeline is None:
+                        ui.label(
+                            "The pipeline is not running in this process, so "
+                            "there is nothing to tune here."
+                        ).classes("text-xs opacity-60")
+                        return
+
+                    inputs = {}
+                    with ui.row().classes("gap-2 flex-wrap pt-1"):
+                        for name in ("sync", "filter", "bodies", "classify",
+                                     "handle"):
+                            inputs[name] = ui.number(
+                                label=name, value=pipeline.limits[name],
+                                min=1, max=5000, step=1, format="%d",
+                            ).props("dense outlined").classes("w-28")
+
+                    def save_limits():
+                        for name, element in inputs.items():
+                            try:
+                                pipeline.limits[name] = max(
+                                    1, int(element.value))
+                            except (TypeError, ValueError):
+                                ui.notify(f"{name} must be a whole number.",
+                                          type="warning")
+                                return
+                        notify("Per-cycle limits updated for this session.")
+
+                    ui.button("Apply", on_click=save_limits).props(
+                        "unelevated no-caps dense")
+                    ui.label(
+                        "Applies to the running pipeline. Not persisted - "
+                        "these are for trying a value against the diagnostics "
+                        "page, and a restart returns to the measured defaults."
+                    ).classes("text-xs opacity-60")
+
         # Blocked senders ------------------------------------------------------
 
         @ui.refreshable
@@ -525,6 +622,7 @@ def settings_page():
         pipeline_card()
         staleness_card()
         relevance_card()
+        tuning_card()
         denylist_card()
         page_timer(0.4, watch)
 

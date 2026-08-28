@@ -110,6 +110,10 @@ LEAD_SORTS = {
 #: the mailbox, and choosing it needs the count in front of you.
 ALERT_STALENESS_KEY = "alert_staleness_days"
 
+#: Profile key holding how long an untouched lead stays on the to-apply list.
+#: Defaults to `LEAD_FRESHNESS_DAYS`.
+LEAD_FRESHNESS_KEY = "lead_freshness_days"
+
 #: Marks a `prepare_error` that is a pause rather than a failure. The column
 #: holds free text and the Leads page renders it in red as "Preparation
 #: failed", which is the wrong thing to say about a lead that is simply waiting
@@ -181,6 +185,33 @@ def alert_staleness_days(store):
     except (TypeError, ValueError):
         log.warning("%s=%r is not a number; using %d days",
                     ALERT_STALENESS_KEY, raw, LEAD_FRESHNESS_DAYS)
+        return LEAD_FRESHNESS_DAYS
+
+
+def lead_freshness_days(store):
+    """How long an untouched lead stays on the to-apply list.
+
+    Summary:
+        Read the configured lead freshness window.
+
+    Parameters:
+        store (JobStore): The store holding the profile key/value table.
+
+    Returns:
+        int: The window in days. Defaults to `LEAD_FRESHNESS_DAYS`, never less
+            than 1.
+
+    Note:
+        Never raises on a bad stored value. A profile row someone hand-edited
+        should degrade to the default rather than start deleting leads on a
+        window nobody chose.
+    """
+    raw = store.get_profile_value(LEAD_FRESHNESS_KEY, "")
+    try:
+        return max(1, int(raw)) if raw else LEAD_FRESHNESS_DAYS
+    except (TypeError, ValueError):
+        log.warning("%s=%r is not a number; using %d days",
+                    LEAD_FRESHNESS_KEY, raw, LEAD_FRESHNESS_DAYS)
         return LEAD_FRESHNESS_DAYS
 
 

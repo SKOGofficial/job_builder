@@ -763,6 +763,27 @@ async def test_the_saved_alert_cutoff_is_what_the_pipeline_reads(user, state):
 # Diagnostics ---------------------------------------------------------------
 
 
+async def test_the_lead_freshness_window_is_configurable(user, state):
+    """A number that deletes your work should not be a source constant."""
+    from utilities.mailstore import LEAD_FRESHNESS_KEY, lead_freshness_days
+
+    state.store.save_profile_value(LEAD_FRESHNESS_KEY, "30")
+    await user.open("/settings")
+    await user.should_see("Pipeline tuning")
+    assert lead_freshness_days(state.store) == 30
+
+
+async def test_a_nonsense_freshness_window_does_not_start_deleting_leads(state):
+    from utilities.mailstore import (
+        LEAD_FRESHNESS_DAYS,
+        LEAD_FRESHNESS_KEY,
+        lead_freshness_days,
+    )
+
+    state.store.save_profile_value(LEAD_FRESHNESS_KEY, "soon")
+    assert lead_freshness_days(state.store) == LEAD_FRESHNESS_DAYS
+
+
 async def test_diagnostics_separates_queues_from_decisions(user, state):
     """The distinction that 264 messages of confusion came down to.
 

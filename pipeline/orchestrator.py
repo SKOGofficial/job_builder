@@ -372,7 +372,7 @@ class PipelineCycle:
             result["retired"] = await self._timed(
                 "retire", self.mail.retire_unclassifiable, 0)
             result["expired"] = await self._timed(
-                "expire", self.mail.purge_stale_leads, 0)
+                "expire", self.purge_stale_leads, 0)
             # Before the provider gate, with the other free stages. Retiring a
             # stale alert costs no model call, and running it inside `dispatch`
             # meant a cooling-off pool skipped the one piece of backlog work
@@ -430,6 +430,28 @@ class PipelineCycle:
             self.flush_timings()
         self.last_result = result
         return result
+
+    def purge_stale_leads(self):
+        """Drop open leads whose posting has gone stale.
+
+        Summary:
+            Delete leads past the configured freshness window.
+
+        Returns:
+            int: How many leads were deleted.
+
+        Raises:
+            sqlite3.Error: Propagated from the store.
+
+        Note:
+            Reads the window from Settings rather than taking the constant, so
+            the number that decides when a role disappears from the to-apply
+            list is one the user can see and change. A lead with generated
+            documents is exempt whatever the window says - see the store.
+        """
+        from utilities.mailstore import lead_freshness_days
+
+        return self.mail.purge_stale_leads(lead_freshness_days(self.store))
 
     def retire_stale_alerts(self):
         """Clear alerts too old for extraction to yield anything.
