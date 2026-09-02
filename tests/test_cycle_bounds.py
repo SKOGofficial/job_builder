@@ -26,6 +26,26 @@ async def _resolved(value):
     return value
 
 
+class FakeClock:
+    """A monotonic clock that only moves when told to.
+
+    Timing tests that race a real clock are the ones that pass on a laptop and
+    fail in CI. The first version of the deadline test set a one-millisecond
+    budget and assumed seven stubbed stages would outlast it; against an
+    in-memory database they do not reliably take that long, so the assertion
+    depended on how busy the runner was.
+    """
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
 def make_cycle(**kwargs):
     store = JobStore(":memory:")
     mail = MailStore(store.conn)
@@ -102,16 +122,41 @@ class TheCycleStopsStartingStagesWhenOutOfTimeTests(unittest.TestCase):
         self.assertFalse(self.cycle.out_of_time())
 
     def test_an_expired_deadline_skips_the_remaining_stages(self):
-        self.cycle.deadline_seconds = 0.001
-        asyncio.run(self.cycle.run())
+        clock = FakeClock()
+        store, _mail, cycle = make_cycle(deadline_seconds=30, clock=clock)
+        self.addCleanup(store.close)
+        # Burn the whole budget during the first stage, so the deadline is
+        # unambiguously spent by the time the second one is considered.
+        cycle.sync.run = lambda limit: (clock.advance(60), _resolved(0))[1]
 
-        stages = self.stages()
+        asyncio.run(cycle.run())
+
+        rows = {row["stage"]: row for row in store.conn.execute(
+            "SELECT * FROM stage_runs")}
         # Recorded, not silently absent. A stage that never got a turn looks
         # exactly like a stage with nothing to do, and only the row says which.
-        out_of_time = [name for name, row in stages.items()
+        out_of_time = [name for name, row in rows.items()
                        if row["outcome"] == "skipped"
                        and "ran out of time" in (row["detail"] or "")]
-        self.assertTrue(out_of_time)
+        self.assertIn("filter", out_of_time)
+        self.assertIn("classify", out_of_time)
+
+    def test_the_first_stage_always_runs(self):
+        # A budget smaller than a cycle takes is a misconfiguration, not an
+        # instruction to do nothing. Without this guarantee the pipeline would
+        # skip every stage on every cycle and quietly stop working while still
+        # reporting that it had run.
+        clock = FakeClock()
+        store, _mail, cycle = make_cycle(deadline_seconds=30, clock=clock)
+        self.addCleanup(store.close)
+        clock.advance(600)  # already long past the deadline before we begin
+
+        asyncio.run(cycle.run())
+
+        first = store.conn.execute(
+            "SELECT * FROM stage_runs ORDER BY id LIMIT 1").fetchone()
+        self.assertEqual(first["stage"], "sync")
+        self.assertEqual(first["outcome"], "ok")
 
     def test_a_generous_deadline_lets_everything_run(self):
         self.cycle.deadline_seconds = 300

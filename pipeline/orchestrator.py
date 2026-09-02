@@ -55,7 +55,7 @@ class PipelineCycle:
     def __init__(self, store, mail, client_factory=None, executor=None,
                  threshold=0.85, limits=None, research_factory=None,
                  relevance_threshold=None, auto_prepare=False,
-                 deadline_seconds=None):
+                 deadline_seconds=None, clock=time.monotonic):
         self.store = store
         self.mail = mail
         self.client_factory = client_factory
@@ -118,6 +118,11 @@ class PipelineCycle:
         #: `PipelineScheduler` sets it from the poll interval.
         self.deadline_seconds = deadline_seconds
         self._deadline_at = None
+        #: Injectable so a test can decide what "out of time" means instead of
+        #: racing a real clock. Same pattern as `ProviderPool`.
+        self._clock = clock
+        #: Stages actually started this cycle. See `out_of_time`.
+        self._stages_started = 0
 
     @property
     def busy(self):
@@ -129,11 +134,21 @@ class PipelineCycle:
             Whether this cycle has spent its wall-clock budget.
 
         Returns:
-            bool: True when the deadline has passed. Always False when no
-                deadline is set.
+            bool: True when the deadline has passed **and** at least one stage
+                has already run. Always False when no deadline is set.
+
+        Note:
+            The first stage of a cycle always runs, however little time is
+            left. A budget smaller than a cycle takes is a misconfiguration,
+            not an instruction to do nothing: without this, a deadline set too
+            low would skip every stage on every cycle and the pipeline would
+            quietly stop working while reporting that it had run. Guaranteeing
+            one stage means the mailbox still syncs and the cycle still makes
+            progress, just slowly.
         """
         return (self._deadline_at is not None
-                and time.monotonic() >= self._deadline_at)
+                and self._stages_started > 0
+                and self._clock() >= self._deadline_at)
 
     # --- measurement -------------------------------------------------------
 
@@ -174,6 +189,7 @@ class PipelineCycle:
                 f"({self.deadline_seconds}s budget).")
             return default
 
+        self._stages_started += 1
         started = time.perf_counter()
         started_at = datetime.now().isoformat(timespec="seconds")
         outcome, detail = "ok", None
@@ -354,7 +370,8 @@ class PipelineCycle:
         self.state = RUNNING
         self.cycle_id = uuid.uuid4().hex[:12]
         self.pending_timings = []
-        self._deadline_at = (time.monotonic() + self.deadline_seconds
+        self._stages_started = 0
+        self._deadline_at = (self._clock() + self.deadline_seconds
                              if self.deadline_seconds else None)
         result = {}
         try:
