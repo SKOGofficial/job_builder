@@ -10,7 +10,7 @@ it, in the order they arrived.
 from nicegui import ui
 
 from utilities.theme import STATUS_COLORS, STATUSES
-from web.shell import card, page_shell
+from web.shell import badge, card, page_shell
 from web.state import get_state
 
 #: How a linked message is labelled on the timeline. Keyed on the bare kind:
@@ -186,10 +186,11 @@ def entry(message):
     with ui.column().classes("w-full gap-1 rounded p-3 bg-black/5 dark:bg-white/5"):
         with ui.row().classes("w-full items-center gap-2"):
             kind = link_kind(message["link_type"])
-            ui.html(
-                f'<span style="background-color:{LINK_COLORS.get(kind, "#64748b")};'
-                f'color:#fff;padding:1px 8px;border-radius:9999px;font-size:10px;'
-                f'font-weight:600">{LINK_LABELS.get(kind, kind)}</span>'
+            badge(
+                LINK_LABELS.get(kind, kind),
+                LINK_COLORS.get(kind, "#64748b"),
+                padding="1px 8px",
+                font_size="10px",
             )
             ui.label(message["received_date"] or "").classes("text-xs opacity-60")
             if message["resolved_by"] == "manual":

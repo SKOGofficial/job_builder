@@ -48,7 +48,7 @@ from utilities.mailstore import (
     LEAD_SORT_RELEVANCE,
     PREPARE_WAITING_PREFIX,
 )
-from web.shell import card, page_shell
+from web.shell import badge, card, page_shell
 from web.state import get_state
 
 log = logging.getLogger(__name__)
@@ -342,11 +342,7 @@ def leads_page():
                 actions(lead)
 
         def status_badge(status):
-            ui.html(
-                f'<span style="background-color:{STATUS_COLORS.get(status, "#64748b")};'
-                f'color:#fff;padding:2px 10px;border-radius:9999px;font-size:11px;'
-                f'font-weight:600">{status}</span>'
-            )
+            badge(status, STATUS_COLORS.get(status, "#64748b"), padding="2px 10px")
 
         def research(lead):
             row = mail.research_for(lead["identity_key"])

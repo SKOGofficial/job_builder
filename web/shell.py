@@ -4,6 +4,7 @@ Every page opens with `page_shell(...)`, which draws the header and drawer and
 then hands back a container for the page body.
 """
 
+import html
 import logging
 from contextlib import contextmanager
 
@@ -57,6 +58,35 @@ def card(padding="p-6"):
             manager.
     """
     return ui.card().classes(f"w-full {padding} gap-2 shadow-sm").props("flat bordered")
+
+
+def badge(text, color, *, padding="2px 8px", font_size="11px"):
+    """A colored pill label, rendered as raw HTML with its text escaped.
+
+    Every current caller sources `text` from a closed set - a label
+    validated against `LABELS`, a fixed job status, or a fixed link kind -
+    so nothing exploitable reaches this today. The escape exists so that
+    stays true if a future caller passes something less controlled; `color`
+    is never caller-supplied text, so it is not escaped.
+
+    Summary:
+        Render a rounded, colored badge with escaped text.
+
+    Parameters:
+        text: The label to show. Converted to `str` and escaped.
+        color (str): CSS color for the badge background, e.g. a hex string.
+        padding (str): CSS padding for the pill. Defaults to "2px 8px".
+        font_size (str): CSS font-size for the label. Defaults to "11px".
+
+    Returns:
+        ui.html: The rendered element.
+    """
+    safe_text = html.escape(str(text))
+    return ui.html(
+        f'<span style="background-color:{color};color:#fff;'
+        f'padding:{padding};border-radius:9999px;font-size:{font_size};'
+        f'font-weight:600">{safe_text}</span>'
+    )
 
 
 def page_timer(interval, callback):

@@ -14,7 +14,7 @@ from nicegui import ui
 from clients import llm_client
 from clients.gmail_client import MISSING_PACKAGES_HINT
 from utilities.theme import STATUSES
-from web.shell import card, page_shell, page_timer
+from web.shell import badge, card, page_shell, page_timer
 from web.state import get_state
 
 
@@ -225,10 +225,9 @@ def email_matches_page():
             if not label:
                 return
             with ui.row().classes("items-center gap-2 flex-wrap"):
-                ui.html(
-                    f'<span style="background-color:{BADGE_COLORS.get(label, "#64748b")};'
-                    f'color:#fff;padding:2px 8px;border-radius:9999px;font-size:11px;'
-                    f'font-weight:600">AI: {label} · {(match["ai_confidence"] or 0):.0%}</span>'
+                badge(
+                    f'AI: {label} · {(match["ai_confidence"] or 0):.0%}',
+                    BADGE_COLORS.get(label, "#64748b"),
                 )
                 model = _column(match, "ai_model")
                 if model:
