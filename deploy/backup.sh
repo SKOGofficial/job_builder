@@ -9,6 +9,9 @@
 # consistent snapshot through the database engine and compacts it on the way
 # out.
 #
+# Also checkpoints the live database's WAL after a good backup exists. Left
+# alone it only grows - VACUUM INTO reads through it but never truncates it.
+#
 # Install as a timer:
 #   sudo cp deploy/job-builder-backup.{service,timer} /etc/systemd/system/
 #   sudo systemctl enable --now job-builder-backup.timer
@@ -37,6 +40,12 @@ if ! sqlite3 "$TARGET" "PRAGMA integrity_check" | grep -q '^ok$'; then
   echo "Integrity check FAILED for $TARGET" >&2
   exit 1
 fi
+
+# Fold the live WAL back into the main file now that a good backup exists.
+# TRUNCATE checkpoints and then shrinks the -wal file; it can leave it
+# partially checkpointed if a writer is active right now, which is fine - the
+# next timer run tries again, and it never blocks the app's own writes.
+sqlite3 "$DB" "PRAGMA wal_checkpoint(TRUNCATE);" > /dev/null
 
 # Prune oldest first, keeping the most recent $KEEP.
 mapfile -t OLD < <(ls -1t "$DEST"/job_applications-*.sqlite3 2>/dev/null | tail -n +"$((KEEP + 1))")
