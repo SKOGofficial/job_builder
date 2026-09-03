@@ -209,7 +209,13 @@ def main(argv=None):
         reload=False,
         show=show,
         host=args.host,
-        storage_secret=os.environ.get("NICEGUI_STORAGE_SECRET", "job-board-tracker-local"),
+        # No literal fallback here on purpose. NiceGUI already fails loudly -
+        # a RuntimeError - the moment `app.storage.user` or `.browser` is
+        # actually used without a secret configured, which is nothing today.
+        # A hardcoded default would defeat that: a public, guessable signing
+        # key sitting next to a --host flag, silently live the day someone
+        # adds a storage call.
+        storage_secret=os.environ.get("NICEGUI_STORAGE_SECRET"),
     )
 
 
