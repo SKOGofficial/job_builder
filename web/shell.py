@@ -36,6 +36,7 @@ DRAWER_ENTRIES = [
     ("Referrals", "/referrals", "handshake"),
     ("Email matches", "/email-matches", "mark_email_unread"),
     ("Experiences", "/experiences", "format_list_bulleted"),
+    ("Diagnostics", "/diagnostics", "monitor_heart"),
     ("Settings", "/settings", "settings"),
     ("Profile", "/profile", "person"),
     ("Resume notes", "/resume", "description"),

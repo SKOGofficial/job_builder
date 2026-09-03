@@ -32,6 +32,13 @@ from utilities import credentials
 
 log = logging.getLogger(__name__)
 
+#: Wall-clock ceiling for one research request, in seconds.
+#:
+#: Generous next to the 30s the JSON providers get: this call runs a server-side
+#: web search and several fetches before it answers, and the CLI's own research
+#: mode allows 240s for the same work.
+REQUEST_TIMEOUT = 240.0
+
 try:
     import anthropic
 
@@ -477,7 +484,14 @@ class ResearchClient:
             return self._caller(prompt)
 
         if self._client is None:
-            self._client = anthropic.Anthropic(api_key=self.key)
+            # Explicit timeout. Every other network path in the app has one -
+            # 30s for Groq and Gemini, 90/240s for the CLI subprocess - and
+            # this was relying on whatever the SDK happened to default to. A
+            # research call runs in an executor thread and holds it for its
+            # whole duration, so "however long the SDK feels like" is a hole in
+            # the cycle's time budget.
+            self._client = anthropic.Anthropic(api_key=self.key,
+                                               timeout=REQUEST_TIMEOUT)
 
         response = self._client.messages.create(
             model=self.model,

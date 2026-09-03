@@ -165,6 +165,7 @@ def use_stub_classifier(state, results):
         ("/email-matches", "Email matches"),
         ("/leads", "To apply"),
         ("/experiences", "Experiences"),
+        ("/diagnostics", "Diagnostics"),
         ("/settings", "Settings"),
         ("/profile", "Profile"),
         ("/resume", "Resume notes"),
@@ -557,6 +558,49 @@ async def test_empty_leads_page_explains_itself(user, state):
     await user.should_see("No leads here yet")
 
 
+async def test_a_lead_offers_generation_rather_than_having_run_it(user, state):
+    """The button that replaced a background job.
+
+    A lead scoring 90% used to have had its research and letter bought already.
+    Now the page offers to do it, and the offer is the only thing that spends.
+    """
+    add_lead(state)
+    await user.open("/leads")
+    await user.should_see("Generate documents")
+    assert state.mail.selections_for(
+        identity_key("Backend Engineer", "Acme", "Remote")) == []
+
+
+async def test_a_lead_with_documents_offers_to_rewrite_them(user, state):
+    add_lead(state)
+    key = identity_key("Backend Engineer", "Acme", "Remote")
+    state.mail.save_selection(key, "resume", bullet_ids=[1])
+    state.mail.commit()
+
+    await user.open("/leads")
+    await user.should_see("Regenerate")
+
+
+async def test_leads_can_be_sorted_by_best_fit(user, state):
+    """Choosing what to spend a research call on wants a different order."""
+    add_lead(state, title="Backend Engineer", score=0.4)
+    add_lead(state, title="Staff Engineer", score=0.95)
+
+    await user.open("/leads")
+    user.find("Best fit").click()
+    await user.should_see("Relevance 95%")
+
+    ordered = state.mail.list_leads(sort_by="relevance")
+    assert [row["title"] for row in ordered] == ["Staff Engineer",
+                                                 "Backend Engineer"]
+
+
+async def test_the_page_says_nothing_is_written_until_you_ask(user, state):
+    add_lead(state)
+    await user.open("/leads")
+    await user.should_see("Nothing is written until you press Generate")
+
+
 async def test_promoting_a_lead_creates_an_application(user, state, store):
     add_lead(state)
     await user.open("/leads")
@@ -677,6 +721,116 @@ async def test_settings_shows_the_pipeline_card(user, state):
     await user.open("/settings")
     await user.should_see("Mailbox ingest")
     await user.should_see("Blocked senders")
+
+
+async def test_settings_previews_what_the_alert_cutoff_would_clear(user, state):
+    """The preview is the whole point of the card.
+
+    The cutoff decides real spend - extraction is the most expensive call in
+    the pipeline - so the number of alerts it would retire has to be visible
+    while choosing it, not only after saving.
+    """
+    import time
+
+    from utilities.mailstore import CATEGORY_ALERT
+
+    for index, days in enumerate((1, 40, 60)):
+        state.mail.upsert_message({"id": f"alert-{index}",
+                                   "sender": "jobs@board.test",
+                                   "subject": "Jobs", "date": ""})
+        state.mail.store_body(f"alert-{index}", "Engineer at Acme.")
+        state.mail.record_category(f"alert-{index}", CATEGORY_ALERT, 0.9, "d")
+        state.mail.conn.execute(
+            "UPDATE messages SET received_ts = ? WHERE gmail_message_id = ?",
+            (int(time.time() - days * 86400), f"alert-{index}"))
+    state.mail.commit()
+
+    await user.open("/settings")
+    await user.should_see("Alert age limit")
+    # Two of the three are past the default fourteen-day cutoff.
+    await user.should_see("retires 2 of them")
+
+
+async def test_the_saved_alert_cutoff_is_what_the_pipeline_reads(user, state):
+    from utilities.mailstore import ALERT_STALENESS_KEY, alert_staleness_days
+
+    state.store.save_profile_value(ALERT_STALENESS_KEY, "5")
+    await user.open("/settings")
+    await user.should_see("older than 5 day(s)")
+    assert alert_staleness_days(state.store) == 5
+
+
+# Diagnostics ---------------------------------------------------------------
+
+
+async def test_the_lead_freshness_window_is_configurable(user, state):
+    """A number that deletes your work should not be a source constant."""
+    from utilities.mailstore import LEAD_FRESHNESS_KEY, lead_freshness_days
+
+    state.store.save_profile_value(LEAD_FRESHNESS_KEY, "30")
+    await user.open("/settings")
+    await user.should_see("Pipeline tuning")
+    assert lead_freshness_days(state.store) == 30
+
+
+async def test_a_nonsense_freshness_window_does_not_start_deleting_leads(state):
+    from utilities.mailstore import (
+        LEAD_FRESHNESS_DAYS,
+        LEAD_FRESHNESS_KEY,
+        lead_freshness_days,
+    )
+
+    state.store.save_profile_value(LEAD_FRESHNESS_KEY, "soon")
+    assert lead_freshness_days(state.store) == LEAD_FRESHNESS_DAYS
+
+
+async def test_diagnostics_separates_queues_from_decisions(user, state):
+    """The distinction that 264 messages of confusion came down to.
+
+    Filter-dropped mail is not a backlog: it never gets a body, so it can never
+    leave `category IS NULL`. Listing it as "waiting" is what made two honest
+    counts disagree.
+    """
+    from pipeline.rough_filter import DROP_PERSONAL
+
+    state.mail.upsert_message({"id": "dropped", "sender": "friend@gmail.com",
+                               "subject": "Lunch?", "date": ""})
+    state.mail.set_filter_verdict("dropped", DROP_PERSONAL)
+    state.mail.commit()
+
+    await user.open("/diagnostics")
+    await user.should_see("dropped before classification")
+    await user.should_see("Not a backlog")
+
+    # A table's rows are props rather than child elements, so this asserts on
+    # the data the table was handed.
+    queues = next(iter(user.find(kind=ui.table).elements)).rows
+    by_queue = {row["queue"]: row["waiting"] for row in queues}
+    assert by_queue["Waiting for the rule tier"] == 0
+    assert by_queue["Waiting for the model"] == 0
+
+
+async def test_diagnostics_says_plainly_when_nothing_has_run(user, state):
+    await user.open("/diagnostics")
+    await user.should_see("Nothing recorded in this window")
+    await user.should_see("No model calls in this window")
+
+
+async def test_diagnostics_reports_stage_timings(user, state):
+    state.mail.record_stage_runs([
+        {"cycle_id": "c1", "stage": "classify",
+         "started_at": __import__("datetime").datetime.now().isoformat(
+             timespec="seconds"),
+         "duration_ms": 4200, "processed": 12, "outcome": "ok"},
+    ])
+
+    await user.open("/diagnostics")
+    tables = [element.rows for element in user.find(kind=ui.table).elements]
+    timings = next(rows for rows in tables
+                   if rows and "stage" in rows[0])
+    assert timings[0]["stage"] == "classify"
+    assert timings[0]["median"] == "4.2 s"
+    assert timings[0]["processed"] == 12
 
 
 async def test_blocked_domains_are_listed_and_removable(user, state):

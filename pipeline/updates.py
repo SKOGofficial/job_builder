@@ -45,6 +45,10 @@ class UpdateHandler:
         self.client = client
         self.threshold = threshold
         self.executor = executor or asyncio.to_thread
+        #: Messages that failed for a reason of their own this pass. Reported
+        #: rather than only logged: a handler failing on every cycle otherwise
+        #: shows up as nothing at all.
+        self.failed = 0
 
     async def handle(self, message):
         """Process one update email.
@@ -191,9 +195,24 @@ class UpdateHandler:
                     processed, exc.retry_after,
                 )
                 break
+            except Exception:
+                # A failure specific to this message must never end the pass.
+                # AGENTS.md states it as a pipeline invariant and the router
+                # obeys it; this handler did not, so anything but a rate limit
+                # propagated out of `dispatch` and cost the whole `prepare`
+                # stage for that cycle. Marked handled because it *was* tried.
+                log.exception(
+                    "%s could not be processed; marking it handled and "
+                    "continuing", message["gmail_message_id"],
+                )
+                self.mail.mark_handled(message["gmail_message_id"])
+                self.failed += 1
+                continue
             processed += 1
             applied += int(outcome["status_applied"])
             unresolved += int(not outcome["identity_key"])
+        if self.failed:
+            log.warning("%d update(s) failed to process this pass", self.failed)
         return {"processed": processed, "applied": applied,
                 "unresolved": unresolved}
 

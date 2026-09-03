@@ -47,6 +47,23 @@ CATEGORIES = JOB_CATEGORIES + (CATEGORY_IRRELEVANT,)
 
 VERDICT_PASSED = "passed"
 
+#: How many times a message may fail classification for a reason of its own
+#: before the pipeline stops offering it.
+#:
+#: Three, not one: the common causes - a truncated body, a provider having a
+#: bad minute, a model returning prose instead of JSON - are often transient,
+#: and retiring a real recruiter email on one bad reply is the expensive
+#: mistake. But the retries have to end. The model queue is oldest-first, so a
+#: message no provider can ever answer sits at its head and is tried *first*,
+#: at cost, on every cycle for ever. A counter is what turns "still pending"
+#: into "cannot be classified, and here is why".
+MAX_CLASSIFY_ATTEMPTS = 3
+
+#: Recorded on a message that passed the filter, had its body fetched, and got
+#: nothing back. Phrased as a finished decision rather than an error, because
+#: that is what it is - there is no reply the model could give.
+EMPTY_BODY_REASON = "The fetched body was empty; there is nothing to classify."
+
 LEAD_NEW = "new"
 LEAD_PREPARING = "preparing"
 LEAD_READY = "ready"
@@ -63,6 +80,39 @@ LEAD_OPEN_STATUSES = (LEAD_READY, LEAD_PREPARING, LEAD_NEW)
 #: has usually been filled or closed, and a to-apply list padded with those
 #: stops being a list of things to do.
 LEAD_FRESHNESS_DAYS = 14
+
+#: How the to-apply list may be ordered.
+#:
+#: Two questions, two orders. "What arrived this morning" wants the newest
+#: posting first, because applying early is most of what decides whether an
+#: application is read. "Which of these should I spend a research call on"
+#: wants the best fit first, and only became a question worth asking once
+#: generation stopped happening on its own.
+LEAD_SORT_POSTED = "posted"
+LEAD_SORT_RELEVANCE = "relevance"
+
+LEAD_SORTS = {
+    LEAD_SORT_POSTED: (
+        "ORDER BY COALESCE(posted_ts, 0) DESC, "
+        "relevance_score DESC NULLS LAST, "
+        "created_at DESC"
+    ),
+    LEAD_SORT_RELEVANCE: (
+        "ORDER BY relevance_score DESC NULLS LAST, "
+        "COALESCE(posted_ts, 0) DESC, "
+        "created_at DESC"
+    ),
+}
+
+#: Profile key holding how old an unhandled alert may be before the pipeline
+#: retires it without spending a model call on it. Kept in the key/value
+#: profile table rather than as a constant because the right answer depends on
+#: the mailbox, and choosing it needs the count in front of you.
+ALERT_STALENESS_KEY = "alert_staleness_days"
+
+#: Profile key holding how long an untouched lead stays on the to-apply list.
+#: Defaults to `LEAD_FRESHNESS_DAYS`.
+LEAD_FRESHNESS_KEY = "lead_freshness_days"
 
 #: Marks a `prepare_error` that is a pause rather than a failure. The column
 #: holds free text and the Leads page renders it in red as "Preparation
@@ -104,6 +154,89 @@ def _now():
         str: The timestamp, for example ``2026-08-03T16:47:09``.
     """
     return datetime.now().isoformat(timespec="seconds")
+
+
+def alert_staleness_days(store):
+    """How old an unhandled alert may be before it is retired unextracted.
+
+    Summary:
+        Read the configured alert staleness cutoff.
+
+    Parameters:
+        store (JobStore): The store holding the profile key/value table.
+
+    Returns:
+        int: The cutoff in days. Defaults to `LEAD_FRESHNESS_DAYS`, and never
+            returns less than 1.
+
+    Note:
+        Defaults to the lead freshness window because that is the age at which
+        extraction stops being able to produce anything: a lead built from an
+        older alert is deleted by `purge_stale_leads` on the same cycle. A
+        different default would be a different claim about what the pipeline
+        is for.
+
+        Never raises on a bad stored value. A profile row someone hand-edited
+        should degrade to the default, not stop the pipeline.
+    """
+    raw = store.get_profile_value(ALERT_STALENESS_KEY, "")
+    try:
+        return max(1, int(raw)) if raw else LEAD_FRESHNESS_DAYS
+    except (TypeError, ValueError):
+        log.warning("%s=%r is not a number; using %d days",
+                    ALERT_STALENESS_KEY, raw, LEAD_FRESHNESS_DAYS)
+        return LEAD_FRESHNESS_DAYS
+
+
+def lead_freshness_days(store):
+    """How long an untouched lead stays on the to-apply list.
+
+    Summary:
+        Read the configured lead freshness window.
+
+    Parameters:
+        store (JobStore): The store holding the profile key/value table.
+
+    Returns:
+        int: The window in days. Defaults to `LEAD_FRESHNESS_DAYS`, never less
+            than 1.
+
+    Note:
+        Never raises on a bad stored value. A profile row someone hand-edited
+        should degrade to the default rather than start deleting leads on a
+        window nobody chose.
+    """
+    raw = store.get_profile_value(LEAD_FRESHNESS_KEY, "")
+    try:
+        return max(1, int(raw)) if raw else LEAD_FRESHNESS_DAYS
+    except (TypeError, ValueError):
+        log.warning("%s=%r is not a number; using %d days",
+                    LEAD_FRESHNESS_KEY, raw, LEAD_FRESHNESS_DAYS)
+        return LEAD_FRESHNESS_DAYS
+
+
+def _percentile(sorted_values, fraction):
+    """
+    Summary:
+        Read a percentile out of an already-sorted list.
+
+    Parameters:
+        sorted_values (list[int]): Values in ascending order.
+        fraction (float): The percentile as 0.0-1.0, e.g. 0.95 for p95.
+
+    Returns:
+        int: The value at that position, or 0 for an empty list.
+
+    Note:
+        Nearest-rank, not interpolated. These are stage durations read by a
+        human off a diagnostics page, where "the slow one took 4.2 seconds" is
+        a real measurement and an interpolated 4.17 is an invented one.
+    """
+    if not sorted_values:
+        return 0
+    index = min(len(sorted_values) - 1,
+                max(0, int(round(fraction * (len(sorted_values) - 1)))))
+    return sorted_values[index]
 
 
 def parse_received(raw):
@@ -395,12 +528,18 @@ class MailStore:
             Messages whose body is empty are excluded rather than skipped
             later - there is nothing for the model to read, so sending them
             would spend quota for a guaranteed non-answer.
+
+            Messages that have already failed `MAX_CLASSIFY_ATTEMPTS` times are
+            excluded too. Oldest-first ordering means an unanswerable message
+            is offered *first* on every cycle, so without the ceiling one bad
+            row is a permanent tax on the front of the queue.
         """
-        sql = """
+        sql = f"""
             SELECT * FROM messages
             WHERE body_text IS NOT NULL
               AND TRIM(body_text) <> ''
               AND category IS NULL
+              AND classify_attempts < {MAX_CLASSIFY_ATTEMPTS}
             ORDER BY received_ts ASC
         """
         if limit is None:
@@ -433,10 +572,19 @@ class MailStore:
             Bodies are excluded rather than merely unused: a full backlog is
             thousands of rows, and loading their text to run a regex over the
             subject line would be the most expensive part of the cheap tier.
+
+            Filtered-out mail is excluded, and that is the point of the verdict
+            clause. Messages the rough filter dropped never get a body, so they
+            can never leave `category IS NULL` - and this query, which had no
+            verdict clause and no limit, re-read all 264 of them on every
+            ten-minute cycle and declined all of them, for ever. They are not a
+            backlog; they are a decision that was already made.
         """
-        sql = """
+        sql = f"""
             SELECT gmail_message_id, sender, subject FROM messages
             WHERE category IS NULL
+              AND (filter_verdict IS NULL OR filter_verdict = '{VERDICT_PASSED}')
+              AND classify_attempts < {MAX_CLASSIFY_ATTEMPTS}
             ORDER BY received_ts ASC
         """
         if limit is None:
@@ -456,11 +604,94 @@ class MailStore:
             sqlite3.Error: If the query fails.
         """
         return self.conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS n FROM messages
-            WHERE body_text IS NOT NULL AND TRIM(body_text) <> '' AND category IS NULL
+            WHERE body_text IS NOT NULL AND TRIM(body_text) <> ''
+              AND category IS NULL
+              AND classify_attempts < {MAX_CLASSIFY_ATTEMPTS}
             """
         ).fetchone()["n"]
+
+    def record_classify_failure(self, gmail_message_id, reason):
+        """Count one failed attempt against a message, and say why.
+
+        Summary:
+            Increment `classify_attempts` and store the reason it failed.
+
+        Parameters:
+            gmail_message_id (str): The message that could not be classified.
+            reason (str): What went wrong, truncated to 500 characters.
+
+        Returns:
+            int: The message's attempt count after this failure.
+
+        Raises:
+            sqlite3.Error: If the update fails.
+
+        Note:
+            Does not commit; the router commits its pass. Only failures
+            specific to *this* message are counted. A rate limit applies to
+            every message behind it as well and says nothing about this one, so
+            counting it would retire a queue's worth of perfectly good mail for
+            the crime of being at the front during a bad afternoon.
+        """
+        self.conn.execute(
+            """
+            UPDATE messages
+            SET classify_attempts = classify_attempts + 1,
+                classify_error = ?
+            WHERE gmail_message_id = ?
+            """,
+            ((reason or "")[:500], gmail_message_id),
+        )
+        row = self.conn.execute(
+            "SELECT classify_attempts AS n FROM messages "
+            "WHERE gmail_message_id = ?",
+            (gmail_message_id,),
+        ).fetchone()
+        return row["n"] if row else 0
+
+    def retire_unclassifiable(self):
+        """Give up, in writing, on mail there is nothing to classify.
+
+        Summary:
+            Mark passed messages whose fetched body turned out to be empty as
+            permanently unclassifiable.
+
+        Returns:
+            int: How many messages were retired.
+
+        Raises:
+            sqlite3.Error: If the update or the commit fails.
+
+        Note:
+            Commits. A message that passed the filter, had its body fetched,
+            and came back empty is excluded from the model queue by the
+            non-empty-body guard - for a good reason, since there is nothing to
+            send - but nothing ever marked it, so it sat in `category IS NULL`
+            for ever, indistinguishable from mail that simply had not been
+            reached yet. One such message has been in this mailbox since May.
+
+            Retired by exhausting the attempt counter rather than by assigning
+            a category, because no category would be true. The distinction the
+            pipeline needs is "tried and cannot be answered", and that is what
+            the counter means everywhere else.
+        """
+        cursor = self.conn.execute(
+            f"""
+            UPDATE messages
+            SET classify_attempts = {MAX_CLASSIFY_ATTEMPTS},
+                classify_error = ?
+            WHERE category IS NULL
+              AND filter_verdict = ?
+              AND body_fetched_at IS NOT NULL
+              AND (body_text IS NULL OR TRIM(body_text) = '')
+              AND classify_attempts < {MAX_CLASSIFY_ATTEMPTS}
+            """,
+            (EMPTY_BODY_REASON, VERDICT_PASSED),
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     def record_category(self, gmail_message_id, category, confidence, reason,
                         model=None):
@@ -783,7 +1014,8 @@ class MailStore:
                      cursor.rowcount, category)
         return cursor.rowcount
 
-    def messages_awaiting_handling(self, category, limit=50, newest_first=True):
+    def messages_awaiting_handling(self, category, limit=50, newest_first=True,
+                                   newer_than_days=None):
         """A category handler's backlog.
 
         Summary:
@@ -797,6 +1029,10 @@ class MailStore:
                 matters more than an old one. Acknowledgements pass False -
                 they are processed oldest first so that a lead is promoted by
                 the receipt that actually came first.
+            newer_than_days (int | None): Exclude messages older than this.
+                None, the default, means no age limit. Alerts pass their
+                staleness cutoff so a handler cannot spend a model call on a
+                message the retirement pass has not reached yet.
 
         Returns:
             list[sqlite3.Row]: Unhandled messages in that category.
@@ -805,15 +1041,30 @@ class MailStore:
             sqlite3.Error: If the query fails.
         """
         order = "DESC" if newest_first else "ASC"
+        age_clause = ""
+        args = [category]
+        if newer_than_days is not None:
+            # Same `fetched_at` fallback as `retire_stale_alerts`, so the two
+            # agree about which rows are stale. An undated message is treated
+            # as recent in both.
+            age_clause = """
+              AND COALESCE(
+                    received_ts,
+                    CAST(strftime('%s', fetched_at) AS INTEGER)
+                  ) >= ?
+            """
+            args.append(int(time.time()) - int(newer_than_days) * 86400)
+        args.append(limit)
         return self.conn.execute(
             f"""
             SELECT * FROM messages
             WHERE category = ?
               AND handled_at IS NULL
+              {age_clause}
             ORDER BY received_ts {order}
             LIMIT ?
             """,
-            (category, limit),
+            args,
         ).fetchall()
 
     def unlink_message(self, gmail_message_id, identity_key):
@@ -1028,7 +1279,8 @@ class MailStore:
             "SELECT * FROM job_leads WHERE id = ?", (lead_id,)
         ).fetchone()
 
-    def list_leads(self, statuses=LEAD_OPEN_STATUSES):
+    def list_leads(self, statuses=LEAD_OPEN_STATUSES,
+                   sort_by=LEAD_SORT_POSTED):
         """The to-apply list, newest posting first.
 
         Summary:
@@ -1038,6 +1290,7 @@ class MailStore:
             statuses (tuple[str, ...] | None): Statuses to include. Defaults
                 to `LEAD_OPEN_STATUSES`. Pass None for every lead regardless
                 of status, which is what the "show dismissed" view uses.
+            sort_by (str): One of `LEAD_SORTS`. Defaults to newest posting.
 
         Returns:
             list[sqlite3.Row]: Matching leads, newest posting first, with
@@ -1057,12 +1310,14 @@ class MailStore:
 
             `created_at` is the tiebreaker of last resort, never the sort key -
             see `migrate_v6` for why it cannot carry this.
+
+            Sorting by relevance is offered as an alternative rather than as
+            the default, and only became worth offering once generation was a
+            click: choosing which handful of 363 leads to spend a research call
+            on is a different task from seeing what arrived this morning, and
+            it wants a different order.
         """
-        order = (
-            "ORDER BY COALESCE(posted_ts, 0) DESC, "
-            "relevance_score DESC NULLS LAST, "
-            "created_at DESC"
-        )
+        order = LEAD_SORTS.get(sort_by, LEAD_SORTS[LEAD_SORT_POSTED])
         if statuses is None:
             return self.conn.execute(
                 f"SELECT * FROM job_leads {order}"
@@ -1101,6 +1356,13 @@ class MailStore:
             The date falls back to `created_at` when `posted_ts` is missing.
             Skipping dateless rows instead would make them permanent, which is
             the one outcome this method exists to prevent.
+
+            A lead with documents in `job_artifacts` is never purged, whatever
+            its age. Generation is a deliberate act now rather than something
+            the pipeline did on its own, so those rows are the ones a person
+            actually chose - and deleting a role you asked for documents about,
+            two weeks later, without saying anything, is not freshness. It is
+            losing your work.
         """
         cutoff = int(time.time()) - older_than_days * 86400
         marks = ", ".join("?" for _ in LEAD_OPEN_STATUSES)
@@ -1112,6 +1374,7 @@ class MailStore:
                     posted_ts,
                     CAST(strftime('%s', created_at) AS INTEGER)
                   ) < ?
+              AND identity_key NOT IN (SELECT identity_key FROM job_artifacts)
             """,
             (*LEAD_OPEN_STATUSES, cutoff),
         )
@@ -1360,31 +1623,44 @@ class MailStore:
             Read the saved per-task provider routing.
 
         Returns:
-            dict[str, tuple[str | None, str | None]]: Task id mapped to
-                `(primary, fallback)`. Empty when nothing has been edited.
+            dict[str, tuple[str, ...]]: Task id mapped to its ordered provider
+                chain. Empty when nothing has been edited.
 
         Raises:
             sqlite3.Error: If the query fails.
+
+        Note:
+            Reads `chain` in preference to the legacy pair, and falls back to
+            the pair for a row written before `migrate_v8`. The pair could only
+            ever hold two, so saving a route here used to silently drop the
+            third provider from an `LLM_ROUTE_*` chain - and this `.env` names
+            three for every classification task.
         """
         rows = self.conn.execute(
-            "SELECT task, primary_provider, fallback_provider FROM provider_settings"
+            "SELECT task, primary_provider, fallback_provider, chain "
+            "FROM provider_settings"
         ).fetchall()
-        return {
-            row["task"]: (row["primary_provider"], row["fallback_provider"])
-            for row in rows
-        }
+        routes = {}
+        for row in rows:
+            chain = [name.strip() for name in (row["chain"] or "").split(",")
+                     if name.strip()]
+            if not chain:
+                chain = [name for name in (row["primary_provider"],
+                                           row["fallback_provider"]) if name]
+            routes[row["task"]] = tuple(chain)
+        return routes
 
-    def set_provider_route(self, task, primary, fallback=None):
+    def set_provider_route(self, task, *providers):
         """
         Summary:
             Save which providers should serve one task, in order.
 
         Parameters:
             task (str): The task identifier being routed.
-            primary (str | None): Provider to try first. None means the task is
-                turned off entirely.
-            fallback (str | None): Provider to try when the primary has no
-                headroom. None means there is nowhere to fall back to.
+            *providers (str | None): Providers to try, in order. `None` and
+                empty entries are dropped, and duplicates are removed while
+                preserving order. No providers at all means the task is turned
+                off.
 
         Raises:
             sqlite3.Error: If the write or the commit fails.
@@ -1392,18 +1668,33 @@ class MailStore:
         Note:
             Commits, because this is a user action rather than pipeline
             progress - it must survive whatever the current cycle does next.
+
+            Takes a chain rather than a primary and a fallback. The old
+            two-argument form silently threw away any third provider, which is
+            most of the point of `migrate_v8`. `primary_provider` and
+            `fallback_provider` are still written so a downgrade reads
+            something sensible, but `chain` is what `provider_routes` returns.
         """
+        chain = []
+        for name in providers:
+            if name and name not in chain:
+                chain.append(name)
         self.conn.execute(
             """
             INSERT INTO provider_settings
-                (task, primary_provider, fallback_provider, updated_at)
-            VALUES (?, ?, ?, ?)
+                (task, primary_provider, fallback_provider, chain, updated_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(task) DO UPDATE SET
                 primary_provider = excluded.primary_provider,
                 fallback_provider = excluded.fallback_provider,
+                chain = excluded.chain,
                 updated_at = excluded.updated_at
             """,
-            (task, primary, fallback, _now()),
+            (task,
+             chain[0] if chain else None,
+             chain[1] if len(chain) > 1 else None,
+             ",".join(chain),
+             _now()),
         )
         self.conn.commit()
 
@@ -1443,7 +1734,9 @@ class MailStore:
         Parameters:
             rows (list[dict]): Each with `provider`, `task`, and `outcome`;
                 optionally `model`, `input_tokens`, `output_tokens`,
-                `total_tokens`. Missing token counts record as 0.
+                `total_tokens`, `duration_ms`. Missing token counts record as
+                0; a missing duration records as NULL, which is the honest
+                value for a call that never reached a provider.
 
         Returns:
             int: How many rows were written.
@@ -1463,8 +1756,8 @@ class MailStore:
             """
             INSERT INTO provider_usage
                 (provider, task, model, requests, input_tokens, output_tokens,
-                 total_tokens, outcome, at)
-            VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+                 total_tokens, outcome, duration_ms, at)
+            VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1475,6 +1768,7 @@ class MailStore:
                     row.get("output_tokens") or 0,
                     row.get("total_tokens") or 0,
                     row["outcome"],
+                    row.get("duration_ms"),
                     row.get("at") or at,
                 )
                 for row in rows
@@ -1618,6 +1912,388 @@ class MailStore:
         )
         cursor = self.conn.execute(
             "DELETE FROM provider_usage WHERE at < ?", (cutoff,)
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    # --- alert staleness ---------------------------------------------------
+
+    def stale_alert_count(self, older_than_days):
+        """How many waiting alerts a given cutoff would retire.
+
+        Summary:
+            Count unhandled alerts older than a cutoff, without changing any.
+
+        Parameters:
+            older_than_days (int): Age in days past which an alert is stale.
+
+        Returns:
+            int: How many unhandled alerts `retire_stale_alerts` would take.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Exists so the cutoff can be chosen against the mailbox rather than
+            guessed at. A number that only appears after the setting is saved
+            is a number nobody can use to decide.
+        """
+        cutoff = int(time.time()) - int(older_than_days) * 86400
+        return self.conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM messages
+            WHERE category = ? AND handled_at IS NULL
+              AND COALESCE(
+                    received_ts,
+                    CAST(strftime('%s', fetched_at) AS INTEGER)
+                  ) < ?
+            """,
+            (CATEGORY_ALERT, cutoff),
+        ).fetchone()["n"]
+
+    def retire_stale_alerts(self, older_than_days):
+        """Retire alerts too old to produce a lead that would survive.
+
+        Summary:
+            Mark unhandled alerts older than the cutoff as handled, without a
+            model call.
+
+        Parameters:
+            older_than_days (int): Age in days past which an alert is stale.
+
+        Returns:
+            int: How many alerts were retired.
+
+        Raises:
+            sqlite3.Error: If the update or the commit fails.
+
+        Note:
+            Commits. This is a spend decision written as a query. Extraction is
+            the most expensive call in the pipeline, and a lead built from an
+            alert older than `LEAD_FRESHNESS_DAYS` is deleted by
+            `purge_stale_leads` on the same cycle that created it - so the work
+            is not merely low-value, its yield is arithmetically zero.
+
+            The alert queue reached 469 with its oldest entry seven weeks back,
+            drained newest-first at fifteen a cycle. The tail was never going
+            to be reached, and reaching it would have bought nothing.
+
+            A message with no `received_ts` falls back to `fetched_at` rather
+            than to zero, and this is the opposite choice from
+            `purge_stale_leads`. There, a dateless row left alone would be
+            immortal, and deletion is the whole point. Here, retiring is
+            throwing a posting away unseen - so an undated alert is treated as
+            recent and extracted. Paying for one advert is the cheap mistake;
+            silently discarding an interview is not.
+        """
+        cutoff = int(time.time()) - int(older_than_days) * 86400
+        cursor = self.conn.execute(
+            """
+            UPDATE messages SET handled_at = ?
+            WHERE category = ? AND handled_at IS NULL
+              AND COALESCE(
+                    received_ts,
+                    CAST(strftime('%s', fetched_at) AS INTEGER)
+                  ) < ?
+            """,
+            (_now(), CATEGORY_ALERT, cutoff),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    # --- queue depths ------------------------------------------------------
+
+    def queue_depths(self):
+        """Every queue the pipeline drains, counted the same way it drains it.
+
+        Summary:
+            Report the depth of each pipeline queue, plus the rows that are
+            stuck in none of them.
+
+        Returns:
+            dict[str, int]: `awaiting_filter`, `awaiting_body`,
+                `awaiting_classification`, `awaiting_rules`, `dead_lettered`,
+                and one `awaiting_handling_<category>` per job category.
+
+        Raises:
+            sqlite3.Error: If a query fails.
+
+        Note:
+            This exists because two honest counts of "unclassified" disagreed
+            by 264. `count_awaiting_classification` required a body, so it read
+            0; anything counting `category IS NULL` read 265, because messages
+            the rough filter dropped never get a body and so never leave that
+            set. Both were right about different things and neither said so.
+
+            Every number here is produced by the same predicate the stage that
+            drains it uses, so the page and the pipeline cannot drift apart.
+        """
+        one = lambda sql, args=(): self.conn.execute(sql, args).fetchone()["n"]
+        depths = {
+            "awaiting_filter": one(
+                "SELECT COUNT(*) n FROM messages WHERE filter_verdict IS NULL"
+            ),
+            "awaiting_body": one(
+                """
+                SELECT COUNT(*) n FROM messages
+                WHERE filter_verdict = ? AND body_fetched_at IS NULL
+                """,
+                (VERDICT_PASSED,),
+            ),
+            "awaiting_classification": self.count_awaiting_classification(),
+            "awaiting_rules": one(
+                f"""
+                SELECT COUNT(*) n FROM messages
+                WHERE category IS NULL
+                  AND (filter_verdict IS NULL OR filter_verdict = ?)
+                  AND classify_attempts < {MAX_CLASSIFY_ATTEMPTS}
+                """,
+                (VERDICT_PASSED,),
+            ),
+            "dead_lettered": one(
+                f"""
+                SELECT COUNT(*) n FROM messages
+                WHERE category IS NULL
+                  AND classify_attempts >= {MAX_CLASSIFY_ATTEMPTS}
+                """
+            ),
+        }
+        for category in (CATEGORY_ALERT, CATEGORY_UPDATE,
+                         CATEGORY_ACKNOWLEDGEMENT):
+            depths[f"awaiting_handling_{category}"] = one(
+                "SELECT COUNT(*) n FROM messages "
+                "WHERE category = ? AND handled_at IS NULL",
+                (category,),
+            )
+        return depths
+
+    def filtered_out(self):
+        """
+        Summary:
+            Count the messages the rough filter dropped, by reason.
+
+        Returns:
+            dict[str, int]: Drop verdict mapped to how many messages carry it.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Reported separately from `queue_depths` on purpose. These rows are
+            not a backlog and never will be - they have no body and are not
+            meant to have one - so putting them in the same table as the queues
+            is what created the confusion in the first place.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT filter_verdict AS verdict, COUNT(*) AS n FROM messages
+            WHERE filter_verdict IS NOT NULL AND filter_verdict <> ?
+            GROUP BY filter_verdict ORDER BY n DESC
+            """,
+            (VERDICT_PASSED,),
+        ).fetchall()
+        return {row["verdict"]: row["n"] for row in rows}
+
+    # --- stage timings -----------------------------------------------------
+
+    def record_stage_runs(self, rows):
+        """Append what each stage of one cycle did, and how long it took.
+
+        Summary:
+            Write one `stage_runs` row per timed pipeline stage.
+
+        Parameters:
+            rows (list[dict]): Each with `cycle_id`, `stage`, `started_at`,
+                `duration_ms`, and `outcome`; optionally `processed` and
+                `detail`.
+
+        Returns:
+            int: How many rows were written.
+
+        Raises:
+            sqlite3.Error: If the write or the commit fails.
+
+        Note:
+            Commits, and takes a batch rather than a row. The cycle buffers its
+            timings and flushes them once at the end for the same reason the
+            provider ledger does: the measurement must not become a write in
+            the middle of the thing it is measuring.
+        """
+        if not rows:
+            return 0
+        self.conn.executemany(
+            """
+            INSERT INTO stage_runs
+                (cycle_id, stage, started_at, duration_ms, processed, outcome,
+                 detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["cycle_id"],
+                    row["stage"],
+                    row["started_at"],
+                    int(row.get("duration_ms") or 0),
+                    int(row.get("processed") or 0),
+                    row["outcome"],
+                    row.get("detail"),
+                )
+                for row in rows
+            ],
+        )
+        self.conn.commit()
+        return len(rows)
+
+    def recent_stage_runs(self, cycles=20):
+        """The stages of the last few cycles, newest cycle first.
+
+        Summary:
+            List every `stage_runs` row belonging to the most recent cycles.
+
+        Parameters:
+            cycles (int): How many cycles back to read. Defaults to 20.
+
+        Returns:
+            list[sqlite3.Row]: Stage rows, newest cycle first and in stage
+                order within a cycle.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Selected by cycle rather than by row count. A cycle that skipped
+            four stages writes fewer rows than one that ran them all, so a flat
+            `LIMIT` would silently show more history for a broken pipeline than
+            a working one - the opposite of what the page is for.
+        """
+        return self.conn.execute(
+            """
+            SELECT * FROM stage_runs
+            WHERE cycle_id IN (
+                SELECT cycle_id FROM stage_runs
+                GROUP BY cycle_id ORDER BY MAX(started_at) DESC LIMIT ?
+            )
+            ORDER BY started_at DESC, id DESC
+            """,
+            (cycles,),
+        ).fetchall()
+
+    def stage_timings(self, since_iso):
+        """How long each stage has been taking.
+
+        Summary:
+            Summarise duration and throughput per stage over a window.
+
+        Parameters:
+            since_iso (str): Inclusive lower bound as an ISO-8601 timestamp.
+
+        Returns:
+            list[dict]: One entry per stage with `stage`, `runs`, `processed`,
+                `median_ms`, `p95_ms`, `max_ms`, and `failures`, slowest
+                median first.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            Percentiles are computed in Python rather than SQL. sqlite has no
+            percentile function, and a stage runs at most a few hundred times
+            in a retention window - small enough that sorting the list costs
+            less than the window function would.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT stage, duration_ms, processed, outcome
+            FROM stage_runs WHERE started_at >= ?
+            """,
+            (since_iso,),
+        ).fetchall()
+
+        by_stage = {}
+        for row in rows:
+            entry = by_stage.setdefault(
+                row["stage"], {"durations": [], "processed": 0, "failures": 0}
+            )
+            entry["durations"].append(row["duration_ms"])
+            entry["processed"] += row["processed"] or 0
+            if row["outcome"] not in ("ok", "skipped"):
+                entry["failures"] += 1
+
+        summary = []
+        for stage, entry in by_stage.items():
+            durations = sorted(entry["durations"])
+            summary.append({
+                "stage": stage,
+                "runs": len(durations),
+                "processed": entry["processed"],
+                "median_ms": _percentile(durations, 0.5),
+                "p95_ms": _percentile(durations, 0.95),
+                "max_ms": durations[-1] if durations else 0,
+                "failures": entry["failures"],
+            })
+        summary.sort(key=lambda entry: entry["median_ms"], reverse=True)
+        return summary
+
+    def last_stage_errors(self):
+        """The most recent failure of each stage, if it has ever failed.
+
+        Summary:
+            Report the latest non-ok outcome per stage.
+
+        Returns:
+            dict[str, dict]: Stage name mapped to `started_at`, `outcome`, and
+                `detail`.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Note:
+            This is the gap that let a stage fail on every single cycle without
+            anything saying so: the scheduler only ever surfaced an error that
+            reached the top of `PipelineCycle.run`, and a stage that logged and
+            carried on never did.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT stage, started_at, outcome, detail FROM stage_runs
+            WHERE outcome NOT IN ('ok', 'skipped')
+            GROUP BY stage
+            HAVING started_at = MAX(started_at)
+            """
+        ).fetchall()
+        return {
+            row["stage"]: {
+                "started_at": row["started_at"],
+                "outcome": row["outcome"],
+                "detail": row["detail"],
+            }
+            for row in rows
+        }
+
+    def prune_stage_runs(self, older_than_days=30):
+        """
+        Summary:
+            Delete stage timing rows past the retention window.
+
+        Parameters:
+            older_than_days (int): Retention window in days. Defaults to 30.
+
+        Returns:
+            int: How many rows were deleted.
+
+        Raises:
+            sqlite3.Error: If the delete or the commit fails.
+
+        Note:
+            Commits. Seven stages every ten minutes is about a thousand rows a
+            day, so this table outgrows `provider_usage` and is pruned on the
+            same schedule for the same reason.
+        """
+        cutoff = (datetime.now() - timedelta(days=older_than_days)).isoformat(
+            timespec="seconds"
+        )
+        cursor = self.conn.execute(
+            "DELETE FROM stage_runs WHERE started_at < ?", (cutoff,)
         )
         self.conn.commit()
         return cursor.rowcount

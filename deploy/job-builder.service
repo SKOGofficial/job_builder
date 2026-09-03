@@ -37,6 +37,12 @@ Environment=JOB_BUILDER_SECRETS_PATH=/var/lib/job_builder/credentials.json
 # Poll interval in seconds. 600 is comfortable; Gmail quota is not the
 # constraint at personal-mailbox scale.
 Environment=JOB_BUILDER_POLL_SECONDS=600
+# The Claude Code CLI runs in a neutral working directory so it never inherits
+# a project's CLAUDE.md, hooks, or MCP config. Its default is ~/.job_builder,
+# which ProtectHome below makes unreachable - so the provider fails to start
+# with an error that points at the CLI rather than at this unit. Pinned into
+# ReadWritePaths instead.
+Environment=CLAUDE_CLI_WORKDIR=/var/lib/job_builder/claude_cli
 
 ExecStart=/opt/job_builder/.venv/bin/python app.py --headless --port 8080
 

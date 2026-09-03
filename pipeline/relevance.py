@@ -1,19 +1,19 @@
-"""Scoring leads before spending real money on them.
+"""Scoring leads, so the list can be read in the order worth reading it.
 
-The gate that keeps the to-apply list application-ready without the bill being
-absurd. A daily digest is five to ten postings; at roughly $0.30-0.50 of Opus
-tokens each, researching all of them is $45-150 a month, most of it spent on
-roles that get dismissed at a glance.
+This was once the gate on spending: a cheap, already-paced model scored each
+lead, and anything above the bar had its research and cover letter bought
+unattended. That was a defensible design when the alternative was researching
+every posting in a digest - $45-150 a month, most of it on roles dismissed at a
+glance - but it made the bill a function of how well the model guessed at
+someone else's taste.
 
-So a cheap model that is already wired up and already paced scores each lead
-against the stored profile first, and only leads above the bar reach the
-expensive pass. The user experience is unchanged - the list still has resumes
-ready when they open it - but the spend follows the roles they would actually
-pursue.
+Generation is now a click (see `pipeline/prepare.py`), so this is no longer a
+gate on anything. It is a ranking, and that is a job it is actually good at. A
+score sorts the list and explains itself; a person decides.
 
-The threshold is deliberately low by default. A missed good lead costs more
-than a wasted dollar, and `relevance_reason` is stored so the bar can be tuned
-against real data instead of guessed at.
+Scoring still runs on every cycle, because it is free relative to research and
+because an unsorted list of 363 leads is not a shortlist. `relevance_reason` is
+stored so a score can be argued with rather than taken on faith.
 """
 
 import asyncio
@@ -25,7 +25,16 @@ from utilities.mailstore import LEAD_NEW
 
 log = logging.getLogger(__name__)
 
+#: Where the to-apply list stops showing leads by default.
+#:
+#: Low on purpose, and lower-stakes than it used to be. This once decided what
+#: got researched, so an over-tight bar meant a role was silently never
+#: prepared; now it only decides what is shown first, and `prepare_now`
+#: bypasses it entirely. A missed good lead still costs more than a wasted row.
 DEFAULT_THRESHOLD = 0.45
+
+#: Profile key holding a user-chosen threshold, if any.
+RELEVANCE_THRESHOLD_KEY = "relevance_threshold"
 
 MAX_PROFILE_CHARS = 3000
 
@@ -80,6 +89,34 @@ def build_messages(profile_text, lead):
             f"<opening>\n{described}\n</opening>"
         )},
     ]
+
+
+def configured_threshold(store):
+    """The relevance bar, as the user set it.
+
+    Summary:
+        Read the configured relevance threshold.
+
+    Parameters:
+        store (JobStore): The store holding the profile key/value table.
+
+    Returns:
+        float: The threshold, clamped to 0.0-1.0. Defaults to
+            `DEFAULT_THRESHOLD`.
+
+    Note:
+        Never raises on a bad stored value - a hand-edited profile row should
+        degrade to the default rather than stop the pipeline.
+    """
+    raw = store.get_profile_value(RELEVANCE_THRESHOLD_KEY, "")
+    if not raw:
+        return DEFAULT_THRESHOLD
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except (TypeError, ValueError):
+        log.warning("%s=%r is not a number; using %s",
+                    RELEVANCE_THRESHOLD_KEY, raw, DEFAULT_THRESHOLD)
+        return DEFAULT_THRESHOLD
 
 
 class RelevanceScorer:

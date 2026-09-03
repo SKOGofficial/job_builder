@@ -16,7 +16,8 @@ import logging
 from nicegui import ui
 
 from clients import gmail_client, llm_client
-from utilities import credentials
+from pipeline import relevance
+from utilities import credentials, mailstore
 from web.ai_settings import build_ai_card, build_routing_card
 from web.shell import card, page_shell, page_timer
 from web.state import get_state
@@ -301,6 +302,254 @@ def settings_page():
                         for name, count in categories.items():
                             ui.label(f"{name}: {count}").classes("text-xs opacity-70")
 
+        # Alert staleness ------------------------------------------------------
+
+        @ui.refreshable
+        def staleness_card():
+            """Choose how old an alert may be before it is retired unextracted.
+
+            Summary:
+                Render the alert staleness setting with a live preview of how
+                many alerts the current cutoff would retire.
+
+            Note:
+                The preview is the point of this card. Extraction is the most
+                expensive call in the pipeline, and a lead built from an alert
+                older than the lead freshness window is deleted on the cycle
+                that created it - so the cutoff decides real spend. A number
+                that only appears after saving is a number nobody can use to
+                decide, so it updates as the value changes.
+            """
+            with card():
+                ui.label("Alert age limit").classes("text-base font-semibold")
+                ui.label(
+                    "Job alerts older than this are cleared without asking a "
+                    "model to read them. A lead built from an older alert is "
+                    "dropped as stale on the same cycle it is created, so "
+                    "reading it costs money and yields nothing."
+                ).classes("text-sm opacity-70")
+
+                current = mailstore.alert_staleness_days(state.store)
+                waiting = state.mail.queue_depths().get(
+                    "awaiting_handling_job_alert", 0)
+                preview = ui.label().classes("text-sm")
+
+                def describe(days):
+                    """
+                    Summary:
+                        Phrase what a cutoff would do to the current queue.
+
+                    Parameters:
+                        days (int): The cutoff being considered.
+                    """
+                    try:
+                        days = max(1, int(days))
+                    except (TypeError, ValueError):
+                        preview.set_text("Enter a whole number of days.")
+                        preview.classes(replace="text-sm text-amber-500")
+                        return
+                    stale = state.mail.stale_alert_count(days)
+                    preview.set_text(
+                        f"{waiting} alert(s) waiting. Clearing anything older "
+                        f"than {days} day(s) retires {stale} of them now, "
+                        f"leaving {waiting - stale} to read."
+                    )
+                    preview.classes(replace="text-sm opacity-80")
+
+                def save(value):
+                    try:
+                        days = max(1, int(value))
+                    except (TypeError, ValueError):
+                        return
+                    state.store.save_profile_value(
+                        mailstore.ALERT_STALENESS_KEY, str(days))
+                    notify(f"Alerts older than {days} day(s) will be cleared "
+                           f"without being read.")
+
+                number = ui.number(
+                    label="Days", value=current, min=1, max=365, step=1,
+                    format="%d",
+                ).props("dense outlined").classes("w-32")
+                number.on_value_change(lambda e: describe(e.value))
+                describe(current)
+
+                with ui.row().classes("items-center gap-2 pt-1"):
+                    ui.button("Save", on_click=lambda: (save(number.value),
+                                                        staleness_card.refresh()),
+                              ).props("unelevated no-caps dense")
+                    ui.button(
+                        "Clear them now",
+                        on_click=lambda: retire_now(number.value),
+                    ).props("flat no-caps dense")
+
+        # Relevance ------------------------------------------------------------
+
+        @ui.refreshable
+        def relevance_card():
+            """The bar the to-apply list uses to decide what to show first.
+
+            Summary:
+                Render the relevance threshold setting.
+
+            Note:
+                This used to decide what got researched, which made it a
+                spending control with an over-tight setting silently costing
+                you roles. Generation is a click now, so it only ranks - and
+                that is worth saying on the card, because a number that used to
+                mean money and now means sort order should not be adjusted on
+                the old assumption.
+            """
+            with card():
+                ui.label("Relevance bar").classes("text-base font-semibold")
+                ui.label(
+                    "How well a role must match your profile to be highlighted "
+                    "in the to-apply list. This only affects ordering and "
+                    "emphasis - you can generate documents for any lead, "
+                    "whatever it scored."
+                ).classes("text-sm opacity-70")
+
+                current = relevance.configured_threshold(state.store)
+
+                def save(value):
+                    try:
+                        score = max(0.0, min(1.0, float(value) / 100))
+                    except (TypeError, ValueError):
+                        ui.notify("Enter a percentage.", type="warning")
+                        return
+                    state.store.save_profile_value(
+                        relevance.RELEVANCE_THRESHOLD_KEY, f"{score:.2f}")
+                    if state.pipeline is not None:
+                        state.pipeline.relevance_threshold = score
+                    notify(f"Relevance bar set to {score:.0%}.")
+
+                percent = ui.number(
+                    label="Minimum match", value=round(current * 100),
+                    min=0, max=100, step=5, suffix="%", format="%d",
+                ).props("dense outlined").classes("w-40")
+                ui.button("Save", on_click=lambda: (save(percent.value),
+                                                    relevance_card.refresh()),
+                          ).props("unelevated no-caps dense")
+
+        def retire_now(value):
+            """
+            Summary:
+                Apply the cutoff immediately rather than waiting for a cycle.
+
+            Parameters:
+                value (float | str): The cutoff shown in the input.
+
+            Note:
+                Exists because the first use of this setting is a backlog of
+                469, and waiting ten minutes to find out whether the number was
+                right is a poor way to choose it.
+            """
+            try:
+                days = max(1, int(value))
+            except (TypeError, ValueError):
+                ui.notify("Enter a whole number of days.", type="warning")
+                return
+            retired = state.mail.retire_stale_alerts(days)
+            notify(f"Cleared {retired} alert(s) older than {days} day(s).")
+            staleness_card.refresh()
+            pipeline_card.refresh()
+
+        # Pipeline tuning ------------------------------------------------------
+
+        @ui.refreshable
+        def tuning_card():
+            """The numbers that decide how much a cycle does and how long a
+            lead lives.
+
+            Summary:
+                Render the lead freshness window and the per-cycle stage
+                limits.
+
+            Note:
+                Lead freshness is first because it is the only one here with a
+                visible consequence - it decides when a role disappears from
+                the to-apply list, and a number that deletes your work should
+                not be a constant in a source file.
+
+                The stage limits are behind an expansion. They are real
+                controls and worth being reachable, but they are tuning rather
+                than policy, and the defaults were each chosen against a
+                measured constraint - see the comments in
+                `PipelineCycle.__init__`. `/diagnostics` is where to look
+                before changing one.
+            """
+            with card():
+                ui.label("Pipeline tuning").classes("text-base font-semibold")
+
+                ui.label("How long an untouched lead stays on the to-apply "
+                         "list. A lead you have generated documents for is "
+                         "kept regardless.").classes("text-sm opacity-70")
+
+                freshness = ui.number(
+                    label="Lead freshness (days)",
+                    value=mailstore.lead_freshness_days(state.store),
+                    min=1, max=365, step=1, format="%d",
+                ).props("dense outlined").classes("w-48")
+
+                def save_freshness():
+                    try:
+                        days = max(1, int(freshness.value))
+                    except (TypeError, ValueError):
+                        ui.notify("Enter a whole number of days.",
+                                  type="warning")
+                        return
+                    state.store.save_profile_value(
+                        mailstore.LEAD_FRESHNESS_KEY, str(days))
+                    notify(f"Leads are kept for {days} day(s).")
+                    tuning_card.refresh()
+
+                ui.button("Save", on_click=save_freshness).props(
+                    "unelevated no-caps dense")
+
+                with ui.expansion("Per-cycle limits").classes("w-full pt-2"):
+                    ui.label(
+                        "How much one pass may do before the scheduler comes "
+                        "back. Each default was chosen against a measured "
+                        "constraint - alert extraction is about 3,400 tokens "
+                        "against a 12,000/minute ceiling, so fifteen is a few "
+                        "minutes. Check /diagnostics before changing one."
+                    ).classes("text-xs opacity-70")
+
+                    pipeline = state.pipeline
+                    if pipeline is None:
+                        ui.label(
+                            "The pipeline is not running in this process, so "
+                            "there is nothing to tune here."
+                        ).classes("text-xs opacity-60")
+                        return
+
+                    inputs = {}
+                    with ui.row().classes("gap-2 flex-wrap pt-1"):
+                        for name in ("sync", "filter", "bodies", "classify",
+                                     "handle"):
+                            inputs[name] = ui.number(
+                                label=name, value=pipeline.limits[name],
+                                min=1, max=5000, step=1, format="%d",
+                            ).props("dense outlined").classes("w-28")
+
+                    def save_limits():
+                        for name, element in inputs.items():
+                            try:
+                                pipeline.limits[name] = max(
+                                    1, int(element.value))
+                            except (TypeError, ValueError):
+                                ui.notify(f"{name} must be a whole number.",
+                                          type="warning")
+                                return
+                        notify("Per-cycle limits updated for this session.")
+
+                    ui.button("Apply", on_click=save_limits).props(
+                        "unelevated no-caps dense")
+                    ui.label(
+                        "Applies to the running pipeline. Not persisted - "
+                        "these are for trying a value against the diagnostics "
+                        "page, and a restart returns to the measured defaults."
+                    ).classes("text-xs opacity-60")
+
         # Blocked senders ------------------------------------------------------
 
         @ui.refreshable
@@ -371,6 +620,9 @@ def settings_page():
         ai_card(confirm=confirm)
         routing_card()
         pipeline_card()
+        staleness_card()
+        relevance_card()
+        tuning_card()
         denylist_card()
         page_timer(0.4, watch)
 

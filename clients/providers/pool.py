@@ -82,6 +82,40 @@ MIN_COOLDOWN = 5.0
 UNAVAILABLE_COOLDOWN = 300.0
 
 
+def _elapsed_ms(started):
+    """
+    Summary:
+        Milliseconds since a `time.perf_counter()` reading.
+
+    Parameters:
+        started (float): The earlier `perf_counter` value.
+
+    Returns:
+        int: Elapsed milliseconds, rounded, never negative.
+    """
+    return max(0, int((time.perf_counter() - started) * 1000))
+
+
+def _took(timing):
+    """
+    Summary:
+        Read the duration out of a `_send` timing list.
+
+    Parameters:
+        timing (list | None): The list `_send` appends its elapsed time to.
+
+    Returns:
+        int | None: The measured milliseconds, or None when the call never
+            reached the provider and so has no honest duration.
+
+    Note:
+        None rather than 0. A call that never happened took no time, but
+        writing 0 would put it in the same bucket as an instant reply and drag
+        every average down with events that were not calls at all.
+    """
+    return timing[0] if timing else None
+
+
 def _build_groq(_mail):
     from clients.llm_client import DISPLAY_NAME, GroqClient
 
@@ -248,6 +282,10 @@ class ProviderState:
         self.cooldown_until = 0.0
         self.last_error = ""
         self._clock = clock
+        #: Guards `cooldown_until` and `last_error`, which are written from
+        #: executor threads and read on the loop thread. `Budget` next to it
+        #: has had one from the start; these were simply missed.
+        self._lock = threading.Lock()
 
     @property
     def client(self):
@@ -339,10 +377,19 @@ class ProviderState:
             Extends an existing cooldown but never shortens it. A second
             refusal arriving with a smaller hint must not make a provider look
             available sooner than the first one said.
+
+            Locked, because this is called from executor threads - every stage
+            puts its model call on one - while `candidates` reads it on the
+            loop thread. `max` of a stale read is how two providers refusing at
+            once could leave one of them looking available, and a cooldown lost
+            that way sends the very next call at a provider that has just said
+            no. `Budget` has had a lock since it was written; this is the same
+            argument for the field next to it.
         """
-        self.cooldown_until = max(self.cooldown_until, until)
-        if reason:
-            self.last_error = reason
+        with self._lock:
+            self.cooldown_until = max(self.cooldown_until, until)
+            if reason:
+                self.last_error = reason
 
     def delay(self, now, projected_tokens):
         """The longest of every pacing rule that applies to this provider.
@@ -414,6 +461,16 @@ class ProviderPool:
         self.providers = {}
         self.routes = {}
         self.pending_usage = []
+        #: Guards `pending_usage` and the mutable fields on `ProviderState`.
+        #:
+        #: `record`, `cool_down` and the pacer are all called from executor
+        #: threads - every stage puts its model call on one - while `flush` and
+        #: `begin_cycle` run on the loop thread. `Budget` has had a lock since
+        #: it was written; the rest of the shared state did not, so a lost
+        #: append dropped a usage row and a lost cooldown sent the next stage
+        #: at a provider that had just refused. Both corrupt the decision the
+        #: pool makes next, and neither leaves a trace.
+        self._lock = threading.Lock()
         #: Task id -> (provider name, model) for the most recent call. Read by
         #: the two stages that write a classification row.
         self.attribution = {}
@@ -524,17 +581,19 @@ class ProviderPool:
             actually did the work - the rows are bookkeeping, and losing them
             costs accuracy in the next budget seed, not correctness.
         """
-        if self.ledger is None or not self.pending_usage:
-            self.pending_usage = []
-            return 0
-        rows, self.pending_usage = self.pending_usage, []
+        with self._lock:
+            if self.ledger is None or not self.pending_usage:
+                self.pending_usage = []
+                return 0
+            rows, self.pending_usage = self.pending_usage, []
         try:
             return self.ledger.flush(rows)
         except Exception:
             log.exception("Could not record provider usage for %d call(s)", len(rows))
             return 0
 
-    def record(self, provider, task, outcome, model=None, tokens=0):
+    def record(self, provider, task, outcome, model=None, tokens=0,
+               duration_ms=None):
         """
         Summary:
             Queue one call's cost for the next flush.
@@ -545,11 +604,22 @@ class ProviderPool:
             outcome (str): 'ok', 'rate_limited', 'denied_day', or 'error'.
             model (str | None): The model used, when known.
             tokens (int): Total tokens the call cost.
+            duration_ms (int | None): How long the provider itself took, in
+                milliseconds. None when the call never reached one.
+
+        Note:
+            `duration_ms` measures the provider call and nothing else - the
+            pacing sleep in front of it is deliberately excluded. Waiting is
+            the pool's cost, not the provider's, and conflating the two would
+            make a fast model behind a slow pacer look like a slow model. The
+            wait is visible in `stage_runs`, which times whole stages.
         """
-        self.pending_usage.append({
-            "provider": provider, "task": task, "outcome": outcome,
-            "model": model, "total_tokens": tokens or 0,
-        })
+        with self._lock:
+            self.pending_usage.append({
+                "provider": provider, "task": task, "outcome": outcome,
+                "model": model, "total_tokens": tokens or 0,
+                "duration_ms": duration_ms,
+            })
 
     # Status ----------------------------------------------------------------
 
@@ -840,11 +910,14 @@ class ProviderPool:
 
         exhausted = None
         for state in ready:
+            # One list per attempt, so the duration recorded against a failure
+            # is that attempt's and not the previous provider's.
+            timing = []
             try:
                 return self._send(state, task, shape, send, projected_tokens,
-                                  budget_s)
+                                  budget_s, timing)
             except ProviderRateLimited as exc:
-                self._on_rate_limit(state, task, shape, exc)
+                self._on_rate_limit(state, task, shape, exc, _took(timing))
                 blocked.append((state.name, "rate limited", float(exc.retry_after)))
                 continue
             except ProviderBudgetExhausted as exc:
@@ -852,7 +925,8 @@ class ProviderPool:
                 # clear on its own, so the provider is out for the window.
                 state.cool_down(self._clock() + state.budget.window_seconds, str(exc))
                 self.record(state.name, task, "denied_day",
-                            model=self._model_of(state, shape))
+                            model=self._model_of(state, shape),
+                            duration_ms=_took(timing))
                 blocked.append((state.name, "spend ceiling reached", 0.0))
                 exhausted = exc
                 continue
@@ -864,7 +938,8 @@ class ProviderPool:
                 # the fallback usually has a far larger allowance.
                 state.last_error = str(exc)
                 self.record(state.name, task, "error",
-                            model=self._model_of(state, shape))
+                            model=self._model_of(state, shape),
+                            duration_ms=_took(timing))
                 blocked.append((state.name, "request too large", 0.0))
                 continue
             except ProviderNotConfigured as exc:
@@ -885,7 +960,8 @@ class ProviderPool:
                 state.cool_down(self._clock() + UNAVAILABLE_COOLDOWN, str(exc))
                 state.last_error = str(exc)
                 self.record(state.name, task, "error",
-                            model=self._model_of(state, shape))
+                            model=self._model_of(state, shape),
+                            duration_ms=_took(timing))
                 # Logged, not just recorded. `provider_usage` stores the
                 # outcome but not the reason, so without this line a provider
                 # failing on every cycle shows up as a row saying "error" and
@@ -918,7 +994,8 @@ class ProviderPool:
         """
         return getattr(state.client_for(shape), "model", None)
 
-    def _send(self, state, task, shape, send, projected_tokens, budget_s):
+    def _send(self, state, task, shape, send, projected_tokens, budget_s,
+              timing=None):
         """Wait out this provider's pacing, then send.
 
         Summary:
@@ -931,6 +1008,10 @@ class ProviderPool:
             send (Callable): Performs the call, given the client.
             projected_tokens (int): Expected cost.
             budget_s (float): Longest this call may wait.
+            timing (list | None): Collects the elapsed milliseconds of the
+                provider call. Appended to whether the call succeeds or raises,
+                so the caller's exception handlers can record a duration for a
+                failure as well as a success.
 
         Returns:
             Any: Whatever `send` returned.
@@ -940,6 +1021,9 @@ class ProviderPool:
             sent, mirroring how `complete_json` books tokens before the call.
             A request in flight has to count, or two stages could each see the
             last slot as free.
+
+            The clock starts after the pacing sleep. A provider is not slow
+            because the pool made it wait its turn - see `record`.
         """
         client = state.client_for(shape)
         now = self._clock()
@@ -947,15 +1031,25 @@ class ProviderPool:
         if delay > 0:
             self._sleep(min(delay, budget_s))
         state.budget.book()
-        value = send(client)
+        started = time.perf_counter()
+        try:
+            value = send(client)
+        finally:
+            # `finally`, not the success path: a call that took ninety seconds
+            # to time out is the single most useful duration in the table, and
+            # recording it only when the call worked would hide exactly the
+            # ones worth seeing.
+            if timing is not None:
+                timing.append(_elapsed_ms(started))
         tokens = getattr(client, "last_total_tokens", 0)
         model = getattr(client, "model", None)
-        self.record(state.name, task, "ok", model=model, tokens=tokens)
+        self.record(state.name, task, "ok", model=model, tokens=tokens,
+                    duration_ms=_took(timing))
         self.attribution[task] = (state.name, model)
         state.last_error = ""
         return value
 
-    def _on_rate_limit(self, state, task, shape, exc):
+    def _on_rate_limit(self, state, task, shape, exc, duration_ms=None):
         """
         Summary:
             Apply a provider's refusal to its cooldown and budget.
@@ -965,6 +1059,10 @@ class ProviderPool:
             task (str): The canonical task id.
             shape (str): Which client refused, for the recorded model name.
             exc (ProviderRateLimited): The refusal.
+            duration_ms (int | None): How long the refused call took. A 429
+                returned in 40ms and a subscription limit discovered after a
+                90-second CLI timeout are both "rate limited" and cost very
+                different amounts of a cycle.
 
         Note:
             A 429 is ground truth. Whatever the local counters believed, the
@@ -977,7 +1075,9 @@ class ProviderPool:
         state.cool_down(now + max(exc.retry_after, MIN_COOLDOWN), str(exc))
         state.budget.deny(exc.scope, now)
         outcome = "denied_day" if exc.scope == "day" else "rate_limited"
-        self.record(state.name, task, outcome, model=self._model_of(state, shape))
+        self.record(state.name, task, outcome,
+                    model=self._model_of(state, shape),
+                    duration_ms=duration_ms)
         log.info("%s refused %s (%s); trying the next provider",
                  state.display, task, exc.scope)
 
@@ -1016,11 +1116,12 @@ class ProviderPool:
             and state.budget.has_headroom(self._clock())
             and state.delay(self._clock(), projected_tokens) <= budget_s
         ):
+            timing = []
             try:
                 return self._send(state, task, shape, send, projected_tokens,
-                                  budget_s)
+                                  budget_s, timing)
             except ProviderRateLimited as exc:
-                self._on_rate_limit(state, task, shape, exc)
+                self._on_rate_limit(state, task, shape, exc, _took(timing))
                 blocked.append((state.name, "rate limited", float(exc.retry_after)))
 
         if exhausted is not None:

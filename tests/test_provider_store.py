@@ -46,15 +46,48 @@ class ProviderStoreTests(unittest.TestCase):
     def test_route_is_replaced_not_duplicated(self):
         self.mail.set_provider_route("route_email", "groq", "gemini")
         self.mail.set_provider_route("route_email", "gemini", None)
+        # A chain, not a padded pair: "gemini and nothing after it" is one
+        # entry long, and the empty second slot was never information.
         self.assertEqual(
-            self.mail.provider_routes(), {"route_email": ("gemini", None)}
+            self.mail.provider_routes(), {"route_email": ("gemini",)}
         )
 
     def test_a_task_can_be_turned_off(self):
         self.mail.set_provider_route("score_relevance", None, None)
         self.assertEqual(
-            self.mail.provider_routes(), {"score_relevance": (None, None)}
+            self.mail.provider_routes(), {"score_relevance": ()}
         )
+
+    def test_a_third_provider_survives_being_saved(self):
+        """The bug the `chain` column exists for.
+
+        `provider_settings` held a primary and a fallback and nothing else, so
+        touching a task in Settings threw away the third provider in its
+        `LLM_ROUTE_*` chain - and this .env names three for every
+        classification task. Silently, and the two-dropdown UI could not have
+        shown that it had happened.
+        """
+        self.mail.set_provider_route("route_email", "groq", "gemini",
+                                     "claude_cli")
+        self.assertEqual(
+            self.mail.provider_routes()["route_email"],
+            ("groq", "gemini", "claude_cli"),
+        )
+
+    def test_a_saved_chain_is_what_the_router_resolves(self):
+        from clients.providers.routing import chain_for
+
+        self.mail.set_provider_route("route_email", "groq", "gemini",
+                                     "claude_cli")
+        self.assertEqual(
+            chain_for("route_email", self.mail.provider_routes()),
+            ("groq", "gemini", "claude_cli"),
+        )
+
+    def test_a_repeated_provider_costs_one_slot_not_two(self):
+        self.mail.set_provider_route("route_email", "groq", "groq", "gemini")
+        self.assertEqual(
+            self.mail.provider_routes()["route_email"], ("groq", "gemini"))
 
     def test_clearing_removes_the_row_rather_than_pinning_a_default(self):
         self.mail.set_provider_route("research", "gemini", "anthropic")

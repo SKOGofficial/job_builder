@@ -7,6 +7,7 @@ creating a module here and importing it below.
 from web.pages import (  # noqa: F401  (imported for the @ui.page side effect)
     add_application,
     dashboard,
+    diagnostics,
     email_matches,
     experiences,
     jobs,
@@ -20,6 +21,7 @@ __all__ = [
     "jobs",
     "add_application",
     "dashboard",
+    "diagnostics",
     "leads",
     "referrals",
     "email_matches",
